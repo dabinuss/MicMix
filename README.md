@@ -4,7 +4,8 @@ Windows-only TeamSpeak 3 Client-Plugin, das eine zweite Audioquelle (z. B. Spoti
 
 ## Status
 
-Aktuell in Planung/Setup.  
+Aktuell in aktiver Entwicklung.  
+Ein funktionaler Plugin-Prototyp (DLL, TS3-Exports, UI, Loopback/Spotify-Capture, Mix/Hotkeys/Config) ist vorhanden.  
 Die technische Spezifikation liegt in [`DEVPLAN.md`](./DEVPLAN.md).
 
 ## Ziel

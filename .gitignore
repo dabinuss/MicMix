@@ -82,6 +82,7 @@ temp/
 
 # Lokale SDK-Ablagen (nicht ins Repo)
 third_party/ts3_sdk/
+third_party/speexdsp/
 
 # Lokale Entwicklungsnotizen (nicht veroeffentlichen)
 LOCAL_DEV.md
