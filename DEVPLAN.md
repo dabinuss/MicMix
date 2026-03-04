@@ -16,6 +16,8 @@ Ein TeamSpeak 3 **Client-Plugin** (Windows-only), das eine **zweite Audioquelle*
 - **Ducking** optional (aktivierbar)
 - **Mute/Unmute nur für den Soundkanal** + **Hotkey** (TS3 Hotkey-System)
 - **Kompatibel mit TS3 3.6.2**, **Plugin API 26**
+- **Spotify Session Source robust inkl. Reacquire** (kein Experimental-Label im Release)
+- **Resampling mit speexdsp + Drift-Kompensation** als Release-Pflicht
 - **Machbarkeits-Spike bestanden** (Go/No-Go Kriterien aus 1.1)
 
 ---
@@ -37,14 +39,14 @@ Ziel: Kritische Annahmen vor Architektur-Feinschliff validieren.
   - Ergebnis: Falls nicht robust möglich, Feature als “best effort” markieren und UI-Warnung verpflichtend.
 - Spike B: **Spotify App-/Session-Capture**
   - Kriterium: Spotify lässt sich zuverlässig selektieren und nach Neustart reacquiren.
-  - Ergebnis: Falls nicht robust möglich, Spotify-Modus auf “experimental” setzen und Loopback als Standard.
+  - Ergebnis: Falls nicht robust möglich, Release ist blockiert bis Ursache behoben ist.
 - Spike C: **PTT-/Talkstate-Erkennung für Ducking**
   - Kriterium: Prüfen, ob TS3-Status direkt nutzbar ist; sonst Plugin-Hotkey als alleinige Quelle.
   - Ergebnis: UI-Optionen nur für tatsächlich verfügbare Signale anzeigen.
 
 Go/No-Go:
 - Wenn Spike A fehlschlägt: kein “garantiertes Soundboard-like” in Muss-Kriterien.
-- Wenn Spike B fehlschlägt: Spotify in v1.0 optional/experimental.
+- Wenn Spike B fehlschlägt: **kein v1.0 Release** (kritischer Blocker).
 - Wenn Spike C fehlschlägt: Ducking-Mode “PTT detect” nur über Plugin-Hotkey.
 
 ### 1.2 Support-Matrix (verbindlich)
@@ -54,6 +56,14 @@ Go/No-Go:
 - Capture-Fähigkeiten:
   - Loopback: auf allen Zielversionen
   - Spotify Session: nur wenn OS/API-Pfad verfügbar und im Spike validiert
+
+### 1.3 Festgelegte Audio-Dependency (v1.0 direkt)
+- Resampler-Library: **speexdsp** (feste Entscheidung)
+- Grund:
+  - gute Echtzeit-Performance bei niedriger Latenz
+  - stabile Qualität für Voice+Music Mixing
+  - einfache Integration in native C/C++ Toolchains
+- `libsamplerate` wird für dieses Projekt nicht als Primärpfad eingeplant.
 
 ---
 
@@ -105,6 +115,52 @@ Go/No-Go:
   - overruns
   - clipped samples
   - source reconnect count
+- Overload-Strategie (degradierend statt abstürzend):
+  - bei wiederholter Callback-Überlast: optionale Metering-Funktionen deaktivieren
+  - Resampler-Qualität stufenweise reduzieren (innerhalb definierter Mindestqualität)
+  - bei anhaltender Überlast: Music temporär stumm + sichtbarer Warnstatus, Mic bleibt aktiv
+
+### 2.3 Persistente Settings (verbindlich)
+Beim Klick auf `Apply/Save` und beim geordneten Plugin-Shutdown werden folgende Werte persistiert:
+
+- `config.version`
+- `source.mode` (`loopback` | `spotify_session`)
+- `source.loopback.device_id` (stabile Device-ID, nicht nur Anzeigename)
+- `source.spotify.process_name` (Default `Spotify.exe`)
+- `source.spotify.session_id` (wenn verfügbar; sonst Reacquire per Prozessname)
+- `source.autostart_enabled` (bool)
+- `mix.music_gain_db`
+- `mix.force_tx_enabled` (bool)
+- `mix.buffer_target_ms`
+- `mix.music_muted` (bool)
+- `ducking.enabled` (bool)
+- `ducking.mode` (`mic_rms` | `plugin_hotkey` | `ts3_talkstate`)
+- `ducking.threshold_dbfs`
+- `ducking.attack_ms`
+- `ducking.release_ms`
+- `ducking.amount_db`
+- `ui.last_open_tab`
+
+Ladeverhalten:
+- In `ts3plugin_init()` wird die komplette Config geladen, validiert und auf Defaults gefallbackt.
+- Ungültige oder veraltete Keys blockieren den Start nicht; sie werden geloggt und auf Default gesetzt.
+- Nach Start zeigt die UI den tatsächlich aktiven Zustand (inkl. Reacquire/Error) und nicht nur gespeicherte Wunschwerte.
+
+Write-Sicherheit:
+- Config-Write ist atomar (`config.tmp` schreiben, flushen, dann replace/rename auf `config.json`).
+- Letzte gültige Config wird als `config.lastgood.json` vorgehalten.
+- Bei defekter/inkompletter Config: Fallback auf `lastgood`, sonst Defaults + Warnung im Log/UI.
+
+Migration:
+- Jede Config hat `config.version`.
+- Beim Laden wird eine deterministische Migration auf die aktuelle Version ausgeführt.
+- Nicht migrierbare Felder werden verworfen, aber Start bleibt möglich.
+
+### 2.4 Diagnostik & Logging (verbindlich)
+- Strukturierte Fehlercodes für Source/Config/Threading (z. B. `device_not_found`, `session_lost`, `config_parse_failed`).
+- Rotierende lokale Logdatei im Plugin-Config-Pfad (z. B. `micmix.log`, max. Größe + Anzahl Backups).
+- Log-Level: `error`, `warn`, `info`, `debug` (default: `info`).
+- In Release-Builds keine sensitiven Daten loggen (keine personenbezogenen Inhalte, keine vollständigen Gerätedumps ohne Opt-in).
 
 ---
 
@@ -129,17 +185,21 @@ Go/No-Go:
 - Quellen können 44.1kHz/48kHz und stereo/mono sein
 - Stereo -> Mono: `(L + R) * 0.5`
 - Resampler:
-  - MVP: linear resample
-  - v1.0: speexdsp oder libsamplerate
+  - **v1.0 Direktpfad:** `speexdsp` (`speex_resampler`)
+  - Qualitätsstufe per Config (Default: Qualität 5-7, je nach CPU-Budget)
 - Drift-Kompensation:
   - Quellen- und TS3-Clock können auseinanderlaufen
   - Ziel: Buffer-Level im Zielkorridor halten (z. B. 60ms)
-  - MVP: leichte adaptive Ratio-Korrektur (ppm-Bereich) statt statischer Ratio
+  - adaptive Ratio-Korrektur (ppm-Bereich) statt statischer Ratio
 
 ### 3.5 Mixing
 - `out = mic + music * musicGainEffective`
 - `musicGainEffective = musicGain * duckFactor`
 - Limiter/Softclip danach
+- Gain-Safety:
+  - harte Grenzen für `musicGain` (z. B. min/max dB)
+  - kein vollständiger Limiter-Bypass im Release
+  - Clip-Events zählen und in Diagnostik ausweisen
 
 ### 3.6 “Soundboard-like” (sendet ohne Mic)
 Problem: VAD/Noisegate kann Musik blocken, wenn TS3 nach dem Callback gated.
@@ -167,6 +227,10 @@ Problem: VAD/Noisegate kann Musik blocken, wenn TS3 nach dem Callback gated.
   - Hinweis: Loopback nimmt alles (inkl. TS3 Output) → Feedback-Risiko
 - Empfehlung in UI:
   - “TS3 Output getrennt von Spotify Output” oder “Spotify Session Mode nutzen”
+- Wenn gespeicherte Device-ID beim Start fehlt:
+  - Status `Error` mit klarer Ursache
+  - kein Crash, keine Blockade des Plugin-Starts
+  - User kann im UI sofort ein neues Device wählen und `Apply/Save` ausführen
 
 ### 4.2 Modus B: Spotify Session/App-only Capture
 - Ziel: Nur Spotify Audio (ohne TS3 / Games / Browser)
@@ -177,8 +241,10 @@ Problem: VAD/Noisegate kann Musik blocken, wenn TS3 nach dem Callback gated.
 - Auto-Reacquire:
   - Timer/Thread prüft alle X Sekunden, ob Session wieder vorhanden ist
   - Bei Spotify restart → Source verbindet neu
-- Fallback (optional):
-  - Wenn Spotify nicht erreichbar → optional auf Loopback wechseln (nur wenn User aktiv erlaubt)
+- Fallback-Verhalten (verbindlich):
+  - Wenn Spotify nicht erreichbar ist, läuft Plugin im Zustand `Reacquiring` oder `Error` weiter, ohne Absturz.
+  - Während `Reacquiring`: Music-Anteil wird als Stille behandelt (Mic bleibt unverändert nutzbar).
+  - Optionaler Auto-Switch auf Loopback bleibt User-Option (default: aus), aber Fehlerbehandlung gilt immer.
 
 ### 4.3 Moduswechsel
 - “Switch Mode”:
@@ -207,6 +273,29 @@ Transitions:
 Regeln:
 - Exponential Backoff für Reacquire (z. B. 1s, 2s, 4s, max 15s)
 - Nach `N` Fehlversuchen Error-Status mit konkreter Ursache
+- Jeder Source-Fehler ist recoverable oder führt deterministisch in `Error`, niemals in undefinierten Zustand.
+- Fehlergrund wird für UI/Logs als Code + Text geführt (z. B. `device_not_found`, `session_lost`, `open_failed`, `timeout`).
+
+### 4.5 Fehlerbehandlung bei fehlenden/instabilen Quellen (verbindlich)
+Beim Laden:
+- Gespeicherte Source nicht verfügbar -> Plugin startet trotzdem, Source bleibt `Error`, UI fordert Re-Select.
+- Config wird nicht verworfen; nur ungültige Source-spezifische Werte werden auf sichere Defaults gesetzt.
+
+Zur Laufzeit:
+- App schließt sich / Session verschwindet -> `Running -> Reacquiring` mit Backoff, ohne Audio-Thread-Crash.
+- Device invalidiert (Treiberwechsel, Device entfernt) -> `Running -> Reacquiring` bzw. `Error` nach Timeout.
+- Source liefert fehlerhafte Frames/Timeouts -> Frame verwerfen, Stille einmischen, Counter erhöhen, State-Übergang auslösen.
+- Device Hotplug / Default-Device-Wechsel:
+  - erkannte Device-Änderungen triggern Re-Resolve per gespeicherter Device-ID
+  - falls ID nicht mehr auflösbar: `Error` + UI-Recovery-Pfad
+- Dynamischer Formatwechsel der Quelle:
+  - Wechsel von Sample-Rate/Kanalzahl im Betrieb löst kontrollierte Reinitialisierung der Source-Chain aus
+  - während Reinit kein Crash/Block; Music ggf. kurz stumm
+
+Nutzerwirkung:
+- Mic bleibt durchgehend nutzbar.
+- Music-Kanal kann temporär stumm werden, aber darf nie TS3-Client oder Plugin instabil machen.
+- UI zeigt sofort den realen Zustand und konkrete Recovery-Hinweise.
 
 ---
 
@@ -249,6 +338,11 @@ Flow:
 - User bindet Hotkey in TS3 Hotkey-Dialog
 - `ts3plugin_onHotkeyEvent(keyword)` togglet plugin state
 
+Randfall-Regeln:
+- Debounce gegen Repeat-Events (insb. bei Toggle-Hotkeys).
+- `music_push_to_play` ist idempotent für Key-Down/Key-Up Sequenzen.
+- Konflikte mit anderen TS3-Hotkeys werden im UI-Hinweis dokumentiert (Priorität/Erwartung).
+
 ---
 
 ## 7) UI (Windows-only, Standard-Plugin-UX)
@@ -274,6 +368,8 @@ Flow:
 - Force TX while music playing (Checkbox)
 - Buffer latency slider (ms)
 - Optional: Music Level Meter
+- Hinweisfeld zu TS3-Preprocessing:
+  - Empfehlungen für VAD/Noisegate/AGC je nach Nutzungsmodus (Music-only, Voice+Music, PTT)
 
 #### Tab: Ducking
 - Enable toggle
@@ -321,6 +417,16 @@ Bottom:
 4. mix + limit + float -> short
 5. `*edited = 1`, wenn Musik hörbar beigemischt ist oder Force TX aktiv ist und Quelle Signal liefert; sonst `*edited = 0` für transparentes Pass-through
 
+### 8.4 Power-/Session-Lifecycle (verbindlich)
+- Windows Sleep/Resume:
+  - nach Resume werden Quellen neu validiert und bei Bedarf kontrolliert reinitialisiert
+  - kein hängender Capture-Thread, kein Deadlock im Callback
+- TS3 ServerConnection-Scopes:
+  - Plugin-Zustand ist pro `serverConnectionHandlerID` konsistent definiert
+  - kein unbeabsichtigtes Cross-Mixing zwischen parallelen TS3-Verbindungen
+- TS3 Restart/Plugin Reload:
+  - vollständiger Cleanup aller Worker-Threads und Handles garantiert
+
 ---
 
 ## 9) Build & Packaging (TS3 3.6.2 / API 26)
@@ -332,6 +438,10 @@ Bottom:
 - Buildsystem festlegen (z. B. CMake + Presets) für reproduzierbare Builds
 - Exportliste/ABI prüfen (alle geforderten TS3-Plugin-Exports vorhanden)
 - Runtime-Strategie dokumentieren (statisch vs. benötigte VC++ Runtime)
+- Third-Party Dependencies fixieren:
+  - `third_party/ts3_sdk` (lokal, nicht versioniert)
+  - `third_party/speexdsp` (lokal/vendor; klare Lizenzdokumentation)
+  - `speexdsp` Version/Commit wird im Build fixiert (reproduzierbar)
 
 ### 9.2 Deployment
 - `plugins/yourplugin.dll`
@@ -342,6 +452,8 @@ Bottom:
   - Versionsnummer + Changelog
   - SHA256 Checksums
 - Optional aber empfohlen: Code Signing der DLL
+- Lizenz-/Third-Party-Hinweise:
+  - `THIRD_PARTY_NOTICES.md` mit `speexdsp`/weiteren Dependencies
 
 ---
 
@@ -357,18 +469,50 @@ Bottom:
   - speaking lowers music; stop speaking raises music
 - Music mute:
   - button and hotkey toggle only music, mic unchanged
+- Persistenz:
+  - Quelle/Device/Session, Mix- und Ducking-Parameter speichern -> TS3 Neustart -> identische Werte geladen
+  - letzter Mute- und Autostart-Zustand wird korrekt wiederhergestellt
+  - bei nicht mehr verfügbarem Device/Session: sauberer Fallback + klare UI-Fehlermeldung statt Crash
+  - defekte Config-Datei simulieren -> Fallback auf `lastgood` oder Defaults ohne Startabbruch
+  - ältere Config-Version laden -> Migration läuft deterministisch und verlustarm
 
 Messbare Akzeptanzkriterien:
-- Zusätzliche End-to-End Latenz durch Plugin: Ziel `< 20 ms` (MVP), `< 10 ms` (v1.0)
+- Zusätzliche End-to-End Latenz durch Plugin: Ziel `< 10 ms`
 - Callback-CPU-Budget: keine hörbaren Glitches unter Zielhardware bei 60 Minuten Dauerlast
 - Clipping-Rate nach Limiter: nahe 0 bei nominalen Einstellungen
 - Underruns/Overruns: im Normalbetrieb 0; bei Stress reproduzierbar geloggt
+- Spotify Reacquire: nach Spotify-Neustart automatische Wiederverbindung innerhalb definierter Timeout-Grenze
+- Sleep/Resume: nach Resume innerhalb definierter Zeit wieder stabiler `Running`-Status oder klarer `Error`-Status
+- Multi-Server: kein Cross-Mixing zwischen parallelen Verbindungen
 
 ### 10.2 Risk Tests
 - Loopback feedback:
   - verify TS3 output not re-injected (or warn user)
 - Spotify session reacquire:
   - restart spotify -> plugin reconnects automatically
+- Source weg beim Laden:
+  - gespeicherte Device/Session existiert nicht -> Plugin startet, zeigt `Error`, UI-Recover möglich
+- Runtime-Source-Ausfall:
+  - Spotify/App schließen während Betrieb -> Übergang `Running -> Reacquiring -> Running/Error` ohne Crash
+- Loopback-Device-Ausfall:
+  - Device deaktivieren/entfernen während Betrieb -> sauberer State-Übergang, Mic bleibt aktiv
+- Device Hotplug / Default-Wechsel:
+  - neues Default-Gerät setzen/alte entfernen -> Source-Resolver verhält sich deterministisch
+- Dynamischer Formatwechsel:
+  - Quelle mit wechselnder Sample-Rate/Kanalzahl -> kontrollierte Reinitialisierung ohne Crash
+- Fehlerhafte Source-Frames:
+  - timeouts/invalid frames -> Stille statt Absturz, Fehlerzähler steigt, Zustand wird korrekt aktualisiert
+- Sleep/Resume:
+  - Windows Standby und Resume während aktiver Source -> kein Deadlock, sauberes Reacquire
+- Hotkey-Randfälle:
+  - schneller Repeat auf Toggle -> kein Flattern/Fehlzustand
+  - Push-to-play Key-Down/Key-Up Sequenzen bleiben konsistent
+- Overload-Fall:
+  - künstliche CPU-Last -> degradierende Qualitätsstrategie greift, Mic bleibt nutzbar
+- Config-Schreibabbruch:
+  - erzwungener Abbruch während Save -> beim nächsten Start konsistente Fallback-Config
+- Mehrere TS3-Verbindungen parallel:
+  - kein State-Leak oder ungewolltes Routing zwischen Verbindungen
 - Stability:
   - run 1h streaming audio -> no drift/dropouts
 - Drift-Test:
@@ -382,25 +526,27 @@ Messbare Akzeptanzkriterien:
 
 ## 11) Roadmap
 
-### Phase 0 (Gate)
+### Phase 0 (Gate, blockierend)
 - Machbarkeits-Spike aus 1.1
-- Go/No-Go Entscheidung und ggf. Scope-Anpassung
+- Go/No-Go Entscheidung
+- Nur bei bestandenem Gate: Implementierung starten
 
-### MVP
-- Loopback Source
-- UI with Start/Stop, Gain, Mute, Force TX
-- Ringbuffer, basic linear resample
-- Basic ducking (mic RMS)
-- Realtime Constraints aus 2.2 erfüllt
-- Basis-Telemetrie (underrun/overrun/clipping) im Debug-Log
+### Phase 1 (Core v1.0)
+- Loopback Source + Spotify Session Source (beide produktionsreif)
+- Robuster Source-Manager mit Reacquire-State-Machine
+- UI komplett (Source/Mix/Ducking/Hotkeys/Status)
+- Realtime Constraints aus 2.2 vollständig umgesetzt
 
-### v1.0
-- Spotify Session Source (app-only)
-- robust reacquire + UI status
-- improved resampler (speexdsp)
-- improved limiter
+### Phase 2 (Audioqualität v1.0)
+- `speexdsp` Resampler integriert (kein linearer Release-Pfad)
 - Drift-Kompensation finalisiert
-- Messkriterien aus Testplan vollständig erreicht
+- Limiter/Softclip final abgestimmt
+- Basis-Telemetrie (underrun/overrun/clipping/reconnect) produktionsreif
+
+### Phase 3 (Release-Hardening)
+- Vollständiger Testplan aus Kapitel 10 bestanden
+- Packaging, Versionierung, Checksums, Dokumentation final
+- Release Candidate -> v1.0
 
 ---
 
@@ -409,9 +555,12 @@ Messbare Akzeptanzkriterien:
 - Plugin DLL + folder
 - Settings UI
 - Config storage
+- Rotierende Diagnose-Logs + Fehlercode-Referenz
 - Dokumentation:
   - How to bind hotkeys
   - Recommended TS3 output separation for Loopback mode
   - Known limitations + troubleshooting
   - Support-Matrix (OS/Arch/Features)
   - Go/No-Go Ergebnis des Machbarkeits-Spikes
+  - Third-Party/Lizenzhinweise (`THIRD_PARTY_NOTICES.md`)
+  - Kurz-Hinweis zu rechtlicher Nutzung von Audioinhalten (Urheberrecht/Plattformregeln)

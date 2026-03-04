@@ -23,16 +23,12 @@ MicMix soll neben dem Mikrofon einen separaten "Soundkanal" senden, ohne bestehe
 - Robustes Reacquire bei Session-Verlust
 - Verbesserter Resampler/Limiter
 
-## Voraussetzungen
+## Voraussetzungen (Nutzung)
 
+- Windows 10/11 (x64 empfohlen)
 - TeamSpeak 3 Client `3.6.2`
-- TeamSpeak Plugin API `26`
-- Windows `10/11` (x64 primär, x86 optional)
-
-## Entwicklung
-
-Der Build-Flow wird im Projekt finalisiert (voraussichtlich CMake + MSVC/Visual Studio).  
-Bis zur ersten Codebasis gilt der DEVPLAN als führendes Dokument.
+- Plugin-Kompatibilität: TeamSpeak Plugin API `26`
+- Für Loopback-Modus: korrektes Audio-Routing empfohlen (um Feedback zu vermeiden)
 
 ## Repository-Struktur
 
@@ -42,4 +38,3 @@ Bis zur ersten Codebasis gilt der DEVPLAN als führendes Dokument.
 
 - Das Projekt ist explizit auf TeamSpeak 3 und Windows ausgerichtet.
 - Feature-Verfügbarkeit (insbesondere Spotify Session Capture) hängt von den im DEVPLAN definierten Machbarkeits-Spikes ab.
-
