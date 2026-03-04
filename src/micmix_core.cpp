@@ -17,6 +17,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cmath>
+#include <cstring>
 #include <cwctype>
 #include <cstdlib>
 #include <filesystem>
@@ -40,6 +41,10 @@ constexpr int  kTargetRate = 48000;
 
 std::mutex g_logMutex;
 std::string g_logPath;
+std::string g_lastLogPayload;
+const char* g_lastLogLevel = nullptr;
+uint32_t g_suppressedLogCount = 0;
+uint32_t g_logWriteCount = 0;
 
 std::wstring Utf8ToWide(const std::string& text) {
     if (text.empty()) {
@@ -68,9 +73,23 @@ std::string WideToUtf8(const std::wstring& text) {
 }
 
 struct ComInit {
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    HRESULT hr = E_FAIL;
+    bool needsUninit = false;
+
+    explicit ComInit(DWORD coinit = COINIT_MULTITHREADED) {
+        hr = CoInitializeEx(nullptr, coinit);
+        if (hr == RPC_E_CHANGED_MODE) {
+            // COM is already initialized on this thread with a different apartment.
+            // That is still usable for the APIs here; we just must not uninitialize.
+            hr = S_OK;
+            needsUninit = false;
+            return;
+        }
+        needsUninit = SUCCEEDED(hr);
+    }
+
     ~ComInit() {
-        if (SUCCEEDED(hr)) {
+        if (needsUninit) {
             CoUninitialize();
         }
     }
@@ -81,15 +100,47 @@ void AppendLogLine(const char* level, const std::string& text) {
     if (g_logPath.empty()) {
         return;
     }
+
+    const uint64_t nowMs = GetTickCount64();
+    if (g_lastLogLevel && std::strcmp(g_lastLogLevel, level) == 0 && g_lastLogPayload == text) {
+        // Suppress short-burst duplicate lines to avoid hot loops spamming disk I/O.
+        static uint64_t lastDuplicateMs = 0;
+        if (nowMs <= (lastDuplicateMs + 400ULL)) {
+            ++g_suppressedLogCount;
+            lastDuplicateMs = nowMs;
+            return;
+        }
+        lastDuplicateMs = nowMs;
+    }
+
+    if ((++g_logWriteCount % 128U) == 0U) {
+        std::error_code ec;
+        const uintmax_t size = std::filesystem::file_size(g_logPath, ec);
+        if (!ec && size > (4U * 1024U * 1024U)) {
+            std::ofstream trunc(g_logPath, std::ios::trunc);
+            if (trunc.is_open()) {
+                trunc << "log rotated: exceeded 4 MiB\n";
+            }
+        }
+    }
+
     std::ofstream out(g_logPath, std::ios::app);
     if (!out.is_open()) {
         return;
     }
     SYSTEMTIME st{};
     GetLocalTime(&st);
+    if (g_suppressedLogCount > 0) {
+        out << st.wYear << "-" << st.wMonth << "-" << st.wDay << " "
+            << st.wHour << ":" << st.wMinute << ":" << st.wSecond << "."
+            << st.wMilliseconds << " [INFO] (suppressed duplicate lines: " << g_suppressedLogCount << ")\n";
+        g_suppressedLogCount = 0;
+    }
     out << st.wYear << "-" << st.wMonth << "-" << st.wDay << " "
         << st.wHour << ":" << st.wMinute << ":" << st.wSecond << "."
         << st.wMilliseconds << " [" << level << "] " << text << "\n";
+    g_lastLogLevel = level;
+    g_lastLogPayload = text;
 }
 
 std::string Trim(std::string value) {
@@ -118,6 +169,70 @@ std::string HrToHex(HRESULT hr) {
     std::ostringstream ss;
     ss << "0x" << std::hex << std::uppercase << static_cast<uint32_t>(hr);
     return ss.str();
+}
+
+void StripConfigControlChars(std::string& value, size_t maxLen) {
+    value.erase(std::remove_if(value.begin(), value.end(), [](char ch) {
+        return ch == '\r' || ch == '\n' || ch == '\t';
+    }), value.end());
+    if (value.size() > maxLen) {
+        value.resize(maxLen);
+    }
+}
+
+bool IsDigitsOnly(const std::string& value) {
+    if (value.empty()) {
+        return false;
+    }
+    return std::all_of(value.begin(), value.end(), [](char ch) {
+        return std::isdigit(static_cast<unsigned char>(ch)) != 0;
+    });
+}
+
+void SanitizeSettings(MicMixSettings& s) {
+    s.configVersion = std::clamp(s.configVersion, 1, 8);
+    s.musicGainDb = std::clamp(s.musicGainDb, -30.0f, 18.0f);
+    s.bufferTargetMs = std::clamp(s.bufferTargetMs, 20, 250);
+    s.muteHotkeyModifiers &= (MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN);
+    s.muteHotkeyVk = std::clamp(s.muteHotkeyVk, 0, 255);
+    s.uiLastOpenTab = std::max(0, s.uiLastOpenTab);
+
+    StripConfigControlChars(s.loopbackDeviceId, 512);
+    StripConfigControlChars(s.appProcessName, 128);
+    StripConfigControlChars(s.appSessionId, 32);
+    StripConfigControlChars(s.captureDeviceId, 512);
+
+    if (!s.appSessionId.empty() && !IsDigitsOnly(s.appSessionId)) {
+        s.appSessionId.clear();
+    }
+}
+
+bool NearlyEqual(float a, float b) {
+    return std::fabs(a - b) < 0.0001f;
+}
+
+bool IsSameSettings(const MicMixSettings& a, const MicMixSettings& b) {
+    return a.configVersion == b.configVersion &&
+           a.sourceMode == b.sourceMode &&
+           a.loopbackDeviceId == b.loopbackDeviceId &&
+           a.appProcessName == b.appProcessName &&
+           a.appSessionId == b.appSessionId &&
+           a.autostartEnabled == b.autostartEnabled &&
+           NearlyEqual(a.musicGainDb, b.musicGainDb) &&
+           a.forceTxEnabled == b.forceTxEnabled &&
+           a.bufferTargetMs == b.bufferTargetMs &&
+           a.musicMuted == b.musicMuted &&
+           a.duckingEnabled == b.duckingEnabled &&
+           a.duckingMode == b.duckingMode &&
+           NearlyEqual(a.duckingThresholdDbfs, b.duckingThresholdDbfs) &&
+           NearlyEqual(a.duckingAttackMs, b.duckingAttackMs) &&
+           NearlyEqual(a.duckingReleaseMs, b.duckingReleaseMs) &&
+           NearlyEqual(a.duckingAmountDb, b.duckingAmountDb) &&
+           a.uiLastOpenTab == b.uiLastOpenTab &&
+           a.autoSwitchToLoopback == b.autoSwitchToLoopback &&
+           a.muteHotkeyModifiers == b.muteHotkeyModifiers &&
+           a.muteHotkeyVk == b.muteHotkeyVk &&
+           a.captureDeviceId == b.captureDeviceId;
 }
 
 bool IsBlockedUiProcess(uint32_t pid, const std::wstring& exeName) {
@@ -536,6 +651,7 @@ bool ConfigStore::Load(MicMixSettings& outSettings, std::string& warning) {
     } catch (...) {
         warning = "Config parse issue detected; fallback values were used.";
     }
+    SanitizeSettings(outSettings);
     outSettings.duckingEnabled = false;
     outSettings.duckingMode = DuckingMode::MicRms;
     outSettings.duckingThresholdDbfs = -30.0f;
@@ -547,22 +663,24 @@ bool ConfigStore::Load(MicMixSettings& outSettings, std::string& warning) {
 
 bool ConfigStore::Save(const MicMixSettings& settings, std::string& error) {
     error.clear();
+    MicMixSettings safe = settings;
+    SanitizeSettings(safe);
     std::ostringstream ss;
-    ss << "config.version=" << settings.configVersion << "\n";
-    ss << "source.mode=" << SourceModeToString(settings.sourceMode) << "\n";
-    ss << "source.loopback.device_id=" << settings.loopbackDeviceId << "\n";
-    ss << "source.app.process_name=" << settings.appProcessName << "\n";
-    ss << "source.app.session_id=" << settings.appSessionId << "\n";
-    ss << "source.autostart_enabled=" << BoolToString(settings.autostartEnabled) << "\n";
-    ss << "source.auto_switch_to_loopback=" << BoolToString(settings.autoSwitchToLoopback) << "\n";
-    ss << "mix.music_gain_db=" << settings.musicGainDb << "\n";
-    ss << "mix.force_tx_enabled=" << BoolToString(settings.forceTxEnabled) << "\n";
-    ss << "mix.buffer_target_ms=" << settings.bufferTargetMs << "\n";
-    ss << "mix.music_muted=" << BoolToString(settings.musicMuted) << "\n";
-    ss << "hotkey.mute.modifiers=" << settings.muteHotkeyModifiers << "\n";
-    ss << "hotkey.mute.vk=" << settings.muteHotkeyVk << "\n";
-    ss << "capture.device_id=" << settings.captureDeviceId << "\n";
-    ss << "ui.last_open_tab=" << settings.uiLastOpenTab << "\n";
+    ss << "config.version=" << safe.configVersion << "\n";
+    ss << "source.mode=" << SourceModeToString(safe.sourceMode) << "\n";
+    ss << "source.loopback.device_id=" << safe.loopbackDeviceId << "\n";
+    ss << "source.app.process_name=" << safe.appProcessName << "\n";
+    ss << "source.app.session_id=" << safe.appSessionId << "\n";
+    ss << "source.autostart_enabled=" << BoolToString(safe.autostartEnabled) << "\n";
+    ss << "source.auto_switch_to_loopback=" << BoolToString(safe.autoSwitchToLoopback) << "\n";
+    ss << "mix.music_gain_db=" << safe.musicGainDb << "\n";
+    ss << "mix.force_tx_enabled=" << BoolToString(safe.forceTxEnabled) << "\n";
+    ss << "mix.buffer_target_ms=" << safe.bufferTargetMs << "\n";
+    ss << "mix.music_muted=" << BoolToString(safe.musicMuted) << "\n";
+    ss << "hotkey.mute.modifiers=" << safe.muteHotkeyModifiers << "\n";
+    ss << "hotkey.mute.vk=" << safe.muteHotkeyVk << "\n";
+    ss << "capture.device_id=" << safe.captureDeviceId << "\n";
+    ss << "ui.last_open_tab=" << safe.uiLastOpenTab << "\n";
 
     {
         std::ofstream out(tmpPath_, std::ios::binary | std::ios::trunc);
@@ -601,10 +719,12 @@ float AudioEngine::DbToLinear(float db) {
 }
 
 void AudioEngine::ApplySettings(const MicMixSettings& settings) {
+    const float gainDb = std::clamp(settings.musicGainDb, -30.0f, 18.0f);
+    const int bufferMs = std::clamp(settings.bufferTargetMs, 20, 250);
     musicMuted_.store(settings.musicMuted, std::memory_order_release);
     forceTxEnabled_.store(settings.forceTxEnabled, std::memory_order_release);
-    musicGainLinear_.store(DbToLinear(settings.musicGainDb), std::memory_order_release);
-    bufferTargetMs_.store(settings.bufferTargetMs, std::memory_order_release);
+    musicGainLinear_.store(DbToLinear(gainDb), std::memory_order_release);
+    bufferTargetMs_.store(bufferMs, std::memory_order_release);
     duckingEnabled_.store(false, std::memory_order_release);
     duckingMode_.store(static_cast<int>(DuckingMode::MicRms), std::memory_order_release);
     duckThresholdLinear_.store(DbToLinear(-30.0f), std::memory_order_release);
@@ -622,6 +742,7 @@ void AudioEngine::ApplySettings(const MicMixSettings& settings) {
 void AudioEngine::SetMusicSourceRunning(bool running) {
     sourceRunning_.store(running, std::memory_order_release);
     if (!running) {
+        ring_.Reset();
         duckCurrent_ = 1.0f;
         duckMeterLinear_.store(1.0f, std::memory_order_release);
         duckingNow_.store(false, std::memory_order_release);
@@ -633,7 +754,7 @@ void AudioEngine::SetMusicSourceRunning(bool running) {
         musicSendPeakDbfs_.store(-120.0f, std::memory_order_release);
     }
 }
-void AudioEngine::SetTalkState(bool talking) { (void)talking; }
+void AudioEngine::SetTalkState(bool talking) { talkState_.store(talking, std::memory_order_release); }
 void AudioEngine::SetHotkeyDucking(bool active) { (void)active; }
 void AudioEngine::SetExternalMicLevel(float linear) {
     const float level = std::clamp(linear, 0.0f, 1.0f);
@@ -681,7 +802,7 @@ void AudioEngine::PushMusicSamples(const float* samples, size_t count) {
     }
     nextPeak = std::clamp(nextPeak, -120.0f, 0.0f);
     musicPeakDbfs_.store(nextPeak, std::memory_order_release);
-    if (peakDb > -55.0f) {
+    if (peakDb > -72.0f || rmsDb > -78.0f) {
         lastMusicSignalTickMs_.store(GetTickCount64(), std::memory_order_release);
     }
 
@@ -710,8 +831,8 @@ TelemetrySnapshot AudioEngine::SnapshotTelemetry() const {
     t.musicSendPeakDbfs = musicSendPeakDbfs_.load(std::memory_order_relaxed);
     t.duckingGainDb = 0.0f;
     t.duckingActive = false;
-    t.talkStateActive = false;
-    t.micTalkDetected = false;
+    t.talkStateActive = talkState_.load(std::memory_order_relaxed);
+    t.micTalkDetected = micTalkDetected_.load(std::memory_order_relaxed);
     t.micRmsDbfs = micRmsDbfs_.load(std::memory_order_relaxed);
     const uint64_t lastSignalMs = lastMusicSignalTickMs_.load(std::memory_order_relaxed);
     t.musicActive = sourceRunning_.load(std::memory_order_relaxed) && (nowMs <= (lastSignalMs + 1200ULL));
@@ -722,15 +843,63 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
     if (!samples || sampleCount <= 0 || channels <= 0 || !edited) {
         return;
     }
-    const int upstreamEdited = *edited;
-    lastConsumeTickMs_.store(GetTickCount64(), std::memory_order_release);
+    const int upstreamFlags = *edited;
+    const uint64_t nowMs = GetTickCount64();
+    lastConsumeTickMs_.store(nowMs, std::memory_order_release);
     const bool muted = musicMuted_.load(std::memory_order_relaxed);
     const bool sourceRunning = sourceRunning_.load(std::memory_order_relaxed);
+    const bool forceTx = forceTxEnabled_.load(std::memory_order_relaxed);
+    const bool talkOpen = talkState_.load(std::memory_order_relaxed);
+    const bool hasQueuedMusic = ring_.Size() > 0;
+    const uint64_t lastSignalMs = lastMusicSignalTickMs_.load(std::memory_order_relaxed);
+    const bool recentMusicSignal = sourceRunning && !muted && (nowMs <= (lastSignalMs + 2500ULL));
+
+    float micRmsAcc = 0.0f;
+    for (int i = 0; i < sampleCount; ++i) {
+        const float mic = static_cast<float>(samples[i * channels]) / 32768.0f;
+        micRmsAcc += mic * mic;
+    }
+    const float micRms = std::sqrt(micRmsAcc / static_cast<float>(sampleCount));
+    const float micRmsDb = 20.0f * std::log10(std::max(micRms, 0.000001f));
+    const float prevMicRms = micRmsDbfs_.load(std::memory_order_relaxed);
+    const float micAlpha = (micRmsDb > prevMicRms) ? 0.25f : 0.10f;
+    const float nextMicRms = std::clamp(prevMicRms + ((micRmsDb - prevMicRms) * micAlpha), -120.0f, 0.0f);
+    micRmsDbfs_.store(nextMicRms, std::memory_order_release);
+    micTalkDetected_.store(talkOpen, std::memory_order_release);
+
+    if (!sourceRunning || muted || !hasQueuedMusic) {
+        const float prevSendPeakDb = musicSendPeakDbfs_.load(std::memory_order_relaxed);
+        const float decayedSendPeakDb = std::max(-120.0f, prevSendPeakDb - 1.8f);
+        musicSendPeakDbfs_.store(decayedSendPeakDb, std::memory_order_release);
+        duckCurrent_ = 1.0f;
+        duckMeterLinear_.store(1.0f, std::memory_order_release);
+        duckingNow_.store(false, std::memory_order_release);
+        micTalkDetected_.store(talkOpen, std::memory_order_release);
+
+        // TS3 bitmask semantics:
+        // bit 1 (value 1): audio buffer modified
+        // bit 2 (value 2): packet should be sent
+        // Keep upstream flags untouched when we did not mix anything.
+        if (!talkOpen) {
+            const size_t frameCount = static_cast<size_t>(sampleCount) * static_cast<size_t>(channels);
+            std::fill(samples, samples + frameCount, static_cast<short>(0));
+        }
+        int outFlags = upstreamFlags;
+        if (!talkOpen) {
+            outFlags |= 1;
+        }
+        if (forceTx && recentMusicSignal) {
+            outFlags |= 2;
+        }
+        *edited = outFlags;
+        return;
+    }
 
     thread_local std::array<float, kCallbackScratch> music{};
     bool anyMusicSignal = false;
     bool touched = false;
     float mixPeak = 0.0f;
+    const float musicGain = musicGainLinear_.load(std::memory_order_relaxed);
     int offset = 0;
     while (offset < sampleCount) {
         const int chunk = std::min(sampleCount - offset, static_cast<int>(kCallbackScratch));
@@ -740,20 +909,8 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
             underruns_.fetch_add(static_cast<uint64_t>(chunk - pulled), std::memory_order_relaxed);
         }
 
-        float rmsAcc = 0.0f;
         for (int i = 0; i < chunk; ++i) {
-            const float mic = static_cast<float>(samples[(offset + i) * channels]) / 32768.0f;
-            rmsAcc += mic * mic;
-        }
-        const float rms = std::sqrt(rmsAcc / static_cast<float>(chunk));
-        const float rmsDb = 20.0f * std::log10(std::max(rms, 0.000001f));
-        const float prevMicRms = micRmsDbfs_.load(std::memory_order_relaxed);
-        const float micAlpha = (rmsDb > prevMicRms) ? 0.25f : 0.10f;
-        const float nextMicRms = std::clamp(prevMicRms + ((rmsDb - prevMicRms) * micAlpha), -120.0f, 0.0f);
-        micRmsDbfs_.store(nextMicRms, std::memory_order_release);
-        const float musicGain = musicGainLinear_.load(std::memory_order_relaxed);
-        for (int i = 0; i < chunk; ++i) {
-            const float m = muted ? 0.0f : (music[i] * musicGain);
+            const float m = music[i] * musicGain;
             const float absM = std::fabs(m);
             if (absM > 0.0005f) {
                 anyMusicSignal = true;
@@ -761,9 +918,13 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
             if (absM > mixPeak) {
                 mixPeak = absM;
             }
+            if (absM <= 0.000001f) {
+                continue;
+            }
             for (int ch = 0; ch < channels; ++ch) {
                 const int idx = ((offset + i) * channels) + ch;
-                float out = (static_cast<float>(samples[idx]) / 32768.0f) + m;
+                const float dry = talkOpen ? (static_cast<float>(samples[idx]) / 32768.0f) : 0.0f;
+                float out = dry + m;
                 if (out > 1.0f) {
                     out = 1.0f;
                     clippedSamples_.fetch_add(1, std::memory_order_relaxed);
@@ -790,10 +951,19 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
     duckCurrent_ = 1.0f;
     duckMeterLinear_.store(1.0f, std::memory_order_release);
     duckingNow_.store(false, std::memory_order_release);
-    micTalkDetected_.store(false, std::memory_order_release);
+    micTalkDetected_.store(talkOpen, std::memory_order_release);
 
-    const int mineEdited = (touched && anyMusicSignal && sourceRunning && !muted) ? 1 : 0;
-    *edited = (upstreamEdited || mineEdited) ? 1 : 0;
+    const bool mixedMusic = touched && anyMusicSignal && sourceRunning && !muted;
+    const bool forceMusicTx = forceTx && (recentMusicSignal || mixedMusic);
+
+    int outFlags = upstreamFlags;
+    if (mixedMusic) {
+        outFlags |= 1;
+    }
+    if (forceMusicTx) {
+        outFlags |= 2;
+    }
+    *edited = outFlags;
 }
 
 namespace {
@@ -1420,6 +1590,9 @@ private:
     DWORD threadId_ = 0;
     UINT modifiers_ = 0;
     UINT vk_ = 0;
+    UINT registeredMods_ = 0;
+    UINT registeredVk_ = 0;
+    bool registeredValid_ = false;
 
     void ApplyRegistration() {
         UINT mods = 0;
@@ -1432,6 +1605,7 @@ private:
 
         UnregisterHotKey(nullptr, kHotkeyId);
         if (vk == 0) {
+            registeredValid_ = false;
             return;
         }
 
@@ -1440,12 +1614,19 @@ private:
         regMods |= MOD_NOREPEAT;
 #endif
         if (!RegisterHotKey(nullptr, kHotkeyId, regMods, vk)) {
+            registeredValid_ = false;
             LogWarn("mute_hotkey register failed vk=" + std::to_string(vk) +
                     " mods=" + std::to_string(mods) +
                     " err=" + std::to_string(GetLastError()));
         } else {
-            LogInfo("mute_hotkey registered vk=" + std::to_string(vk) +
-                    " mods=" + std::to_string(mods));
+            const bool changed = (!registeredValid_) || (registeredMods_ != mods) || (registeredVk_ != vk);
+            if (changed) {
+                LogInfo("mute_hotkey registered vk=" + std::to_string(vk) +
+                        " mods=" + std::to_string(mods));
+            }
+            registeredMods_ = mods;
+            registeredVk_ = vk;
+            registeredValid_ = true;
         }
     }
 
@@ -2054,12 +2235,304 @@ MicMixApp& MicMixApp::Instance() {
 MicMixApp::MicMixApp() = default;
 MicMixApp::~MicMixApp() = default;
 
+namespace {
+bool IsConnectedForTx(uint64 schid) {
+    if (schid == 0 || !g_ts3Functions.getConnectionStatus) {
+        return false;
+    }
+    int status = STATUS_DISCONNECTED;
+    const unsigned int err = g_ts3Functions.getConnectionStatus(schid, &status);
+    if (!(err == ERROR_ok || err == ERROR_ok_no_update)) {
+        return false;
+    }
+    return status == STATUS_CONNECTED || status == STATUS_CONNECTION_ESTABLISHED;
+}
+} // namespace
+
+void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
+    std::lock_guard<std::mutex> lock(voiceTxMutex_);
+    static uint64_t lastErrLogMs = 0;
+
+    const bool currentlyActive = voiceRecordingActive_.load(std::memory_order_relaxed);
+    const uint64 currentSchid = voiceRecordingSchid_.load(std::memory_order_relaxed);
+    auto clearState = [this]() {
+        savedInputStateValid_ = false;
+        savedVadValid_ = false;
+        savedVadThresholdValid_ = false;
+        savedVadThresholdDbfs_ = -50.0f;
+        voiceRecordingActive_.store(false, std::memory_order_release);
+        voiceRecordingSchid_.store(0, std::memory_order_release);
+        voiceTxLastNudgeMs_.store(0, std::memory_order_release);
+        engine_.SetTalkState(true);
+    };
+
+    auto restoreStateForSchid = [this](uint64 targetSchid) {
+        bool ok = true;
+        if (savedVadValid_ && g_ts3Functions.setPreProcessorConfigValue) {
+            const unsigned int errVad = g_ts3Functions.setPreProcessorConfigValue(
+                targetSchid, "vad", savedVadEnabled_ ? "true" : "false");
+            ok = ok && (errVad == ERROR_ok || errVad == ERROR_ok_no_update);
+        }
+        if (savedInputStateValid_ && g_ts3Functions.setClientSelfVariableAsInt) {
+            const unsigned int errInput = g_ts3Functions.setClientSelfVariableAsInt(
+                targetSchid, CLIENT_INPUT_DEACTIVATED, savedInputDeactivated_);
+            ok = ok && (errInput == ERROR_ok || errInput == ERROR_ok_no_update);
+        }
+        if (g_ts3Functions.flushClientSelfUpdates) {
+            const unsigned int errFlush = g_ts3Functions.flushClientSelfUpdates(targetSchid, nullptr);
+            ok = ok && (errFlush == ERROR_ok || errFlush == ERROR_ok_no_update);
+        } else {
+            ok = false;
+        }
+        return ok;
+    };
+
+    if (!active || schid == 0 || !IsConnectedForTx(schid)) {
+        if (currentlyActive && currentSchid != 0) {
+            const bool restored = restoreStateForSchid(currentSchid);
+            if (!restored) {
+                const uint64_t nowMs = GetTickCount64();
+                if (nowMs > (lastErrLogMs + 2000ULL)) {
+                    LogWarn("talk_mode restore failed schid=" + std::to_string(currentSchid));
+                    lastErrLogMs = nowMs;
+                }
+            } else {
+                LogInfo("talk_mode restored schid=" + std::to_string(currentSchid));
+            }
+        }
+        clearState();
+        return;
+    }
+
+    if (!g_ts3Functions.getClientSelfVariableAsInt ||
+        !g_ts3Functions.getPreProcessorConfigValue ||
+        !g_ts3Functions.setClientSelfVariableAsInt ||
+        !g_ts3Functions.setPreProcessorConfigValue ||
+        !g_ts3Functions.flushClientSelfUpdates) {
+        return;
+    }
+
+    const uint64_t nowMs = GetTickCount64();
+    const uint64_t lastNudgeMs = voiceTxLastNudgeMs_.load(std::memory_order_relaxed);
+    const bool sameSchid = currentlyActive && (currentSchid == schid);
+    if (sameSchid && nowMs <= (lastNudgeMs + 1000ULL)) {
+        return;
+    }
+
+    if (currentlyActive && currentSchid != 0 && currentSchid != schid) {
+        restoreStateForSchid(currentSchid);
+        savedInputStateValid_ = false;
+        savedVadValid_ = false;
+    }
+
+    int inputState = INPUT_DEACTIVATED;
+    const unsigned int errGetInput = g_ts3Functions.getClientSelfVariableAsInt(
+        schid, CLIENT_INPUT_DEACTIVATED, &inputState);
+    char* vadStr = nullptr;
+    const unsigned int errGetVad = g_ts3Functions.getPreProcessorConfigValue(schid, "vad", &vadStr);
+    bool vadEnabled = false;
+    if ((errGetVad == ERROR_ok || errGetVad == ERROR_ok_no_update) && vadStr) {
+        vadEnabled = (_stricmp(vadStr, "true") == 0);
+    }
+    if (vadStr && g_ts3Functions.freeMemory) {
+        g_ts3Functions.freeMemory(vadStr);
+    }
+    float vadThreshold = -50.0f;
+    bool vadThresholdValid = false;
+    char* vadLevelStr = nullptr;
+    const unsigned int errGetVadLevel = g_ts3Functions.getPreProcessorConfigValue(schid, "voiceactivation_level", &vadLevelStr);
+    if ((errGetVadLevel == ERROR_ok || errGetVadLevel == ERROR_ok_no_update) && vadLevelStr) {
+        char* endPtr = nullptr;
+        const float parsed = std::strtof(vadLevelStr, &endPtr);
+        if (endPtr && endPtr != vadLevelStr) {
+            vadThreshold = std::clamp(parsed, -90.0f, 0.0f);
+            vadThresholdValid = true;
+        }
+    }
+    if (vadLevelStr && g_ts3Functions.freeMemory) {
+        g_ts3Functions.freeMemory(vadLevelStr);
+    }
+
+    if (!(errGetInput == ERROR_ok || errGetInput == ERROR_ok_no_update) ||
+        !(errGetVad == ERROR_ok || errGetVad == ERROR_ok_no_update)) {
+        if (nowMs > (lastErrLogMs + 2000ULL)) {
+            LogWarn("talk_mode read failed schid=" + std::to_string(schid) +
+                    " input_err=" + std::to_string(errGetInput) +
+                    " vad_err=" + std::to_string(errGetVad));
+            lastErrLogMs = nowMs;
+        }
+        return;
+    }
+
+    if (!currentlyActive || currentSchid != schid) {
+        savedInputStateValid_ = true;
+        savedInputDeactivated_ = inputState;
+        savedVadValid_ = true;
+        savedVadEnabled_ = vadEnabled;
+        savedVadThresholdValid_ = vadThresholdValid;
+        savedVadThresholdDbfs_ = vadThreshold;
+    }
+
+    const unsigned int errVad = g_ts3Functions.setPreProcessorConfigValue(schid, "vad", "false");
+    const unsigned int errInput = g_ts3Functions.setClientSelfVariableAsInt(
+        schid, CLIENT_INPUT_DEACTIVATED, INPUT_ACTIVE);
+    const unsigned int errFlush = g_ts3Functions.flushClientSelfUpdates(schid, nullptr);
+    const bool ok = (errVad == ERROR_ok || errVad == ERROR_ok_no_update) &&
+                    (errInput == ERROR_ok || errInput == ERROR_ok_no_update) &&
+                    (errFlush == ERROR_ok || errFlush == ERROR_ok_no_update);
+    if (!ok) {
+        if (nowMs > (lastErrLogMs + 2000ULL)) {
+            LogWarn("talk_mode force failed schid=" + std::to_string(schid) +
+                    " vad_err=" + std::to_string(errVad) +
+                    " input_err=" + std::to_string(errInput) +
+                    " flush_err=" + std::to_string(errFlush));
+            lastErrLogMs = nowMs;
+        }
+        clearState();
+        return;
+    }
+
+    if (!sameSchid) {
+        LogInfo("talk_mode forced continuous schid=" + std::to_string(schid));
+    }
+    voiceRecordingActive_.store(true, std::memory_order_release);
+    voiceRecordingSchid_.store(schid, std::memory_order_release);
+    voiceTxLastNudgeMs_.store(nowMs, std::memory_order_release);
+}
+
+void MicMixApp::NudgeCapturePath(uint64 schid) {
+    (void)schid;
+}
+
+void MicMixApp::RefreshVoiceTxControl(uint64 schidHint) {
+    uint64 schid = schidHint;
+    if (schid == 0) {
+        schid = activeSchid_.load(std::memory_order_acquire);
+    }
+    if (schid == 0 && g_ts3Functions.getCurrentServerConnectionHandlerID) {
+        schid = g_ts3Functions.getCurrentServerConnectionHandlerID();
+        if (schid != 0) {
+            activeSchid_.store(schid, std::memory_order_release);
+        }
+    }
+    if (!IsConnectedForTx(schid)) {
+        SetVoiceRecordingState(false, 0);
+        return;
+    }
+
+    const MicMixSettings s = GetSettings();
+    const SourceStatus st = sourceManager_ ? sourceManager_->GetStatus() : SourceStatus{};
+    const TelemetrySnapshot t = engine_.SnapshotTelemetry();
+    const bool sourceUp = (st.state == SourceState::Running) ||
+                          (st.state == SourceState::Starting) ||
+                          (st.state == SourceState::Reacquiring);
+    const bool shouldKeepCaptureActive = s.forceTxEnabled && sourceUp && !s.musicMuted && t.musicActive;
+    SetVoiceRecordingState(shouldKeepCaptureActive, schid);
+}
+
+void MicMixApp::VoiceTxThreadMain() {
+    voiceTxThreadRunning_.store(true, std::memory_order_release);
+    uint64_t lastLogMs = 0;
+    while (!voiceTxStop_.load(std::memory_order_acquire)) {
+        uint64 schid = activeSchid_.load(std::memory_order_acquire);
+        if (schid == 0 && g_ts3Functions.getCurrentServerConnectionHandlerID) {
+            schid = g_ts3Functions.getCurrentServerConnectionHandlerID();
+            if (schid != 0) {
+                activeSchid_.store(schid, std::memory_order_release);
+            }
+        }
+        RefreshVoiceTxControl(schid);
+
+        if (g_ts3Functions.activateCaptureDevice) {
+            if (schid == 0 && g_ts3Functions.getServerConnectionHandlerList) {
+                uint64* list = nullptr;
+                if (g_ts3Functions.getServerConnectionHandlerList(&list) == ERROR_ok && list) {
+                    if (list[0] != 0) {
+                        schid = list[0];
+                        activeSchid_.store(schid, std::memory_order_release);
+                    }
+                    if (g_ts3Functions.freeMemory) {
+                        g_ts3Functions.freeMemory(list);
+                    }
+                }
+            }
+
+            if (schid != 0) {
+                const bool shouldEnsureCapture = voiceRecordingActive_.load(std::memory_order_acquire) &&
+                                                (voiceRecordingSchid_.load(std::memory_order_acquire) == schid);
+                if (shouldEnsureCapture) {
+                    bool gateByVad = false;
+                    float vadThresholdDb = -50.0f;
+                    {
+                        std::lock_guard<std::mutex> lock(voiceTxMutex_);
+                        gateByVad = savedVadValid_ && savedVadEnabled_;
+                        if (savedVadThresholdValid_) {
+                            vadThresholdDb = savedVadThresholdDbfs_;
+                        }
+                    }
+                    bool talkOpen = true;
+                    if (gateByVad && g_ts3Functions.getPreProcessorInfoValueFloat) {
+                        float micDb = -120.0f;
+                        const unsigned int errDb = g_ts3Functions.getPreProcessorInfoValueFloat(
+                            schid, "decibel_last_period", &micDb);
+                        if (errDb == ERROR_ok || errDb == ERROR_ok_no_update) {
+                            talkOpen = micDb >= (vadThresholdDb - 1.0f);
+                        }
+                    }
+                    engine_.SetTalkState(talkOpen);
+
+                    const uint64_t nowMs = GetTickCount64();
+                    const uint64_t lastCaptureMs = lastCaptureEditTickMs_.load(std::memory_order_acquire);
+                    const uint64_t lastNudgeMs = lastCaptureReopenTickMs_.load(std::memory_order_acquire);
+                    if (nowMs > (lastCaptureMs + 1200ULL) && nowMs > (lastNudgeMs + 1200ULL)) {
+                        const unsigned int err = g_ts3Functions.activateCaptureDevice(schid);
+                        lastCaptureReopenTickMs_.store(nowMs, std::memory_order_release);
+                        if (!(err == ERROR_ok || err == ERROR_ok_no_update)) {
+                            if (nowMs > (lastLogMs + 2000ULL)) {
+                                LogWarn("capture_activate watchdog failed schid=" + std::to_string(schid) +
+                                        " err=" + std::to_string(err));
+                                lastLogMs = nowMs;
+                            }
+                        } else if (nowMs > (lastLogMs + 3000ULL)) {
+                            LogInfo("capture_activate watchdog schid=" + std::to_string(schid) +
+                                    " err=" + std::to_string(err));
+                            lastLogMs = nowMs;
+                        }
+                    }
+                } else {
+                    engine_.SetTalkState(true);
+                }
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    SetVoiceRecordingState(false, 0);
+    voiceTxThreadRunning_.store(false, std::memory_order_release);
+}
+
+void MicMixApp::StartVoiceTxThread() {
+    if (voiceTxThread_.joinable()) {
+        return;
+    }
+    voiceTxStop_.store(false, std::memory_order_release);
+    voiceTxThread_ = std::thread([this]() { VoiceTxThreadMain(); });
+}
+
+void MicMixApp::StopVoiceTxThread() {
+    voiceTxStop_.store(true, std::memory_order_release);
+    if (voiceTxThread_.joinable()) {
+        voiceTxThread_.join();
+    }
+    SetVoiceRecordingState(false, 0);
+}
+
 bool MicMixApp::Initialize(const std::string& configBasePath) {
     if (initialized_.exchange(true)) return true;
     configStore_ = std::make_unique<ConfigStore>(configBasePath);
     g_logPath = configStore_->LogPath();
     std::string warn;
     configStore_->Load(settings_, warn);
+    SanitizeSettings(settings_);
     if (!warn.empty()) LogWarn(warn);
     engine_.ApplySettings(settings_);
     // Disabled intentionally: an additional capture stream can interfere with
@@ -2081,6 +2554,10 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
         });
     sourceManager_->ApplySettings(settings_);
     if (settings_.autostartEnabled) sourceManager_->Start();
+    const uint64_t nowMs = GetTickCount64();
+    lastCaptureEditTickMs_.store(nowMs, std::memory_order_release);
+    lastCaptureReopenTickMs_.store(0, std::memory_order_release);
+    StartVoiceTxThread();
     LogInfo("MicMix initialized");
     return true;
 }
@@ -2090,6 +2567,7 @@ void MicMixApp::Shutdown() {
     SettingsWindowController::Instance().Close();
     if (hotkeyManager_) hotkeyManager_->Stop();
     if (sourceManager_) sourceManager_->Stop();
+    StopVoiceTxThread();
     if (configStore_) {
         std::string err;
         configStore_->Save(settings_, err);
@@ -2106,21 +2584,29 @@ MicMixSettings MicMixApp::GetSettings() const {
 }
 
 void MicMixApp::ApplySettings(const MicMixSettings& settings, bool restartSource, bool saveConfig) {
+    MicMixSettings safe = settings;
+    SanitizeSettings(safe);
+    bool changed = false;
     {
         std::lock_guard<std::mutex> lock(settingsMutex_);
-        settings_ = settings;
+        changed = !IsSameSettings(settings_, safe);
+        settings_ = safe;
     }
-    engine_.ApplySettings(settings);
+    if (!changed && !restartSource) {
+        return;
+    }
+
+    engine_.ApplySettings(safe);
     if (hotkeyManager_) {
-        hotkeyManager_->ApplySettings(settings);
+        hotkeyManager_->ApplySettings(safe);
     }
     if (sourceManager_) {
-        sourceManager_->ApplySettings(settings);
+        sourceManager_->ApplySettings(safe);
         if (restartSource && sourceManager_->IsRunning()) sourceManager_->Restart();
     }
-    if (saveConfig && configStore_) {
+    if (saveConfig && changed && configStore_) {
         std::string err;
-        if (!configStore_->Save(settings, err) && !err.empty()) LogError("Config save failed: " + err);
+        if (!configStore_->Save(safe, err) && !err.empty()) LogError("Config save failed: " + err);
     }
 }
 
@@ -2152,6 +2638,22 @@ void MicMixApp::SetTalkStateForOwnClient(uint64 schid, anyID clientId, int talkS
 
 void MicMixApp::SetActiveServer(uint64 schid) {
     activeSchid_.store(schid, std::memory_order_release);
+    RefreshVoiceTxControl(schid);
+}
+
+void MicMixApp::OnConnectStatusChange(uint64 schid, int newStatus, unsigned int errorNumber) {
+    (void)errorNumber;
+    if (newStatus == STATUS_DISCONNECTED) {
+        if (activeSchid_.load(std::memory_order_acquire) == schid) {
+            activeSchid_.store(0, std::memory_order_release);
+        }
+        SetVoiceRecordingState(false, 0);
+        return;
+    }
+    if (newStatus == STATUS_CONNECTION_ESTABLISHED || newStatus == STATUS_CONNECTION_ESTABLISHING || newStatus == STATUS_CONNECTED) {
+        activeSchid_.store(schid, std::memory_order_release);
+        RefreshVoiceTxControl(schid);
+    }
 }
 std::vector<LoopbackDeviceInfo> MicMixApp::GetLoopbackDevices() const { return AudioSourceManager::EnumerateLoopbackDevices(); }
 std::vector<CaptureDeviceInfo> MicMixApp::GetCaptureDevices() const { return AudioSourceManager::EnumerateCaptureDevices(); }
@@ -2199,6 +2701,8 @@ void MicMixApp::RefreshAppList() {}
 
 void MicMixApp::EditCapturedVoice(uint64 schid, short* samples, int sampleCount, int channels, int* edited) {
     if (!initialized_.load(std::memory_order_acquire)) return;
+    const uint64_t nowMs = GetTickCount64();
+    lastCaptureEditTickMs_.store(nowMs, std::memory_order_release);
     (void)schid;
     engine_.EditCapturedVoice(samples, sampleCount, channels, edited);
 }

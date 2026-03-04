@@ -68,7 +68,7 @@ struct UiTheme {
 std::mutex g_mutex;
 std::thread g_thread;
 std::atomic<bool> g_running{false};
-HWND g_hwnd = nullptr;
+std::atomic<HWND> g_hwnd{nullptr};
 std::vector<LoopbackDeviceInfo> g_loopbacks;
 std::vector<CaptureDeviceInfo> g_captureDevices;
 std::vector<AppProcessInfo> g_apps;
@@ -100,6 +100,7 @@ RECT g_rcMeter{};
 float g_meterVisualDb = -60.0f;
 float g_meterHoldDb = -60.0f;
 TelemetrySnapshot g_lastTelemetry{};
+std::wstring g_lastStatusText;
 
 int S(int px) {
     return MulDiv(px, g_dpi, 96);
@@ -160,6 +161,10 @@ void SetControlFont(HWND hwnd, int id, HFONT font) {
 }
 
 void SetStatusText(HWND hwnd, const std::wstring& text) {
+    if (text == g_lastStatusText) {
+        return;
+    }
+    g_lastStatusText = text;
     SetWindowTextW(GetDlgItem(hwnd, IDC_STATUS), text.c_str());
 }
 
@@ -874,7 +879,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
-        g_hwnd = nullptr;
+        g_hwnd.store(nullptr, std::memory_order_release);
+        g_lastStatusText.clear();
         KillTimer(hwnd, 1);
         ReleaseUiResources();
         PostQuitMessage(0);
@@ -914,7 +920,7 @@ void WindowThreadMain() {
         g_running.store(false, std::memory_order_release);
         return;
     }
-    g_hwnd = hwnd;
+    g_hwnd.store(hwnd, std::memory_order_release);
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
 
@@ -939,9 +945,10 @@ void SettingsWindowController::Open() {
         g_thread.join();
     }
     if (g_running.load(std::memory_order_acquire)) {
-        if (g_hwnd) {
-            ShowWindow(g_hwnd, SW_RESTORE);
-            SetForegroundWindow(g_hwnd);
+        HWND hwnd = g_hwnd.load(std::memory_order_acquire);
+        if (hwnd) {
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
         }
         return;
     }
@@ -955,8 +962,9 @@ void SettingsWindowController::Close() {
         if (g_thread.joinable()) g_thread.join();
         return;
     }
-    if (g_hwnd) {
-        PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+    HWND hwnd = g_hwnd.load(std::memory_order_acquire);
+    if (hwnd) {
+        PostMessageW(hwnd, WM_CLOSE, 0, 0);
     }
     if (g_thread.joinable()) {
         g_thread.join();

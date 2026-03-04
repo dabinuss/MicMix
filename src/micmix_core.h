@@ -170,8 +170,10 @@ public:
     }
 
     void Reset() {
-        readIndex_.store(0, std::memory_order_release);
-        writeIndex_.store(0, std::memory_order_release);
+        // Keep monotonic counters and just drop buffered data. This avoids
+        // unsigned underflow races if producer/consumer are active concurrently.
+        const size_t write = writeIndex_.load(std::memory_order_acquire);
+        readIndex_.store(write, std::memory_order_release);
     }
 
 private:
@@ -227,7 +229,7 @@ private:
     std::atomic<float> duckAmountLinear_{0.25f};
     std::atomic<float> duckAttackMs_{20.0f};
     std::atomic<float> duckReleaseMs_{220.0f};
-    std::atomic<bool>  talkState_{false};
+    std::atomic<bool>  talkState_{true};
     std::atomic<bool>  hotkeyDucking_{false};
     std::atomic<float> duckMeterLinear_{1.0f};
     std::atomic<bool>  duckingNow_{false};
@@ -309,6 +311,7 @@ public:
     void TogglePushToPlay();
     void SetTalkStateForOwnClient(uint64 schid, anyID clientId, int talkStatus);
     void SetActiveServer(uint64 schid);
+    void OnConnectStatusChange(uint64 schid, int newStatus, unsigned int errorNumber);
 
     std::vector<LoopbackDeviceInfo> GetLoopbackDevices() const;
     std::vector<CaptureDeviceInfo> GetCaptureDevices() const;
@@ -327,6 +330,12 @@ public:
 private:
     MicMixApp();
     ~MicMixApp();
+    void StartVoiceTxThread();
+    void StopVoiceTxThread();
+    void VoiceTxThreadMain();
+    void SetVoiceRecordingState(bool active, uint64 schid);
+    void RefreshVoiceTxControl(uint64 schidHint);
+    void NudgeCapturePath(uint64 schid);
 
     std::atomic<bool> initialized_{false};
     std::unique_ptr<ConfigStore> configStore_;
@@ -338,6 +347,22 @@ private:
     std::unique_ptr<MicLevelMonitor> micLevelMonitor_;
     std::atomic<uint64> activeSchid_{0};
     std::atomic<bool> pushToPlayActive_{false};
+    std::thread voiceTxThread_;
+    std::atomic<bool> voiceTxStop_{false};
+    std::atomic<bool> voiceTxThreadRunning_{false};
+    std::atomic<bool> voiceRecordingActive_{false};
+    std::atomic<uint64> voiceRecordingSchid_{0};
+    std::atomic_uint64_t voiceTxLastNudgeMs_{0};
+    std::atomic_uint64_t voiceControlLastEvalMs_{0};
+    std::atomic_uint64_t lastCaptureEditTickMs_{0};
+    std::atomic_uint64_t lastCaptureReopenTickMs_{0};
+    std::mutex voiceTxMutex_;
+    bool savedInputStateValid_ = false;
+    int savedInputDeactivated_ = INPUT_DEACTIVATED;
+    bool savedVadValid_ = false;
+    bool savedVadEnabled_ = false;
+    bool savedVadThresholdValid_ = false;
+    float savedVadThresholdDbfs_ = -50.0f;
 };
 
 std::string SourceStateToString(SourceState state);
