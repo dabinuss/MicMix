@@ -14,6 +14,7 @@
 #include <string>
 
 #include "micmix_core.h"
+#include "resource.h"
 
 #pragma comment(lib, "Comctl32.lib")
 #pragma comment(lib, "UxTheme.lib")
@@ -85,6 +86,10 @@ UINT g_muteHotkeyVk = 0;
 constexpr INT_PTR kSourceItemHeader = -10;
 constexpr INT_PTR kSourceItemDivider = -11;
 constexpr INT_PTR kSourceItemPlaceholder = -12;
+constexpr float kMusicGainMinDb = -30.0f;
+constexpr float kMusicGainMaxDb = -6.0f;
+constexpr int kMusicGainStepPerDb = 10;
+constexpr int kMusicGainSliderMax = static_cast<int>((kMusicGainMaxDb - kMusicGainMinDb) * static_cast<float>(kMusicGainStepPerDb));
 
 HFONT g_fontBody = nullptr;
 HFONT g_fontSmall = nullptr;
@@ -137,6 +142,17 @@ std::wstring NormalizeDeviceName(std::wstring text) {
     return text;
 }
 
+HINSTANCE GetPluginModuleHandle() {
+    HMODULE mod = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&GetPluginModuleHandle),
+                           &mod) == 0 || mod == nullptr) {
+        return GetModuleHandleW(nullptr);
+    }
+    return mod;
+}
+
 void EnsureUiResources() {
     if (!g_brushBg) g_brushBg = CreateSolidBrush(g_theme.bg);
     if (!g_brushCard) g_brushCard = CreateSolidBrush(g_theme.card);
@@ -169,12 +185,14 @@ void SetStatusText(HWND hwnd, const std::wstring& text) {
 }
 
 int GainDbToSlider(float db) {
-    const int value = static_cast<int>(db * 10.0f) + 300;
-    return std::max(0, std::min(420, value));
+    const float clamped = std::clamp(db, kMusicGainMinDb, kMusicGainMaxDb);
+    const int value = static_cast<int>((clamped - kMusicGainMinDb) * static_cast<float>(kMusicGainStepPerDb));
+    return std::max(0, std::min(kMusicGainSliderMax, value));
 }
 
 float SliderToGainDb(int slider) {
-    return static_cast<float>(slider - 300) / 10.0f;
+    const int clamped = std::max(0, std::min(kMusicGainSliderMax, slider));
+    return kMusicGainMinDb + (static_cast<float>(clamped) / static_cast<float>(kMusicGainStepPerDb));
 }
 
 int DuckAmountDbToSlider(float duckAmountDb) {
@@ -218,15 +236,15 @@ void UpdateMusicMeter(HWND hwnd) {
     }
 
     if (!t.musicActive) {
-        SetWindowTextW(txt, L"kein Signal");
+        SetWindowTextW(txt, L"No signal");
     } else {
         const wchar_t* grade = L"OK";
         if (shownPeakDb > -8.0f) {
-            grade = L"zu laut";
+            grade = L"too loud";
         } else if (shownPeakDb > -16.0f) {
-            grade = L"eher leiser";
+            grade = L"reduce volume";
         } else if (shownPeakDb < -35.0f) {
-            grade = L"zu leise";
+            grade = L"too quiet";
         }
         wchar_t meter[96];
         swprintf_s(meter, L"%.1f dBFS (%s)", shownPeakDb, grade);
@@ -307,10 +325,10 @@ std::wstring VkToText(UINT vk) {
 
 std::wstring FormatHotkeyText(UINT mods, UINT vk) {
     if (vk == 0) {
-        return L"Nicht gesetzt";
+        return L"Not set";
     }
     std::wstring out;
-    if ((mods & MOD_CONTROL) != 0) out += L"Strg + ";
+    if ((mods & MOD_CONTROL) != 0) out += L"Ctrl + ";
     if ((mods & MOD_ALT) != 0) out += L"Alt + ";
     if ((mods & MOD_SHIFT) != 0) out += L"Shift + ";
     if ((mods & MOD_WIN) != 0) out += L"Win + ";
@@ -326,13 +344,13 @@ void UpdateMuteHotkeyLabel(HWND hwnd) {
     if (!label) {
         return;
     }
-    const std::wstring text = L"Aktuell: " + FormatHotkeyText(g_muteHotkeyModifiers, g_muteHotkeyVk);
+    const std::wstring text = L"Current: " + FormatHotkeyText(g_muteHotkeyModifiers, g_muteHotkeyVk);
     SetWindowTextW(label, text.c_str());
 }
 
 void BeginHotkeyCapture(HWND hwnd) {
     g_waitingForHotkey = true;
-    SetWindowTextW(GetDlgItem(hwnd, IDC_MUTE_HOTKEY_TEXT), L"Aktuell: Taste drücken... (Esc=Abbrechen, Entf=Entfernen)");
+    SetWindowTextW(GetDlgItem(hwnd, IDC_MUTE_HOTKEY_TEXT), L"Current: Press key... (Esc=Cancel, Del=Clear)");
     SetFocus(hwnd);
 }
 
@@ -363,9 +381,9 @@ void PopulateCombos(HWND hwnd) {
     HWND source = GetDlgItem(hwnd, IDC_SOURCE);
     SendMessageW(source, CB_RESETCONTENT, 0, 0);
 
-    addStaticItem(source, L"Audiokanäle:", kSourceItemHeader);
+    addStaticItem(source, L"Audio Channels:", kSourceItemHeader);
     if (g_loopbacks.empty()) {
-        addStaticItem(source, L"  (keine Audiokanäle gefunden)", kSourceItemPlaceholder);
+        addStaticItem(source, L"  (no audio channels found)", kSourceItemPlaceholder);
     } else {
         for (const auto& d : g_loopbacks) {
             std::wstring label = L"  ";
@@ -381,9 +399,9 @@ void PopulateCombos(HWND hwnd) {
     }
 
     addStaticItem(source, L"------------------------------", kSourceItemDivider);
-    addStaticItem(source, L"Laufende Apps:", kSourceItemHeader);
+    addStaticItem(source, L"Running Apps:", kSourceItemHeader);
     if (g_apps.empty()) {
-        addStaticItem(source, L"  (keine laufende App gefunden)", kSourceItemPlaceholder);
+        addStaticItem(source, L"  (no running app found)", kSourceItemPlaceholder);
     } else {
         for (const auto& p : g_apps) {
             std::wstring label = L"  ";
@@ -578,8 +596,7 @@ void ApplyExplorerTheme(HWND hwnd) {
         wchar_t className[32]{};
         GetClassNameW(child, className, static_cast<int>(std::size(className)));
         if (_wcsicmp(className, WC_COMBOBOXW) == 0 ||
-            _wcsicmp(className, WC_BUTTONW) == 0 ||
-            _wcsicmp(className, TRACKBAR_CLASSW) == 0) {
+            _wcsicmp(className, WC_BUTTONW) == 0) {
             SetWindowTheme(child, L"Explorer", nullptr);
         }
         return TRUE;
@@ -599,9 +616,9 @@ void ApplyFonts(HWND hwnd) {
 }
 
 void ComputeLayout() {
-    g_rcSource = { S(16), S(78), S(684), S(206) };
-    g_rcSession = { S(16), S(216), S(684), S(306) };
-    g_rcMix = { S(16), S(316), S(684), S(530) };
+    g_rcSource = { S(16), S(82), S(684), S(220) };
+    g_rcSession = { S(16), S(232), S(684), S(340) };
+    g_rcMix = { S(16), S(352), S(684), S(590) };
 }
 
 void DrawCard(HDC hdc, const RECT& rc) {
@@ -626,7 +643,7 @@ void DrawMusicMeter(HDC hdc) {
         return;
     }
     RECT rc = g_rcMeter;
-    FillSolidRect(hdc, rc, RGB(228, 233, 240));
+    FillSolidRect(hdc, rc, RGB(235, 240, 246));
 
     const int width = rc.right - rc.left;
     const int levelPx = std::clamp(MeterDbToPixels(g_meterVisualDb, width), 0, width);
@@ -659,7 +676,7 @@ void DrawMusicMeter(HDC hdc) {
         DeleteObject(holdPen);
     }
 
-    HPEN border = CreatePen(PS_SOLID, 1, RGB(160, 170, 184));
+    HPEN border = CreatePen(PS_SOLID, 1, RGB(184, 193, 207));
     HGDIOBJ oldPen = SelectObject(hdc, border);
     HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
     Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
@@ -676,45 +693,45 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         ComputeLayout();
 
         CreateWindowW(L"STATIC", L"MicMix", WS_CHILD | WS_VISIBLE, S(20), S(14), S(220), S(36), hwnd, reinterpret_cast<HMENU>(IDC_TITLE), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Wähle genau eine Quelle: Audiokanal oder laufende App", WS_CHILD | WS_VISIBLE, S(22), S(44), S(560), S(20), hwnd, reinterpret_cast<HMENU>(IDC_SUBTITLE), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Select exactly one source: audio channel or running app", WS_CHILD | WS_VISIBLE, S(22), S(44), S(560), S(20), hwnd, reinterpret_cast<HMENU>(IDC_SUBTITLE), nullptr, nullptr);
 
         const int labelX = S(36);
         const int fieldX = S(180);
         const int sourceW = S(340);
 
-        CreateWindowW(L"STATIC", L"Audioquelle", WS_CHILD | WS_VISIBLE, labelX, S(98), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        HWND source = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | CBS_DROPDOWNLIST, fieldX, S(94), sourceW, S(360), hwnd, reinterpret_cast<HMENU>(IDC_SOURCE), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Audio Source", WS_CHILD | WS_VISIBLE, labelX, S(104), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
+        HWND source = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | CBS_DROPDOWNLIST, fieldX, S(100), sourceW, S(360), hwnd, reinterpret_cast<HMENU>(IDC_SOURCE), nullptr, nullptr);
         SendMessageW(source, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), S(24));
         SendMessageW(source, CB_SETITEMHEIGHT, 0, S(22));
         SendMessageW(source, CB_SETMINVISIBLE, 18, 0);
-        CreateWindowW(L"BUTTON", L"Aktualisieren", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, S(532), S(94), S(130), S(30), hwnd, reinterpret_cast<HMENU>(IDC_RESCAN), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Refresh", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, S(532), S(100), S(130), S(30), hwnd, reinterpret_cast<HMENU>(IDC_RESCAN), nullptr, nullptr);
 
-        CreateWindowW(L"STATIC", L"Mikrofon", WS_CHILD | WS_VISIBLE, labelX, S(136), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        HWND mic = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | CBS_DROPDOWNLIST, fieldX, S(132), S(482), S(240), hwnd, reinterpret_cast<HMENU>(IDC_MIC_DEVICE), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Microphone", WS_CHILD | WS_VISIBLE, labelX, S(148), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
+        HWND mic = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | CBS_DROPDOWNLIST, fieldX, S(144), S(482), S(240), hwnd, reinterpret_cast<HMENU>(IDC_MIC_DEVICE), nullptr, nullptr);
         SendMessageW(mic, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), S(24));
         SendMessageW(mic, CB_SETITEMHEIGHT, 0, S(22));
         SendMessageW(mic, CB_SETMINVISIBLE, 12, 0);
 
-        CreateWindowW(L"BUTTON", L"MicMix aktivieren", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, S(36), S(236), S(180), S(36), hwnd, reinterpret_cast<HMENU>(IDC_START), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"MicMix deaktivieren", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, S(228), S(236), S(180), S(36), hwnd, reinterpret_cast<HMENU>(IDC_STOP), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Audioquelle neustarten", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, S(420), S(236), S(242), S(36), hwnd, reinterpret_cast<HMENU>(IDC_SAVE), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Enable MicMix", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, S(36), S(256), S(180), S(36), hwnd, reinterpret_cast<HMENU>(IDC_START), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Disable MicMix", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, S(228), S(256), S(180), S(36), hwnd, reinterpret_cast<HMENU>(IDC_STOP), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Restart Audio Source", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, S(420), S(256), S(242), S(36), hwnd, reinterpret_cast<HMENU>(IDC_SAVE), nullptr, nullptr);
 
-        CreateWindowW(L"STATIC", L"Musik-Lautstärke", WS_CHILD | WS_VISIBLE, labelX, S(340), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        HWND gain = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS, fieldX, S(336), S(380), S(34), hwnd, reinterpret_cast<HMENU>(IDC_GAIN), nullptr, nullptr);
-        SendMessageW(gain, TBM_SETRANGE, TRUE, MAKELONG(0, 420));
-        CreateWindowW(L"STATIC", L"-6.0 dB", WS_CHILD | WS_VISIBLE, S(572), S(340), S(90), S(24), hwnd, reinterpret_cast<HMENU>(IDC_GAIN_VALUE), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Musikpegel", WS_CHILD | WS_VISIBLE, labelX, S(374), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        g_rcMeter = { fieldX, S(372), fieldX + S(380), S(372) + S(18) };
-        CreateWindowW(L"STATIC", L"kein Signal", WS_CHILD | WS_VISIBLE, S(572), S(374), S(120), S(22), hwnd, reinterpret_cast<HMENU>(IDC_METER_TEXT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Music Volume", WS_CHILD | WS_VISIBLE, labelX, S(382), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
+        HWND gain = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_NOTICKS, fieldX, S(378), S(380), S(34), hwnd, reinterpret_cast<HMENU>(IDC_GAIN), nullptr, nullptr);
+        SendMessageW(gain, TBM_SETRANGE, TRUE, MAKELONG(0, kMusicGainSliderMax));
+        CreateWindowW(L"STATIC", L"-15.0 dB", WS_CHILD | WS_VISIBLE, S(572), S(382), S(90), S(24), hwnd, reinterpret_cast<HMENU>(IDC_GAIN_VALUE), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Music Meter", WS_CHILD | WS_VISIBLE, labelX, S(420), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
+        g_rcMeter = { fieldX, S(418), fieldX + S(380), S(418) + S(20) };
+        CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE, S(572), S(420), S(120), S(22), hwnd, reinterpret_cast<HMENU>(IDC_METER_TEXT), nullptr, nullptr);
 
-        CreateWindowW(L"STATIC", L"MicMix-Mute-Hotkey", WS_CHILD | WS_VISIBLE, labelX, S(408), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Festlegen...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, fieldX, S(404), S(160), S(30), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_SET), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Aktuell: Nicht gesetzt", WS_CHILD | WS_VISIBLE, fieldX + S(172), S(408), S(290), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_TEXT), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Beim Start automatisch aktiv", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, fieldX, S(442), S(220), S(24), hwnd, reinterpret_cast<HMENU>(IDC_AUTOSTART), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Musik auch ohne Sprechen senden", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, S(430), S(442), S(240), S(24), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Musik stumm", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, fieldX, S(466), S(120), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MUTE), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"MicMix-Mute-Hotkey", WS_CHILD | WS_VISIBLE, labelX, S(456), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Set...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, fieldX, S(452), S(160), S(30), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_SET), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Current: Not set", WS_CHILD | WS_VISIBLE, fieldX + S(172), S(456), S(290), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_TEXT), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Enable on startup", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, fieldX, S(492), S(220), S(24), hwnd, reinterpret_cast<HMENU>(IDC_AUTOSTART), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Send music without speaking", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, S(430), S(492), S(240), S(24), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Mute music", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, fieldX, S(520), S(120), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MUTE), nullptr, nullptr);
 
-        CreateWindowW(L"STATIC", L"State: Stopped", WS_CHILD | WS_VISIBLE, S(36), S(532), S(626), S(46), hwnd, reinterpret_cast<HMENU>(IDC_STATUS), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"State: Stopped", WS_CHILD | WS_VISIBLE, S(36), S(598), S(626), S(54), hwnd, reinterpret_cast<HMENU>(IDC_STATUS), nullptr, nullptr);
 
         ApplyExplorerTheme(hwnd);
         ApplyFonts(hwnd);
@@ -864,12 +881,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, g_theme.muted);
         SelectObject(hdc, g_fontSmall);
-        const wchar_t* h1 = L"AUDIOQUELLE";
-        const wchar_t* h2 = L"MUSIK SENDEN";
-        const wchar_t* h3 = L"PEGEL & VERHALTEN";
-        TextOutW(hdc, S(30), S(82), h1, lstrlenW(h1));
-        TextOutW(hdc, S(30), S(220), h2, lstrlenW(h2));
-        TextOutW(hdc, S(30), S(320), h3, lstrlenW(h3));
+        const wchar_t* h1 = L"AUDIO SOURCE";
+        const wchar_t* h2 = L"SEND MUSIC";
+        const wchar_t* h3 = L"LEVEL & BEHAVIOR";
+        TextOutW(hdc, S(30), S(86), h1, lstrlenW(h1));
+        TextOutW(hdc, S(30), S(236), h2, lstrlenW(h2));
+        TextOutW(hdc, S(30), S(356), h3, lstrlenW(h3));
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -894,12 +911,13 @@ void WindowThreadMain() {
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES };
     InitCommonControlsEx(&icc);
 
-    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    HINSTANCE hInst = GetPluginModuleHandle();
     WNDCLASSW wc{};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
     wc.lpszClassName = L"MicMixSettingsWindow";
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APP_ICON));
     wc.hbrBackground = nullptr;
     RegisterClassW(&wc);
 
@@ -911,7 +929,7 @@ void WindowThreadMain() {
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         S(716),
-        S(640),
+        S(700),
         nullptr,
         nullptr,
         hInst,
@@ -920,6 +938,8 @@ void WindowThreadMain() {
         g_running.store(false, std::memory_order_release);
         return;
     }
+    SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APP_ICON))));
+    SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APP_ICON_SMALL))));
     g_hwnd.store(hwnd, std::memory_order_release);
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);

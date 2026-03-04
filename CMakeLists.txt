@@ -41,6 +41,7 @@ add_library(micmix SHARED
   src/plugin_main.cpp
   src/micmix_core.cpp
   src/settings_window.cpp
+  resources/micmix.rc
 )
 
 target_include_directories(micmix PRIVATE

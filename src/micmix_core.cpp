@@ -191,7 +191,7 @@ bool IsDigitsOnly(const std::string& value) {
 
 void SanitizeSettings(MicMixSettings& s) {
     s.configVersion = std::clamp(s.configVersion, 1, 8);
-    s.musicGainDb = std::clamp(s.musicGainDb, -30.0f, 18.0f);
+    s.musicGainDb = std::clamp(s.musicGainDb, -30.0f, -6.0f);
     s.bufferTargetMs = std::clamp(s.bufferTargetMs, 20, 250);
     s.muteHotkeyModifiers &= (MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN);
     s.muteHotkeyVk = std::clamp(s.muteHotkeyVk, 0, 255);
@@ -719,7 +719,7 @@ float AudioEngine::DbToLinear(float db) {
 }
 
 void AudioEngine::ApplySettings(const MicMixSettings& settings) {
-    const float gainDb = std::clamp(settings.musicGainDb, -30.0f, 18.0f);
+    const float gainDb = std::clamp(settings.musicGainDb, -30.0f, -6.0f);
     const int bufferMs = std::clamp(settings.bufferTargetMs, 20, 250);
     musicMuted_.store(settings.musicMuted, std::memory_order_release);
     forceTxEnabled_.store(settings.forceTxEnabled, std::memory_order_release);

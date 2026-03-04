@@ -14,6 +14,7 @@ namespace {
 
 constexpr int PLUGIN_API_VERSION = 26;
 constexpr int MENU_ID_SETTINGS = 1;
+constexpr char MENU_ICON_FILE[] = "menu_icon.png";
 
 char* g_pluginIdRaw = nullptr;
 
@@ -130,9 +131,13 @@ void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
         *menuIcon = nullptr;
         return;
     }
-    (*menuItems)[0] = CreateMenuItem(PLUGIN_MENU_TYPE_GLOBAL, MENU_ID_SETTINGS, "MicMix Settings...", "");
+    (*menuItems)[0] = CreateMenuItem(PLUGIN_MENU_TYPE_GLOBAL, MENU_ID_SETTINGS, "MicMix Settings...", MENU_ICON_FILE);
     (*menuItems)[1] = nullptr;
-    *menuIcon = nullptr;
+    *menuIcon = static_cast<char*>(std::malloc(PLUGIN_MENU_BUFSZ));
+    if (!*menuIcon) {
+        return;
+    }
+    strcpy_s(*menuIcon, PLUGIN_MENU_BUFSZ, MENU_ICON_FILE);
 }
 
 void ts3plugin_initHotkeys(struct PluginHotkey*** hotkeys) {
