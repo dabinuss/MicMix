@@ -79,6 +79,7 @@ target_link_libraries(micmix PRIVATE
   ole32
   uuid
   avrt
+  winmm
   mmdevapi
   propsys
   comctl32

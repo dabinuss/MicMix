@@ -294,6 +294,7 @@ private:
 
 class GlobalHotkeyManager;
 class MicLevelMonitor;
+class MixMonitorPlayer;
 
 class MicMixApp {
 public:
@@ -307,6 +308,9 @@ public:
     void StartSource();
     void StopSource();
     void ToggleMute();
+    void SetMonitorEnabled(bool enabled);
+    bool IsMonitorEnabled() const;
+    void ToggleMonitor();
     void SetPushToPlayActive(bool active);
     void TogglePushToPlay();
     void SetTalkStateForOwnClient(uint64 schid, anyID clientId, int talkStatus);
@@ -345,6 +349,7 @@ private:
     std::unique_ptr<AudioSourceManager> sourceManager_;
     std::unique_ptr<GlobalHotkeyManager> hotkeyManager_;
     std::unique_ptr<MicLevelMonitor> micLevelMonitor_;
+    std::unique_ptr<MixMonitorPlayer> mixMonitorPlayer_;
     std::atomic<uint64> activeSchid_{0};
     std::atomic<bool> pushToPlayActive_{false};
     std::thread voiceTxThread_;

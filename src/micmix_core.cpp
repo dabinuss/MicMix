@@ -7,6 +7,7 @@
 #include <functiondiscoverykeys_devpkey.h>
 #include <Shlwapi.h>
 #include <tlhelp32.h>
+#include <mmsystem.h>
 #include <wrl/client.h>
 
 #include <speex/speex_resampler.h>
@@ -2079,6 +2080,167 @@ private:
     }
 };
 
+class MixMonitorPlayer {
+public:
+    MixMonitorPlayer()
+        : ring_(kTargetRate * 4) {}
+
+    ~MixMonitorPlayer() {
+        Stop();
+    }
+
+    void SetEnabled(bool enabled) {
+        if (enabled) {
+            Start();
+        } else {
+            Stop();
+        }
+    }
+
+    bool IsEnabled() const {
+        return enabled_.load(std::memory_order_acquire);
+    }
+
+    void PushCaptured(const short* samples, int sampleCount, int channels) {
+        if (!IsEnabled() || !samples || sampleCount <= 0 || channels <= 0) {
+            return;
+        }
+        const size_t frames = static_cast<size_t>(sampleCount);
+        thread_local std::vector<short> stereo;
+        stereo.resize(frames * 2);
+        for (size_t i = 0; i < frames; ++i) {
+            const size_t base = i * static_cast<size_t>(channels);
+            const short l = samples[base];
+            const short r = (channels >= 2) ? samples[base + 1] : l;
+            stereo[(i * 2) + 0] = l;
+            stereo[(i * 2) + 1] = r;
+        }
+        const size_t written = ring_.Write(stereo.data(), stereo.size());
+        if (written < stereo.size()) {
+            droppedSamples_.fetch_add(static_cast<uint64_t>(stereo.size() - written), std::memory_order_relaxed);
+        }
+    }
+
+private:
+    struct Block {
+        WAVEHDR header{};
+        std::vector<short> data;
+        bool prepared = false;
+        bool queued = false;
+    };
+
+    static constexpr int kBlockFrames = 960; // 20ms @ 48kHz
+    static constexpr int kBlockCount = 6;
+
+    SpscRingBuffer<short> ring_;
+    std::thread thread_;
+    std::atomic<bool> enabled_{false};
+    std::atomic<bool> stop_{false};
+    std::atomic_uint64_t droppedSamples_{0};
+
+    void Start() {
+        if (thread_.joinable()) {
+            return;
+        }
+        ring_.Reset();
+        droppedSamples_.store(0, std::memory_order_release);
+        stop_.store(false, std::memory_order_release);
+        enabled_.store(true, std::memory_order_release);
+        try {
+            thread_ = std::thread([this]() { ThreadMain(); });
+        } catch (const std::exception& ex) {
+            enabled_.store(false, std::memory_order_release);
+            stop_.store(true, std::memory_order_release);
+            LogError(std::string("mix_monitor thread start failed: ") + ex.what());
+        } catch (...) {
+            enabled_.store(false, std::memory_order_release);
+            stop_.store(true, std::memory_order_release);
+            LogError("mix_monitor thread start failed: unknown");
+        }
+    }
+
+    void Stop() {
+        enabled_.store(false, std::memory_order_release);
+        stop_.store(true, std::memory_order_release);
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+        ring_.Reset();
+    }
+
+    void ThreadMain() {
+        WAVEFORMATEX wf{};
+        wf.wFormatTag = WAVE_FORMAT_PCM;
+        wf.nChannels = 2;
+        wf.nSamplesPerSec = kTargetRate;
+        wf.wBitsPerSample = 16;
+        wf.nBlockAlign = static_cast<WORD>((wf.nChannels * wf.wBitsPerSample) / 8);
+        wf.nAvgBytesPerSec = wf.nSamplesPerSec * wf.nBlockAlign;
+        wf.cbSize = 0;
+
+        HWAVEOUT wave = nullptr;
+        const MMRESULT openRes = waveOutOpen(&wave, WAVE_MAPPER, &wf, 0, 0, CALLBACK_NULL);
+        if (openRes != MMSYSERR_NOERROR || !wave) {
+            enabled_.store(false, std::memory_order_release);
+            LogWarn("mix_monitor open failed code=" + std::to_string(openRes));
+            return;
+        }
+
+        std::vector<Block> blocks(static_cast<size_t>(kBlockCount));
+        for (auto& block : blocks) {
+            block.data.resize(static_cast<size_t>(kBlockFrames) * 2);
+            block.header = {};
+            block.header.lpData = reinterpret_cast<LPSTR>(block.data.data());
+            block.header.dwBufferLength = static_cast<DWORD>(block.data.size() * sizeof(short));
+            if (waveOutPrepareHeader(wave, &block.header, sizeof(WAVEHDR)) == MMSYSERR_NOERROR) {
+                block.prepared = true;
+            }
+        }
+
+        while (!stop_.load(std::memory_order_acquire)) {
+            bool wroteAny = false;
+            for (auto& block : blocks) {
+                if (!block.prepared) {
+                    continue;
+                }
+                if (block.queued && (block.header.dwFlags & WHDR_DONE) == 0) {
+                    continue;
+                }
+                block.queued = false;
+                const size_t need = block.data.size();
+                const size_t got = ring_.Read(block.data.data(), need);
+                if (got < need) {
+                    std::fill(block.data.begin() + static_cast<std::ptrdiff_t>(got), block.data.end(), static_cast<short>(0));
+                }
+                block.header.dwBufferLength = static_cast<DWORD>(need * sizeof(short));
+                block.header.dwFlags &= ~WHDR_DONE;
+                const MMRESULT wr = waveOutWrite(wave, &block.header, sizeof(WAVEHDR));
+                if (wr == MMSYSERR_NOERROR) {
+                    block.queued = true;
+                    wroteAny = true;
+                }
+            }
+            if (!wroteAny) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(6));
+            }
+        }
+
+        waveOutReset(wave);
+        for (auto& block : blocks) {
+            if (block.prepared) {
+                waveOutUnprepareHeader(wave, &block.header, sizeof(WAVEHDR));
+            }
+            block.prepared = false;
+            block.queued = false;
+        }
+        waveOutClose(wave);
+        const uint64_t dropped = droppedSamples_.load(std::memory_order_relaxed);
+        if (dropped > 0) {
+            LogWarn("mix_monitor dropped_samples=" + std::to_string(dropped));
+        }
+    }
+};
+
 AudioSourceManager::AudioSourceManager(AudioPushFn pushFn, StatusFn statusFn)
     : pushFn_(std::move(pushFn)), statusFn_(std::move(statusFn)) {}
 
@@ -2569,6 +2731,16 @@ void MicMixApp::VoiceTxThreadMain() {
             }
             RefreshVoiceTxControl(schid);
 
+            if (schid != 0 && g_ts3Functions.getPreProcessorInfoValueFloat) {
+                float micDb = -120.0f;
+                const unsigned int errDb = g_ts3Functions.getPreProcessorInfoValueFloat(
+                    schid, "decibel_last_period", &micDb);
+                if (errDb == ERROR_ok || errDb == ERROR_ok_no_update) {
+                    const float linear = std::pow(10.0f, std::clamp(micDb, -120.0f, 0.0f) / 20.0f);
+                    engine_.SetExternalMicLevel(linear);
+                }
+            }
+
             if (g_ts3Functions.activateCaptureDevice) {
                 if (schid == 0 && g_ts3Functions.getServerConnectionHandlerList) {
                     uint64* list = nullptr;
@@ -2710,6 +2882,7 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
                 LogInfo(line);
             });
         sourceManager_->ApplySettings(settings_);
+        mixMonitorPlayer_ = std::make_unique<MixMonitorPlayer>();
         if (settings_.autostartEnabled) sourceManager_->Start();
         const uint64_t nowMs = GetTickCount64();
         lastCaptureEditTickMs_.store(nowMs, std::memory_order_release);
@@ -2726,9 +2899,11 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
     StopVoiceTxThread();
     if (hotkeyManager_) hotkeyManager_->Stop();
     if (sourceManager_) sourceManager_->Stop();
+    if (mixMonitorPlayer_) mixMonitorPlayer_->SetEnabled(false);
     micLevelMonitor_.reset();
     hotkeyManager_.reset();
     sourceManager_.reset();
+    mixMonitorPlayer_.reset();
     configStore_.reset();
     initialized_.store(false, std::memory_order_release);
     return false;
@@ -2739,6 +2914,7 @@ void MicMixApp::Shutdown() {
     SettingsWindowController::Instance().Close();
     if (hotkeyManager_) hotkeyManager_->Stop();
     if (sourceManager_) sourceManager_->Stop();
+    if (mixMonitorPlayer_) mixMonitorPlayer_->SetEnabled(false);
     StopVoiceTxThread();
     if (configStore_) {
         std::string err;
@@ -2747,6 +2923,7 @@ void MicMixApp::Shutdown() {
     }
     hotkeyManager_.reset();
     sourceManager_.reset();
+    mixMonitorPlayer_.reset();
     configStore_.reset();
 }
 
@@ -2792,6 +2969,21 @@ void MicMixApp::ToggleMute() {
     ApplySettings(s, false, true);
 }
 
+void MicMixApp::SetMonitorEnabled(bool enabled) {
+    if (mixMonitorPlayer_) {
+        mixMonitorPlayer_->SetEnabled(enabled);
+        LogInfo(std::string("mix_monitor ") + (mixMonitorPlayer_->IsEnabled() ? "enabled" : "disabled"));
+    }
+}
+
+bool MicMixApp::IsMonitorEnabled() const {
+    return mixMonitorPlayer_ ? mixMonitorPlayer_->IsEnabled() : false;
+}
+
+void MicMixApp::ToggleMonitor() {
+    SetMonitorEnabled(!IsMonitorEnabled());
+}
+
 void MicMixApp::SetPushToPlayActive(bool active) {
     pushToPlayActive_.store(active, std::memory_order_release);
     engine_.SetMuted(!active);
@@ -2833,7 +3025,27 @@ std::vector<AppProcessInfo> MicMixApp::GetAppProcesses() const {
     return AudioSourceManager::EnumerateAppProcesses();
 }
 SourceStatus MicMixApp::GetSourceStatus() const { return sourceManager_ ? sourceManager_->GetStatus() : SourceStatus{}; }
-TelemetrySnapshot MicMixApp::GetTelemetry() const { return engine_.SnapshotTelemetry(); }
+TelemetrySnapshot MicMixApp::GetTelemetry() const {
+    TelemetrySnapshot t = engine_.SnapshotTelemetry();
+    if (t.micRmsDbfs > -119.0f || !g_ts3Functions.getPreProcessorInfoValueFloat) {
+        return t;
+    }
+
+    uint64 schid = activeSchid_.load(std::memory_order_acquire);
+    if (schid == 0 && g_ts3Functions.getCurrentServerConnectionHandlerID) {
+        schid = g_ts3Functions.getCurrentServerConnectionHandlerID();
+    }
+    if (schid == 0) {
+        return t;
+    }
+    float micDb = -120.0f;
+    const unsigned int errDb = g_ts3Functions.getPreProcessorInfoValueFloat(
+        schid, "decibel_last_period", &micDb);
+    if (errDb == ERROR_ok || errDb == ERROR_ok_no_update) {
+        t.micRmsDbfs = std::clamp(micDb, -120.0f, 0.0f);
+    }
+    return t;
+}
 std::string MicMixApp::GetConfigDir() const { return configStore_ ? configStore_->ConfigPath() : std::string{}; }
 std::string MicMixApp::GetPreferredTsCaptureDeviceName() const {
     uint64 schid = activeSchid_.load(std::memory_order_acquire);
@@ -2870,6 +3082,9 @@ void MicMixApp::EditCapturedVoice(uint64 schid, short* samples, int sampleCount,
     lastCaptureEditTickMs_.store(nowMs, std::memory_order_release);
     (void)schid;
     engine_.EditCapturedVoice(samples, sampleCount, channels, edited);
+    if (mixMonitorPlayer_) {
+        mixMonitorPlayer_->PushCaptured(samples, sampleCount, channels);
+    }
 }
 
 void MicMixApp::OpenSettingsWindow() {
