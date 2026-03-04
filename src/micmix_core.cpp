@@ -20,6 +20,7 @@
 #include <cstring>
 #include <cwctype>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -115,16 +116,17 @@ void AppendLogLine(const char* level, const std::string& text) {
 
     if ((++g_logWriteCount % 128U) == 0U) {
         std::error_code ec;
-        const uintmax_t size = std::filesystem::file_size(g_logPath, ec);
+        const std::filesystem::path logPath = std::filesystem::path(Utf8ToWide(g_logPath));
+        const uintmax_t size = std::filesystem::file_size(logPath, ec);
         if (!ec && size > (4U * 1024U * 1024U)) {
-            std::ofstream trunc(g_logPath, std::ios::trunc);
+            std::ofstream trunc(logPath, std::ios::trunc);
             if (trunc.is_open()) {
                 trunc << "log rotated: exceeded 4 MiB\n";
             }
         }
     }
 
-    std::ofstream out(g_logPath, std::ios::app);
+    std::ofstream out(std::filesystem::path(Utf8ToWide(g_logPath)), std::ios::app);
     if (!out.is_open()) {
         return;
     }
@@ -551,12 +553,12 @@ ConfigStore::ConfigStore(std::string basePath)
     if (!basePath_.empty() && basePath_.back() != '\\') {
         basePath_.push_back('\\');
     }
-    const std::filesystem::path dir = std::filesystem::path(basePath_) / "plugins" / "micmix";
+    const std::filesystem::path dir = std::filesystem::path(Utf8ToWide(basePath_)) / L"plugins" / L"micmix";
     std::filesystem::create_directories(dir);
-    configPath_ = (dir / "config.json").string();
-    tmpPath_ = (dir / "config.tmp").string();
-    lastGoodPath_ = (dir / "config.lastgood.json").string();
-    logPath_ = (dir / "micmix.log").string();
+    configPath_ = WideToUtf8((dir / L"config.json").wstring());
+    tmpPath_ = WideToUtf8((dir / L"config.tmp").wstring());
+    lastGoodPath_ = WideToUtf8((dir / L"config.lastgood.json").wstring());
+    logPath_ = WideToUtf8((dir / L"micmix.log").wstring());
 }
 
 std::string ConfigStore::Trim(const std::string& value) {
@@ -605,7 +607,7 @@ DuckingMode ConfigStore::DuckingModeFromString(const std::string& value) {
 
 bool ConfigStore::Load(MicMixSettings& outSettings, std::string& warning) {
     warning.clear();
-    std::ifstream in(configPath_);
+    std::ifstream in(std::filesystem::path(Utf8ToWide(configPath_)));
     if (!in.is_open()) {
         return true;
     }
@@ -624,31 +626,50 @@ bool ConfigStore::Load(MicMixSettings& outSettings, std::string& warning) {
         kv[Trim(line.substr(0, eq))] = Trim(line.substr(eq + 1));
     }
 
-    try {
-        if (auto it = kv.find("config.version"); it != kv.end()) outSettings.configVersion = std::stoi(it->second);
-        if (auto it = kv.find("source.mode"); it != kv.end()) outSettings.sourceMode = SourceModeFromString(it->second);
-        if (auto it = kv.find("source.loopback.device_id"); it != kv.end()) outSettings.loopbackDeviceId = it->second;
-        if (auto it = kv.find("source.app.process_name"); it != kv.end()) {
-            outSettings.appProcessName = it->second;
-        } else if (auto itLegacy = kv.find("source.spotify.process_name"); itLegacy != kv.end()) {
-            outSettings.appProcessName = itLegacy->second;
+    bool parseIssue = false;
+    auto parseInt = [&](const char* key, int& outValue) {
+        if (auto it = kv.find(key); it != kv.end()) {
+            try {
+                outValue = std::stoi(it->second);
+            } catch (...) {
+                parseIssue = true;
+            }
         }
-        if (auto it = kv.find("source.app.session_id"); it != kv.end()) {
-            outSettings.appSessionId = it->second;
-        } else if (auto itLegacy = kv.find("source.spotify.session_id"); itLegacy != kv.end()) {
-            outSettings.appSessionId = itLegacy->second;
+    };
+    auto parseFloat = [&](const char* key, float& outValue) {
+        if (auto it = kv.find(key); it != kv.end()) {
+            try {
+                outValue = std::stof(it->second);
+            } catch (...) {
+                parseIssue = true;
+            }
         }
-        if (auto it = kv.find("source.autostart_enabled"); it != kv.end()) outSettings.autostartEnabled = ::ParseBool(it->second, outSettings.autostartEnabled);
-        if (auto it = kv.find("source.auto_switch_to_loopback"); it != kv.end()) outSettings.autoSwitchToLoopback = ::ParseBool(it->second, outSettings.autoSwitchToLoopback);
-        if (auto it = kv.find("mix.music_gain_db"); it != kv.end()) outSettings.musicGainDb = std::stof(it->second);
-        if (auto it = kv.find("mix.force_tx_enabled"); it != kv.end()) outSettings.forceTxEnabled = ::ParseBool(it->second, outSettings.forceTxEnabled);
-        if (auto it = kv.find("mix.buffer_target_ms"); it != kv.end()) outSettings.bufferTargetMs = std::stoi(it->second);
-        if (auto it = kv.find("mix.music_muted"); it != kv.end()) outSettings.musicMuted = ::ParseBool(it->second, outSettings.musicMuted);
-        if (auto it = kv.find("hotkey.mute.modifiers"); it != kv.end()) outSettings.muteHotkeyModifiers = std::stoi(it->second);
-        if (auto it = kv.find("hotkey.mute.vk"); it != kv.end()) outSettings.muteHotkeyVk = std::stoi(it->second);
-        if (auto it = kv.find("capture.device_id"); it != kv.end()) outSettings.captureDeviceId = it->second;
-        if (auto it = kv.find("ui.last_open_tab"); it != kv.end()) outSettings.uiLastOpenTab = std::stoi(it->second);
-    } catch (...) {
+    };
+
+    parseInt("config.version", outSettings.configVersion);
+    if (auto it = kv.find("source.mode"); it != kv.end()) outSettings.sourceMode = SourceModeFromString(it->second);
+    if (auto it = kv.find("source.loopback.device_id"); it != kv.end()) outSettings.loopbackDeviceId = it->second;
+    if (auto it = kv.find("source.app.process_name"); it != kv.end()) {
+        outSettings.appProcessName = it->second;
+    } else if (auto itLegacy = kv.find("source.spotify.process_name"); itLegacy != kv.end()) {
+        outSettings.appProcessName = itLegacy->second;
+    }
+    if (auto it = kv.find("source.app.session_id"); it != kv.end()) {
+        outSettings.appSessionId = it->second;
+    } else if (auto itLegacy = kv.find("source.spotify.session_id"); itLegacy != kv.end()) {
+        outSettings.appSessionId = itLegacy->second;
+    }
+    if (auto it = kv.find("source.autostart_enabled"); it != kv.end()) outSettings.autostartEnabled = ::ParseBool(it->second, outSettings.autostartEnabled);
+    if (auto it = kv.find("source.auto_switch_to_loopback"); it != kv.end()) outSettings.autoSwitchToLoopback = ::ParseBool(it->second, outSettings.autoSwitchToLoopback);
+    parseFloat("mix.music_gain_db", outSettings.musicGainDb);
+    if (auto it = kv.find("mix.force_tx_enabled"); it != kv.end()) outSettings.forceTxEnabled = ::ParseBool(it->second, outSettings.forceTxEnabled);
+    parseInt("mix.buffer_target_ms", outSettings.bufferTargetMs);
+    if (auto it = kv.find("mix.music_muted"); it != kv.end()) outSettings.musicMuted = ::ParseBool(it->second, outSettings.musicMuted);
+    parseInt("hotkey.mute.modifiers", outSettings.muteHotkeyModifiers);
+    parseInt("hotkey.mute.vk", outSettings.muteHotkeyVk);
+    if (auto it = kv.find("capture.device_id"); it != kv.end()) outSettings.captureDeviceId = it->second;
+    parseInt("ui.last_open_tab", outSettings.uiLastOpenTab);
+    if (parseIssue) {
         warning = "Config parse issue detected; fallback values were used.";
     }
     SanitizeSettings(outSettings);
@@ -683,7 +704,7 @@ bool ConfigStore::Save(const MicMixSettings& settings, std::string& error) {
     ss << "ui.last_open_tab=" << safe.uiLastOpenTab << "\n";
 
     {
-        std::ofstream out(tmpPath_, std::ios::binary | std::ios::trunc);
+        std::ofstream out(std::filesystem::path(Utf8ToWide(tmpPath_)), std::ios::binary | std::ios::trunc);
         if (!out.is_open()) {
             error = "open config tmp failed";
             return false;
@@ -697,10 +718,13 @@ bool ConfigStore::Save(const MicMixSettings& settings, std::string& error) {
         }
     }
 
-    if (PathFileExistsA(configPath_.c_str())) {
-        CopyFileA(configPath_.c_str(), lastGoodPath_.c_str(), FALSE);
+    const std::wstring configW = Utf8ToWide(configPath_);
+    const std::wstring tmpW = Utf8ToWide(tmpPath_);
+    const std::wstring lastGoodW = Utf8ToWide(lastGoodPath_);
+    if (PathFileExistsW(configW.c_str())) {
+        CopyFileW(configW.c_str(), lastGoodW.c_str(), FALSE);
     }
-    if (!MoveFileExA(tmpPath_.c_str(), configPath_.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    if (!MoveFileExW(tmpW.c_str(), configW.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         error = "atomic config replace failed";
         return false;
     }
@@ -1078,8 +1102,15 @@ public:
 
     bool Start() override {
         stop_.store(false, std::memory_order_release);
-        thread_ = std::thread([this] { Run(); });
-        return true;
+        try {
+            thread_ = std::thread([this] { Run(); });
+            return true;
+        } catch (const std::exception& ex) {
+            SetStatus(SourceState::Error, "thread_start_failed", "Source thread start failed", ex.what());
+        } catch (...) {
+            SetStatus(SourceState::Error, "thread_start_failed", "Source thread start failed", "");
+        }
+        return false;
     }
 
     void Stop() override {
@@ -1125,7 +1156,17 @@ private:
             std::string code;
             std::string msg;
             std::string detail;
-            if (CaptureOnce(code, msg, detail)) {
+            bool captureOk = false;
+            try {
+                captureOk = CaptureOnce(code, msg, detail);
+            } catch (const std::exception& ex) {
+                SetStatus(SourceState::Error, "capture_exception", "Source capture exception", ex.what());
+                break;
+            } catch (...) {
+                SetStatus(SourceState::Error, "capture_exception", "Source capture exception", "");
+                break;
+            }
+            if (captureOk) {
                 backoff = 1;
                 continue;
             }
@@ -1186,36 +1227,78 @@ private:
         if (!isFloat && !isPcm16) {
             code = "format_unsupported"; msg = "Unsupported loopback format"; releaseWf(); return false;
         }
-        hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 0, 0, wf, nullptr);
+        DWORD initFlags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+        hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, initFlags, 0, 0, wf, nullptr);
         if (FAILED(hr)) {
-            code = "client_init_failed"; msg = "Loopback init failed"; releaseWf(); return false;
+            initFlags = AUDCLNT_STREAMFLAGS_LOOPBACK;
+            hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, initFlags, 0, 0, wf, nullptr);
+            if (FAILED(hr)) {
+                code = "client_init_failed"; msg = "Loopback init failed"; releaseWf(); return false;
+            }
+        }
+
+        HANDLE event = nullptr;
+        auto closeEvent = [&]() {
+            if (event) {
+                CloseHandle(event);
+                event = nullptr;
+            }
+        };
+        if ((initFlags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) != 0) {
+            event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (!event) {
+                code = "event_failed"; msg = "Loopback event create failed"; releaseWf(); return false;
+            }
+            hr = client->SetEventHandle(event);
+            if (FAILED(hr)) {
+                closeEvent();
+                code = "event_set_failed"; msg = "Loopback event set failed"; releaseWf(); return false;
+            }
         }
 
         ComPtr<IAudioCaptureClient> cap;
         hr = client->GetService(IID_PPV_ARGS(&cap));
         if (FAILED(hr) || !cap) {
+            closeEvent();
             code = "capture_service_failed"; msg = "Loopback capture service failed"; releaseWf(); return false;
         }
         if (!resampler_.Configure(wf->nSamplesPerSec, kTargetRate, 6)) {
+            closeEvent();
             code = "resampler_failed"; msg = "Resampler init failed"; releaseWf(); return false;
         }
         const int channels = std::max<int>(1, wf->nChannels);
         hr = client->Start();
         if (FAILED(hr)) {
+            closeEvent();
             code = "start_failed"; msg = "Loopback start failed"; releaseWf(); return false;
         }
         SetStatus(SourceState::Running, "running", "Loopback running", "");
 
         while (!StopRequested()) {
+            if (event) {
+                const DWORD wait = WaitForSingleObject(event, 200);
+                if (wait == WAIT_TIMEOUT) {
+                    continue;
+                }
+                if (wait != WAIT_OBJECT_0) {
+                    client->Stop();
+                    closeEvent();
+                    releaseWf();
+                    code = "wait_failed"; msg = "Loopback wait failed"; return false;
+                }
+            }
             UINT32 nextPacket = 0;
             hr = cap->GetNextPacketSize(&nextPacket);
             if (FAILED(hr)) {
                 client->Stop();
+                closeEvent();
                 releaseWf();
                 code = "packet_failed"; msg = "Packet query failed"; return false;
             }
             if (nextPacket == 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                if (!event) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                }
                 continue;
             }
             while (nextPacket > 0 && !StopRequested()) {
@@ -1225,6 +1308,7 @@ private:
                 hr = cap->GetBuffer(&data, &frames, &flags, nullptr, nullptr);
                 if (FAILED(hr)) {
                     client->Stop();
+                    closeEvent();
                     releaseWf();
                     code = "buffer_failed"; msg = "Buffer fetch failed"; return false;
                 }
@@ -1249,6 +1333,7 @@ private:
                 if (!resampler_.Process(monoIn_.data(), monoIn_.size(), monoOut_)) {
                     cap->ReleaseBuffer(frames);
                     client->Stop();
+                    closeEvent();
                     releaseWf();
                     code = "resample_failed"; msg = "Resample failed"; return false;
                 }
@@ -1257,6 +1342,7 @@ private:
                 hr = cap->GetNextPacketSize(&nextPacket);
                 if (FAILED(hr)) {
                     client->Stop();
+                    closeEvent();
                     releaseWf();
                     code = "packet_failed"; msg = "Packet query failed"; return false;
                 }
@@ -1264,6 +1350,7 @@ private:
         }
 
         client->Stop();
+        closeEvent();
         releaseWf();
         return true;
     }
@@ -1539,8 +1626,19 @@ public:
         if (thread_.joinable()) {
             return;
         }
-        thread_ = std::thread([this]() { ThreadMain(); });
-        startedCv_.wait(lock, [this]() { return threadReady_; });
+        threadReady_ = false;
+        try {
+            thread_ = std::thread([this]() { ThreadMain(); });
+        } catch (const std::exception& ex) {
+            LogError(std::string("mute_hotkey thread start failed: ") + ex.what());
+            return;
+        } catch (...) {
+            LogError("mute_hotkey thread start failed: unknown");
+            return;
+        }
+        if (!startedCv_.wait_for(lock, std::chrono::seconds(2), [this]() { return threadReady_; })) {
+            LogWarn("mute_hotkey thread ready timeout");
+        }
     }
 
     void Stop() {
@@ -1652,7 +1750,13 @@ private:
             }
             if (msg.message == WM_HOTKEY && static_cast<int>(msg.wParam) == kHotkeyId) {
                 if (onHotkey_) {
-                    onHotkey_();
+                    try {
+                        onHotkey_();
+                    } catch (const std::exception& ex) {
+                        LogError(std::string("mute_hotkey callback exception: ") + ex.what());
+                    } catch (...) {
+                        LogError("mute_hotkey callback exception: unknown");
+                    }
                 }
             }
         }
@@ -1680,7 +1784,13 @@ public:
         }
         stop_ = false;
         dirty_ = true;
-        thread_ = std::thread([this]() { ThreadMain(); });
+        try {
+            thread_ = std::thread([this]() { ThreadMain(); });
+        } catch (const std::exception& ex) {
+            LogError(std::string("mic_monitor thread start failed: ") + ex.what());
+        } catch (...) {
+            LogError("mic_monitor thread start failed: unknown");
+        }
     }
 
     void Stop() {
@@ -2038,8 +2148,21 @@ void AudioSourceManager::SetStatus(SourceState state, const std::string& code, c
 
 std::unique_ptr<IAudioSource> AudioSourceManager::CreateSourceLocked() {
     auto statusForward = [this](SourceState st, const std::string& c, const std::string& m, const std::string& d) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        SetStatus(st, c, m, d);
+        StatusFn callback;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            status_.state = st;
+            status_.code = c;
+            status_.message = m;
+            status_.detail = d;
+            if (st == SourceState::Reacquiring) {
+                status_.reconnectCount += 1;
+            }
+            callback = statusFn_;
+        }
+        if (callback) {
+            callback(st, c, m, d);
+        }
     };
     if (settings_.sourceMode == SourceMode::AppSession) {
         return std::make_unique<AppSessionSource>(settings_, pushFn_, statusForward);
@@ -2309,6 +2432,7 @@ void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
         !g_ts3Functions.setClientSelfVariableAsInt ||
         !g_ts3Functions.setPreProcessorConfigValue ||
         !g_ts3Functions.flushClientSelfUpdates) {
+        clearState();
         return;
     }
 
@@ -2432,79 +2556,103 @@ void MicMixApp::RefreshVoiceTxControl(uint64 schidHint) {
 
 void MicMixApp::VoiceTxThreadMain() {
     voiceTxThreadRunning_.store(true, std::memory_order_release);
-    uint64_t lastLogMs = 0;
-    while (!voiceTxStop_.load(std::memory_order_acquire)) {
-        uint64 schid = activeSchid_.load(std::memory_order_acquire);
-        if (schid == 0 && g_ts3Functions.getCurrentServerConnectionHandlerID) {
-            schid = g_ts3Functions.getCurrentServerConnectionHandlerID();
-            if (schid != 0) {
-                activeSchid_.store(schid, std::memory_order_release);
-            }
-        }
-        RefreshVoiceTxControl(schid);
-
-        if (g_ts3Functions.activateCaptureDevice) {
-            if (schid == 0 && g_ts3Functions.getServerConnectionHandlerList) {
-                uint64* list = nullptr;
-                if (g_ts3Functions.getServerConnectionHandlerList(&list) == ERROR_ok && list) {
-                    if (list[0] != 0) {
-                        schid = list[0];
-                        activeSchid_.store(schid, std::memory_order_release);
-                    }
-                    if (g_ts3Functions.freeMemory) {
-                        g_ts3Functions.freeMemory(list);
-                    }
+    try {
+        uint64_t lastLogMs = 0;
+        uint64_t lastVadFallbackLogMs = 0;
+        while (!voiceTxStop_.load(std::memory_order_acquire)) {
+            uint64 schid = activeSchid_.load(std::memory_order_acquire);
+            if (schid == 0 && g_ts3Functions.getCurrentServerConnectionHandlerID) {
+                schid = g_ts3Functions.getCurrentServerConnectionHandlerID();
+                if (schid != 0) {
+                    activeSchid_.store(schid, std::memory_order_release);
                 }
             }
+            RefreshVoiceTxControl(schid);
 
-            if (schid != 0) {
-                const bool shouldEnsureCapture = voiceRecordingActive_.load(std::memory_order_acquire) &&
-                                                (voiceRecordingSchid_.load(std::memory_order_acquire) == schid);
-                if (shouldEnsureCapture) {
-                    bool gateByVad = false;
-                    float vadThresholdDb = -50.0f;
-                    {
-                        std::lock_guard<std::mutex> lock(voiceTxMutex_);
-                        gateByVad = savedVadValid_ && savedVadEnabled_;
-                        if (savedVadThresholdValid_) {
-                            vadThresholdDb = savedVadThresholdDbfs_;
+            if (g_ts3Functions.activateCaptureDevice) {
+                if (schid == 0 && g_ts3Functions.getServerConnectionHandlerList) {
+                    uint64* list = nullptr;
+                    if (g_ts3Functions.getServerConnectionHandlerList(&list) == ERROR_ok && list) {
+                        if (list[0] != 0) {
+                            schid = list[0];
+                            activeSchid_.store(schid, std::memory_order_release);
+                        }
+                        if (g_ts3Functions.freeMemory) {
+                            g_ts3Functions.freeMemory(list);
                         }
                     }
-                    bool talkOpen = true;
-                    if (gateByVad && g_ts3Functions.getPreProcessorInfoValueFloat) {
-                        float micDb = -120.0f;
-                        const unsigned int errDb = g_ts3Functions.getPreProcessorInfoValueFloat(
-                            schid, "decibel_last_period", &micDb);
-                        if (errDb == ERROR_ok || errDb == ERROR_ok_no_update) {
-                            talkOpen = micDb >= (vadThresholdDb - 1.0f);
-                        }
-                    }
-                    engine_.SetTalkState(talkOpen);
+                }
 
-                    const uint64_t nowMs = GetTickCount64();
-                    const uint64_t lastCaptureMs = lastCaptureEditTickMs_.load(std::memory_order_acquire);
-                    const uint64_t lastNudgeMs = lastCaptureReopenTickMs_.load(std::memory_order_acquire);
-                    if (nowMs > (lastCaptureMs + 1200ULL) && nowMs > (lastNudgeMs + 1200ULL)) {
-                        const unsigned int err = g_ts3Functions.activateCaptureDevice(schid);
-                        lastCaptureReopenTickMs_.store(nowMs, std::memory_order_release);
-                        if (!(err == ERROR_ok || err == ERROR_ok_no_update)) {
-                            if (nowMs > (lastLogMs + 2000ULL)) {
-                                LogWarn("capture_activate watchdog failed schid=" + std::to_string(schid) +
+                if (schid != 0) {
+                    const bool shouldEnsureCapture = voiceRecordingActive_.load(std::memory_order_acquire) &&
+                                                    (voiceRecordingSchid_.load(std::memory_order_acquire) == schid);
+                    if (shouldEnsureCapture) {
+                        bool gateByVad = false;
+                        float vadThresholdDb = -50.0f;
+                        {
+                            std::lock_guard<std::mutex> lock(voiceTxMutex_);
+                            gateByVad = savedVadValid_ && savedVadEnabled_;
+                            if (savedVadThresholdValid_) {
+                                vadThresholdDb = savedVadThresholdDbfs_;
+                            }
+                        }
+                        bool talkOpen = true;
+                        if (gateByVad) {
+                            bool decided = false;
+                            if (g_ts3Functions.getPreProcessorInfoValueFloat) {
+                                float micDb = -120.0f;
+                                const unsigned int errDb = g_ts3Functions.getPreProcessorInfoValueFloat(
+                                    schid, "decibel_last_period", &micDb);
+                                if (errDb == ERROR_ok || errDb == ERROR_ok_no_update) {
+                                    talkOpen = micDb >= (vadThresholdDb - 1.0f);
+                                    decided = true;
+                                }
+                            }
+                            if (!decided) {
+                                const TelemetrySnapshot tel = engine_.SnapshotTelemetry();
+                                if (tel.micRmsDbfs > -119.0f) {
+                                    talkOpen = tel.micRmsDbfs >= (vadThresholdDb - 1.0f);
+                                } else {
+                                    talkOpen = tel.talkStateActive;
+                                }
+                                const uint64_t nowMs = GetTickCount64();
+                                if (nowMs > (lastVadFallbackLogMs + 4000ULL)) {
+                                    LogWarn("talk_gate fallback used schid=" + std::to_string(schid));
+                                    lastVadFallbackLogMs = nowMs;
+                                }
+                            }
+                        }
+                        engine_.SetTalkState(talkOpen);
+
+                        const uint64_t nowMs = GetTickCount64();
+                        const uint64_t lastCaptureMs = lastCaptureEditTickMs_.load(std::memory_order_acquire);
+                        const uint64_t lastNudgeMs = lastCaptureReopenTickMs_.load(std::memory_order_acquire);
+                        if (nowMs > (lastCaptureMs + 1200ULL) && nowMs > (lastNudgeMs + 1200ULL)) {
+                            const unsigned int err = g_ts3Functions.activateCaptureDevice(schid);
+                            lastCaptureReopenTickMs_.store(nowMs, std::memory_order_release);
+                            if (!(err == ERROR_ok || err == ERROR_ok_no_update)) {
+                                if (nowMs > (lastLogMs + 2000ULL)) {
+                                    LogWarn("capture_activate watchdog failed schid=" + std::to_string(schid) +
+                                            " err=" + std::to_string(err));
+                                    lastLogMs = nowMs;
+                                }
+                            } else if (nowMs > (lastLogMs + 3000ULL)) {
+                                LogInfo("capture_activate watchdog schid=" + std::to_string(schid) +
                                         " err=" + std::to_string(err));
                                 lastLogMs = nowMs;
                             }
-                        } else if (nowMs > (lastLogMs + 3000ULL)) {
-                            LogInfo("capture_activate watchdog schid=" + std::to_string(schid) +
-                                    " err=" + std::to_string(err));
-                            lastLogMs = nowMs;
                         }
+                    } else {
+                        engine_.SetTalkState(true);
                     }
-                } else {
-                    engine_.SetTalkState(true);
                 }
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    } catch (const std::exception& ex) {
+        LogError(std::string("voice_tx thread exception: ") + ex.what());
+    } catch (...) {
+        LogError("voice_tx thread exception: unknown");
     }
     SetVoiceRecordingState(false, 0);
     voiceTxThreadRunning_.store(false, std::memory_order_release);
@@ -2515,7 +2663,15 @@ void MicMixApp::StartVoiceTxThread() {
         return;
     }
     voiceTxStop_.store(false, std::memory_order_release);
-    voiceTxThread_ = std::thread([this]() { VoiceTxThreadMain(); });
+    try {
+        voiceTxThread_ = std::thread([this]() { VoiceTxThreadMain(); });
+    } catch (const std::exception& ex) {
+        voiceTxStop_.store(true, std::memory_order_release);
+        LogError(std::string("voice_tx thread start failed: ") + ex.what());
+    } catch (...) {
+        voiceTxStop_.store(true, std::memory_order_release);
+        LogError("voice_tx thread start failed: unknown");
+    }
 }
 
 void MicMixApp::StopVoiceTxThread() {
@@ -2528,38 +2684,54 @@ void MicMixApp::StopVoiceTxThread() {
 
 bool MicMixApp::Initialize(const std::string& configBasePath) {
     if (initialized_.exchange(true)) return true;
-    configStore_ = std::make_unique<ConfigStore>(configBasePath);
-    g_logPath = configStore_->LogPath();
-    std::string warn;
-    configStore_->Load(settings_, warn);
-    SanitizeSettings(settings_);
-    if (!warn.empty()) LogWarn(warn);
-    engine_.ApplySettings(settings_);
-    // Disabled intentionally: an additional capture stream can interfere with
-    // some driver/device combinations and TS microphone preview.
-    // Mic activity is derived from TS3 capture callback path.
-    micLevelMonitor_.reset();
-    hotkeyManager_ = std::make_unique<GlobalHotkeyManager>([this]() {
-        this->ToggleMute();
-    });
-    hotkeyManager_->Start();
-    hotkeyManager_->ApplySettings(settings_);
-    sourceManager_ = std::make_unique<AudioSourceManager>(
-        [this](const float* data, size_t count) { engine_.PushMusicSamples(data, count); },
-        [this](SourceState st, const std::string& code, const std::string& msg, const std::string& detail) {
-            engine_.SetMusicSourceRunning(st == SourceState::Running);
-            std::string line = "source=" + SourceStateToString(st) + " code=" + code + " msg=" + msg;
-            if (!detail.empty()) line += " detail=" + detail;
-            LogInfo(line);
+    try {
+        configStore_ = std::make_unique<ConfigStore>(configBasePath);
+        g_logPath = configStore_->LogPath();
+        std::string warn;
+        configStore_->Load(settings_, warn);
+        SanitizeSettings(settings_);
+        if (!warn.empty()) LogWarn(warn);
+        engine_.ApplySettings(settings_);
+        // Disabled intentionally: an additional capture stream can interfere with
+        // some driver/device combinations and TS microphone preview.
+        // Mic activity is derived from TS3 capture callback path.
+        micLevelMonitor_.reset();
+        hotkeyManager_ = std::make_unique<GlobalHotkeyManager>([this]() {
+            this->ToggleMute();
         });
-    sourceManager_->ApplySettings(settings_);
-    if (settings_.autostartEnabled) sourceManager_->Start();
-    const uint64_t nowMs = GetTickCount64();
-    lastCaptureEditTickMs_.store(nowMs, std::memory_order_release);
-    lastCaptureReopenTickMs_.store(0, std::memory_order_release);
-    StartVoiceTxThread();
-    LogInfo("MicMix initialized");
-    return true;
+        hotkeyManager_->Start();
+        hotkeyManager_->ApplySettings(settings_);
+        sourceManager_ = std::make_unique<AudioSourceManager>(
+            [this](const float* data, size_t count) { engine_.PushMusicSamples(data, count); },
+            [this](SourceState st, const std::string& code, const std::string& msg, const std::string& detail) {
+                engine_.SetMusicSourceRunning(st == SourceState::Running);
+                std::string line = "source=" + SourceStateToString(st) + " code=" + code + " msg=" + msg;
+                if (!detail.empty()) line += " detail=" + detail;
+                LogInfo(line);
+            });
+        sourceManager_->ApplySettings(settings_);
+        if (settings_.autostartEnabled) sourceManager_->Start();
+        const uint64_t nowMs = GetTickCount64();
+        lastCaptureEditTickMs_.store(nowMs, std::memory_order_release);
+        lastCaptureReopenTickMs_.store(0, std::memory_order_release);
+        StartVoiceTxThread();
+        LogInfo("MicMix initialized");
+        return true;
+    } catch (const std::exception& ex) {
+        LogError(std::string("MicMix initialize failed: ") + ex.what());
+    } catch (...) {
+        LogError("MicMix initialize failed: unknown");
+    }
+
+    StopVoiceTxThread();
+    if (hotkeyManager_) hotkeyManager_->Stop();
+    if (sourceManager_) sourceManager_->Stop();
+    micLevelMonitor_.reset();
+    hotkeyManager_.reset();
+    sourceManager_.reset();
+    configStore_.reset();
+    initialized_.store(false, std::memory_order_release);
+    return false;
 }
 
 void MicMixApp::Shutdown() {
@@ -2658,14 +2830,7 @@ void MicMixApp::OnConnectStatusChange(uint64 schid, int newStatus, unsigned int 
 std::vector<LoopbackDeviceInfo> MicMixApp::GetLoopbackDevices() const { return AudioSourceManager::EnumerateLoopbackDevices(); }
 std::vector<CaptureDeviceInfo> MicMixApp::GetCaptureDevices() const { return AudioSourceManager::EnumerateCaptureDevices(); }
 std::vector<AppProcessInfo> MicMixApp::GetAppProcesses() const {
-    auto apps = AudioSourceManager::EnumerateAppProcesses();
-    std::string line = "app_list count=" + std::to_string(apps.size());
-    const size_t limit = std::min<size_t>(apps.size(), 8);
-    for (size_t i = 0; i < limit; ++i) {
-        line += " | " + apps[i].exeName + ":" + std::to_string(apps[i].pid);
-    }
-    LogInfo(line);
-    return apps;
+    return AudioSourceManager::EnumerateAppProcesses();
 }
 SourceStatus MicMixApp::GetSourceStatus() const { return sourceManager_ ? sourceManager_->GetStatus() : SourceStatus{}; }
 TelemetrySnapshot MicMixApp::GetTelemetry() const { return engine_.SnapshotTelemetry(); }

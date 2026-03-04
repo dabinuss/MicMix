@@ -3,6 +3,8 @@
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <string>
 
 #include "teamspeak/public_definitions.h"
 #include "teamspeak/public_errors.h"
@@ -19,6 +21,17 @@ constexpr char MENU_ICON_FILE[] = "t.png";
 constexpr char SETTINGS_ICON_FILE[] = "1.png";
 
 char* g_pluginIdRaw = nullptr;
+
+template <typename Fn>
+void RunGuarded(const char* where, Fn&& fn) {
+    try {
+        fn();
+    } catch (const std::exception& ex) {
+        LogError(std::string(where) + " exception: " + ex.what());
+    } catch (...) {
+        LogError(std::string(where) + " exception: unknown");
+    }
+}
 
 PluginMenuItem* CreateMenuItem(PluginMenuType type, int id, const char* text, const char* icon) {
     auto* item = static_cast<PluginMenuItem*>(std::calloc(1, sizeof(PluginMenuItem)));
@@ -71,17 +84,27 @@ void ts3plugin_setFunctionPointers(const struct TS3Functions funcs) {
 }
 
 int ts3plugin_init() {
-    if (!g_ts3Functions.getConfigPath) {
+    try {
+        if (!g_ts3Functions.getConfigPath) {
+            return 1;
+        }
+        char configPath[1024]{};
+        g_ts3Functions.getConfigPath(configPath, sizeof(configPath));
+        const bool ok = MicMixApp::Instance().Initialize(configPath);
+        return ok ? 0 : 1;
+    } catch (const std::exception& ex) {
+        LogError(std::string("ts3plugin_init exception: ") + ex.what());
+        return 1;
+    } catch (...) {
+        LogError("ts3plugin_init exception: unknown");
         return 1;
     }
-    char configPath[1024]{};
-    g_ts3Functions.getConfigPath(configPath, sizeof(configPath));
-    const bool ok = MicMixApp::Instance().Initialize(configPath);
-    return ok ? 0 : 1;
 }
 
 void ts3plugin_shutdown() {
-    MicMixApp::Instance().Shutdown();
+    RunGuarded("ts3plugin_shutdown", [] {
+        MicMixApp::Instance().Shutdown();
+    });
     if (g_pluginIdRaw) {
         std::free(g_pluginIdRaw);
         g_pluginIdRaw = nullptr;
@@ -116,7 +139,9 @@ int ts3plugin_offersConfigure() {
 void ts3plugin_configure(void* handle, void* qParentWidget) {
     (void)handle;
     (void)qParentWidget;
-    MicMixApp::Instance().OpenSettingsWindow();
+    RunGuarded("ts3plugin_configure", [] {
+        MicMixApp::Instance().OpenSettingsWindow();
+    });
 }
 
 void ts3plugin_freeMemory(void* data) {
@@ -127,64 +152,89 @@ void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
     if (!menuItems || !menuIcon) {
         return;
     }
+    *menuItems = nullptr;
+    *menuIcon = nullptr;
     const size_t sz = 2;
-    *menuItems = static_cast<PluginMenuItem**>(std::malloc(sizeof(PluginMenuItem*) * sz));
-    if (!*menuItems) {
-        *menuIcon = nullptr;
+    auto** items = static_cast<PluginMenuItem**>(std::calloc(sz, sizeof(PluginMenuItem*)));
+    if (!items) {
         return;
     }
-    (*menuItems)[0] = CreateMenuItem(PLUGIN_MENU_TYPE_GLOBAL, MENU_ID_SETTINGS, "MicMix Settings...", SETTINGS_ICON_FILE);
-    (*menuItems)[1] = nullptr;
-    *menuIcon = static_cast<char*>(std::malloc(PLUGIN_MENU_BUFSZ));
-    if (!*menuIcon) {
+    items[0] = CreateMenuItem(PLUGIN_MENU_TYPE_GLOBAL, MENU_ID_SETTINGS, "MicMix Settings...", SETTINGS_ICON_FILE);
+    if (!items[0]) {
+        std::free(items);
         return;
     }
-    strcpy_s(*menuIcon, PLUGIN_MENU_BUFSZ, MENU_ICON_FILE);
+    auto* icon = static_cast<char*>(std::malloc(PLUGIN_MENU_BUFSZ));
+    if (!icon) {
+        std::free(items[0]);
+        std::free(items);
+        return;
+    }
+    strcpy_s(icon, PLUGIN_MENU_BUFSZ, MENU_ICON_FILE);
+    *menuItems = items;
+    *menuIcon = icon;
 }
 
 void ts3plugin_initHotkeys(struct PluginHotkey*** hotkeys) {
     if (!hotkeys) {
         return;
     }
+    *hotkeys = nullptr;
     const size_t sz = 2;
-    *hotkeys = static_cast<PluginHotkey**>(std::malloc(sizeof(PluginHotkey*) * sz));
-    if (!*hotkeys) {
+    auto** keys = static_cast<PluginHotkey**>(std::calloc(sz, sizeof(PluginHotkey*)));
+    if (!keys) {
         return;
     }
-    (*hotkeys)[0] = CreateHotkey("music_toggle_mute", "MicMix: Music mute (toggle)");
-    (*hotkeys)[1] = nullptr;
+    keys[0] = CreateHotkey("music_toggle_mute", "MicMix: Music mute (toggle)");
+    if (!keys[0]) {
+        std::free(keys);
+        return;
+    }
+    *hotkeys = keys;
 }
 
 void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenuType type, int menuItemID, uint64 selectedItemID) {
-    (void)serverConnectionHandlerID;
-    (void)selectedItemID;
-    if (type == PLUGIN_MENU_TYPE_GLOBAL && menuItemID == MENU_ID_SETTINGS) {
-        MicMixApp::Instance().OpenSettingsWindow();
-    }
+    RunGuarded("ts3plugin_onMenuItemEvent", [&] {
+        (void)serverConnectionHandlerID;
+        (void)selectedItemID;
+        if (type == PLUGIN_MENU_TYPE_GLOBAL && menuItemID == MENU_ID_SETTINGS) {
+            MicMixApp::Instance().OpenSettingsWindow();
+        }
+    });
 }
 
 void ts3plugin_onHotkeyEvent(const char* keyword) {
-    if (!keyword) return;
-    if (std::strcmp(keyword, "music_toggle_mute") == 0) {
-        MicMixApp::Instance().ToggleMute();
-    }
+    RunGuarded("ts3plugin_onHotkeyEvent", [&] {
+        if (!keyword) return;
+        if (std::strcmp(keyword, "music_toggle_mute") == 0) {
+            MicMixApp::Instance().ToggleMute();
+        }
+    });
 }
 
 void ts3plugin_currentServerConnectionChanged(uint64 serverConnectionHandlerID) {
-    MicMixApp::Instance().SetActiveServer(serverConnectionHandlerID);
+    RunGuarded("ts3plugin_currentServerConnectionChanged", [&] {
+        MicMixApp::Instance().SetActiveServer(serverConnectionHandlerID);
+    });
 }
 
 void ts3plugin_onTalkStatusChangeEvent(uint64 serverConnectionHandlerID, int status, int isReceivedWhisper, anyID clientID) {
-    (void)isReceivedWhisper;
-    MicMixApp::Instance().SetTalkStateForOwnClient(serverConnectionHandlerID, clientID, status);
+    RunGuarded("ts3plugin_onTalkStatusChangeEvent", [&] {
+        (void)isReceivedWhisper;
+        MicMixApp::Instance().SetTalkStateForOwnClient(serverConnectionHandlerID, clientID, status);
+    });
 }
 
 void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int newStatus, unsigned int errorNumber) {
-    MicMixApp::Instance().OnConnectStatusChange(serverConnectionHandlerID, newStatus, errorNumber);
+    RunGuarded("ts3plugin_onConnectStatusChangeEvent", [&] {
+        MicMixApp::Instance().OnConnectStatusChange(serverConnectionHandlerID, newStatus, errorNumber);
+    });
 }
 
 void ts3plugin_onEditCapturedVoiceDataEvent(uint64 serverConnectionHandlerID, short* samples, int sampleCount, int channels, int* edited) {
-    MicMixApp::Instance().EditCapturedVoice(serverConnectionHandlerID, samples, sampleCount, channels, edited);
+    RunGuarded("ts3plugin_onEditCapturedVoiceDataEvent", [&] {
+        MicMixApp::Instance().EditCapturedVoice(serverConnectionHandlerID, samples, sampleCount, channels, edited);
+    });
 }
 
 const char* ts3plugin_commandKeyword() {
@@ -205,7 +255,9 @@ void ts3plugin_infoData(uint64 serverConnectionHandlerID, uint64 id, PluginItemT
     (void)serverConnectionHandlerID;
     (void)id;
     (void)type;
-    *data = nullptr;
+    if (data) {
+        *data = nullptr;
+    }
 }
 
 const char* ts3plugin_keyPrefix() {

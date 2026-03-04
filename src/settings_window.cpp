@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cwctype>
+#include <exception>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -976,7 +977,15 @@ void SettingsWindowController::Open() {
         return;
     }
     g_running.store(true, std::memory_order_release);
-    g_thread = std::thread(WindowThreadMain);
+    try {
+        g_thread = std::thread(WindowThreadMain);
+    } catch (const std::exception& ex) {
+        g_running.store(false, std::memory_order_release);
+        LogError(std::string("settings_window thread start failed: ") + ex.what());
+    } catch (...) {
+        g_running.store(false, std::memory_order_release);
+        LogError("settings_window thread start failed: unknown");
+    }
 }
 
 void SettingsWindowController::Close() {
