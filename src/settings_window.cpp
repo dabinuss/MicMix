@@ -912,14 +912,17 @@ void WindowThreadMain() {
     InitCommonControlsEx(&icc);
 
     HINSTANCE hInst = GetPluginModuleHandle();
-    WNDCLASSW wc{};
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
     wc.lpszClassName = L"MicMixSettingsWindow";
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APP_ICON));
+    wc.hIconSm = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APP_ICON_SMALL));
     wc.hbrBackground = nullptr;
-    RegisterClassW(&wc);
+    UnregisterClassW(wc.lpszClassName, hInst);
+    RegisterClassExW(&wc);
 
     HWND hwnd = CreateWindowExW(
         0,

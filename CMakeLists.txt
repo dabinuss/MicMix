@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.21)
-project(MicMix LANGUAGES C CXX)
+
+set(MICMIX_VERSION "1.0.0")
+if(EXISTS "${CMAKE_SOURCE_DIR}/VERSION")
+  file(READ "${CMAKE_SOURCE_DIR}/VERSION" MICMIX_VERSION_RAW)
+  string(STRIP "${MICMIX_VERSION_RAW}" MICMIX_VERSION)
+endif()
+
+project(MicMix VERSION ${MICMIX_VERSION} LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,8 +51,15 @@ add_library(micmix SHARED
   resources/micmix.rc
 )
 
+configure_file(
+  ${CMAKE_SOURCE_DIR}/cmake/version.h.in
+  ${CMAKE_BINARY_DIR}/generated/micmix_version.h
+  @ONLY
+)
+
 target_include_directories(micmix PRIVATE
   src
+  ${CMAKE_BINARY_DIR}/generated
   ${TS3_SDK_DIR}/include
   ${TS3_SDK_DIR}/src
   ${SPEEXDSP_DIR}/include

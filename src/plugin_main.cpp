@@ -9,12 +9,14 @@
 #include "plugin.h"
 #include "plugin_definitions.h"
 #include "micmix_core.h"
+#include "micmix_version.h"
 
 namespace {
 
 constexpr int PLUGIN_API_VERSION = 26;
 constexpr int MENU_ID_SETTINGS = 1;
-constexpr char MENU_ICON_FILE[] = "menu_icon.png";
+constexpr char MENU_ICON_FILE[] = "t.png";
+constexpr char SETTINGS_ICON_FILE[] = "1.png";
 
 char* g_pluginIdRaw = nullptr;
 
@@ -49,7 +51,7 @@ const char* ts3plugin_name() {
 }
 
 const char* ts3plugin_version() {
-    return "1.0.0";
+    return MICMIX_VERSION;
 }
 
 int ts3plugin_apiVersion() {
@@ -57,7 +59,7 @@ int ts3plugin_apiVersion() {
 }
 
 const char* ts3plugin_author() {
-    return "MicMix";
+    return "Dabinuss";
 }
 
 const char* ts3plugin_description() {
@@ -131,7 +133,7 @@ void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
         *menuIcon = nullptr;
         return;
     }
-    (*menuItems)[0] = CreateMenuItem(PLUGIN_MENU_TYPE_GLOBAL, MENU_ID_SETTINGS, "MicMix Settings...", MENU_ICON_FILE);
+    (*menuItems)[0] = CreateMenuItem(PLUGIN_MENU_TYPE_GLOBAL, MENU_ID_SETTINGS, "MicMix Settings...", SETTINGS_ICON_FILE);
     (*menuItems)[1] = nullptr;
     *menuIcon = static_cast<char*>(std::malloc(PLUGIN_MENU_BUFSZ));
     if (!*menuIcon) {
