@@ -1,0 +1,82 @@
+# ------------------------------
+# OS / Dateisystem
+# ------------------------------
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ------------------------------
+# Editor / IDE
+# ------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Visual Studio
+.vs/
+*.VC.db
+*.VC.opendb
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+ipch/
+*.aps
+*.ncb
+
+# ------------------------------
+# Build-Systeme / Artefakte
+# ------------------------------
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+build/
+out/
+install/
+Testing/
+CTestTestfile.cmake
+cmake_install.cmake
+compile_commands.json
+
+# Allgemeine Binary-Outputs
+*.obj
+*.o
+*.pch
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+*.a
+*.dll
+*.exe
+*.so
+*.dylib
+*.manifest
+
+# Packaging / Releases
+dist/
+release/
+artifacts/
+*.zip
+*.7z
+*.tar
+*.gz
+
+# ------------------------------
+# Logs / Temp / lokale Dateien
+# ------------------------------
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Lokale Umgebungsdateien
+.env
+.env.*
+!.env.example
+
