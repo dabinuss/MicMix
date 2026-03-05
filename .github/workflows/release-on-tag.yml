@@ -1,0 +1,99 @@
+name: Release On Tag
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart('v')
+          $artifact = "dist/MicMix-$version-win64.ts3_plugin"
+          $checksum = "$artifact.sha256"
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "artifact=$artifact" >> $env:GITHUB_OUTPUT
+          "checksum=$checksum" >> $env:GITHUB_OUTPUT
+
+      - name: Configure CMake
+        shell: pwsh
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build (Release)
+        shell: pwsh
+        run: cmake --build build --config Release
+
+      - name: Package TeamSpeak plugin
+        shell: pwsh
+        run: ./scripts/package_ts3_plugin.ps1 -Version "${{ steps.meta.outputs.version }}" -Configuration Release
+
+      - name: Generate SHA256 file
+        shell: pwsh
+        run: |
+          $artifact = "${{ steps.meta.outputs.artifact }}"
+          if (-not (Test-Path $artifact)) {
+            throw "Artifact not found: $artifact"
+          }
+          $hash = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash
+          $fileName = [System.IO.Path]::GetFileName($artifact)
+          $line = "$hash  $fileName"
+          Set-Content -LiteralPath "${{ steps.meta.outputs.checksum }}" -Value $line -Encoding ascii
+
+      - name: Build release notes
+        id: notes
+        shell: pwsh
+        run: |
+          $version = "${{ steps.meta.outputs.version }}"
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
+
+          $body = "Automated release for $tag.`n`nIncluded assets:`n- MicMix-$version-win64.ts3_plugin`n- MicMix-$version-win64.ts3_plugin.sha256"
+
+          if (Test-Path CHANGELOG.md) {
+            $lines = Get-Content CHANGELOG.md
+            $start = -1
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match ("^## \[" + [regex]::Escape($version) + "\]")) {
+                $start = $i
+                break
+              }
+            }
+            if ($start -ge 0) {
+              $end = $lines.Count
+              for ($j = $start + 1; $j -lt $lines.Count; $j++) {
+                if ($lines[$j] -match "^## \[") {
+                  $end = $j
+                  break
+                }
+              }
+              $body = ($lines[$start..($end - 1)] -join "`n")
+            }
+          }
+
+          Set-Content -LiteralPath $notesPath -Value $body -Encoding utf8
+          "path=$notesPath" >> $env:GITHUB_OUTPUT
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: MicMix ${{ steps.meta.outputs.version }}
+          body_path: ${{ steps.notes.outputs.path }}
+          files: |
+            ${{ steps.meta.outputs.artifact }}
+            ${{ steps.meta.outputs.checksum }}

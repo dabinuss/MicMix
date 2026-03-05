@@ -118,6 +118,7 @@ public:
 private:
     std::string basePath_;
     std::string configPath_;
+    std::string legacyConfigPath_;
     std::string tmpPath_;
     std::string lastGoodPath_;
     std::string logPath_;

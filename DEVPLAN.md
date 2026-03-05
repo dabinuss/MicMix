@@ -147,8 +147,8 @@ Ladeverhalten:
 - Nach Start zeigt die UI den tatsächlich aktiven Zustand (inkl. Reacquire/Error) und nicht nur gespeicherte Wunschwerte.
 
 Write-Sicherheit:
-- Config-Write ist atomar (`config.tmp` schreiben, flushen, dann replace/rename auf `config.json`).
-- Letzte gültige Config wird als `config.lastgood.json` vorgehalten.
+- Config-Write ist atomar (`config.tmp` schreiben, flushen, dann replace/rename auf `config.ini`).
+- Letzte gültige Config wird als `config.lastgood.ini` vorgehalten.
 - Bei defekter/inkompletter Config: Fallback auf `lastgood`, sonst Defaults + Warnung im Log/UI.
 
 Migration:

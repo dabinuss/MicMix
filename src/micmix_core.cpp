@@ -556,9 +556,10 @@ ConfigStore::ConfigStore(std::string basePath)
     }
     const std::filesystem::path dir = std::filesystem::path(Utf8ToWide(basePath_)) / L"plugins" / L"micmix";
     std::filesystem::create_directories(dir);
-    configPath_ = WideToUtf8((dir / L"config.json").wstring());
+    configPath_ = WideToUtf8((dir / L"config.ini").wstring());
+    legacyConfigPath_ = WideToUtf8((dir / L"config.json").wstring());
     tmpPath_ = WideToUtf8((dir / L"config.tmp").wstring());
-    lastGoodPath_ = WideToUtf8((dir / L"config.lastgood.json").wstring());
+    lastGoodPath_ = WideToUtf8((dir / L"config.lastgood.ini").wstring());
     logPath_ = WideToUtf8((dir / L"micmix.log").wstring());
 }
 
@@ -608,9 +609,26 @@ DuckingMode ConfigStore::DuckingModeFromString(const std::string& value) {
 
 bool ConfigStore::Load(MicMixSettings& outSettings, std::string& warning) {
     warning.clear();
+    auto appendWarning = [&](const char* msg) {
+        if (!msg || msg[0] == '\0') {
+            return;
+        }
+        if (!warning.empty()) {
+            warning += " ";
+        }
+        warning += msg;
+    };
+
     std::ifstream in(std::filesystem::path(Utf8ToWide(configPath_)));
+    bool usedLegacyConfig = false;
     if (!in.is_open()) {
-        return true;
+        in.clear();
+        in.open(std::filesystem::path(Utf8ToWide(legacyConfigPath_)));
+        usedLegacyConfig = in.is_open();
+        if (!usedLegacyConfig) {
+            return true;
+        }
+        appendWarning("Loaded legacy config.json file; settings will migrate to config.ini on next save.");
     }
 
     std::unordered_map<std::string, std::string> kv;
@@ -671,7 +689,7 @@ bool ConfigStore::Load(MicMixSettings& outSettings, std::string& warning) {
     if (auto it = kv.find("capture.device_id"); it != kv.end()) outSettings.captureDeviceId = it->second;
     parseInt("ui.last_open_tab", outSettings.uiLastOpenTab);
     if (parseIssue) {
-        warning = "Config parse issue detected; fallback values were used.";
+        appendWarning("Config parse issue detected; fallback values were used.");
     }
     SanitizeSettings(outSettings);
     outSettings.duckingEnabled = false;
@@ -720,10 +738,13 @@ bool ConfigStore::Save(const MicMixSettings& settings, std::string& error) {
     }
 
     const std::wstring configW = Utf8ToWide(configPath_);
+    const std::wstring legacyConfigW = Utf8ToWide(legacyConfigPath_);
     const std::wstring tmpW = Utf8ToWide(tmpPath_);
     const std::wstring lastGoodW = Utf8ToWide(lastGoodPath_);
     if (PathFileExistsW(configW.c_str())) {
         CopyFileW(configW.c_str(), lastGoodW.c_str(), FALSE);
+    } else if (PathFileExistsW(legacyConfigW.c_str())) {
+        CopyFileW(legacyConfigW.c_str(), lastGoodW.c_str(), FALSE);
     }
     if (!MoveFileExW(tmpW.c_str(), configW.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         error = "atomic config replace failed";
