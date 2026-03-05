@@ -19,12 +19,6 @@ enum class SourceMode {
     AppSession = 1,
 };
 
-enum class DuckingMode {
-    MicRms = 0,
-    PluginHotkey = 1,
-    Ts3Talkstate = 2,
-};
-
 enum class SourceState {
     Stopped = 0,
     Starting = 1,
@@ -44,12 +38,6 @@ struct MicMixSettings {
     bool        forceTxEnabled = true;
     int         bufferTargetMs = 60;
     bool        musicMuted = false;
-    bool        duckingEnabled = false;
-    DuckingMode duckingMode = DuckingMode::MicRms;
-    float       duckingThresholdDbfs = -30.0f;
-    float       duckingAttackMs = 20.0f;
-    float       duckingReleaseMs = 220.0f;
-    float       duckingAmountDb = -12.0f;
     int         uiLastOpenTab = 0;
     bool        autoSwitchToLoopback = false;
     int         muteHotkeyModifiers = 0;
@@ -92,8 +80,6 @@ struct TelemetrySnapshot {
     float musicPeakDbfs = -120.0f;
     float musicSendPeakDbfs = -120.0f;
     bool  musicActive = false;
-    float duckingGainDb = 0.0f;
-    bool  duckingActive = false;
     bool  talkStateActive = false;
     bool  micTalkDetected = false;
     float micRmsDbfs = -120.0f;
@@ -128,8 +114,6 @@ private:
     static std::string BoolToString(bool value);
     static std::string SourceModeToString(SourceMode mode);
     static SourceMode SourceModeFromString(const std::string& value);
-    static std::string DuckingModeToString(DuckingMode mode);
-    static DuckingMode DuckingModeFromString(const std::string& value);
 };
 
 template <typename T>
@@ -200,7 +184,6 @@ public:
     void ApplySettings(const MicMixSettings& settings);
     void SetMusicSourceRunning(bool running);
     void SetTalkState(bool talking);
-    void SetHotkeyDucking(bool active);
     void SetExternalMicLevel(float linear);
     void ToggleMute();
     void SetMuted(bool muted);
@@ -224,16 +207,7 @@ private:
     std::atomic<float> musicGainLinear_{0.5f};
     std::atomic<int>   bufferTargetMs_{60};
 
-    std::atomic<bool>  duckingEnabled_{false};
-    std::atomic<int>   duckingMode_{static_cast<int>(DuckingMode::MicRms)};
-    std::atomic<float> duckThresholdLinear_{0.03f};
-    std::atomic<float> duckAmountLinear_{0.25f};
-    std::atomic<float> duckAttackMs_{20.0f};
-    std::atomic<float> duckReleaseMs_{220.0f};
     std::atomic<bool>  talkState_{true};
-    std::atomic<bool>  hotkeyDucking_{false};
-    std::atomic<float> duckMeterLinear_{1.0f};
-    std::atomic<bool>  duckingNow_{false};
     std::atomic<bool>  micTalkDetected_{false};
     std::atomic<float> micRmsDbfs_{-120.0f};
     std::atomic<float> externalMicLinear_{0.0f};
@@ -248,8 +222,6 @@ private:
     std::atomic<float> musicRmsDbfs_{-120.0f};
     std::atomic<float> musicPeakDbfs_{-120.0f};
     std::atomic<float> musicSendPeakDbfs_{-120.0f};
-
-    float duckCurrent_ = 1.0f;
 
     static float DbToLinear(float db);
 };

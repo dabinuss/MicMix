@@ -30,7 +30,6 @@ enum ControlId {
     IDC_GAIN = 1006,
     IDC_GAIN_VALUE = 1007,
     IDC_FORCE_TX = 1008,
-    IDC_DUCKING = 1009,
     IDC_MUTE = 1010,
     IDC_AUTOSTART = 1011,
     IDC_START = 1012,
@@ -42,8 +41,6 @@ enum ControlId {
     IDC_METER_TEXT = 1019,
     IDC_MUTE_HOTKEY_SET = 1020,
     IDC_MUTE_HOTKEY_TEXT = 1021,
-    IDC_DUCK_AMOUNT = 1022,
-    IDC_DUCK_AMOUNT_VALUE = 1023,
     IDC_MIC_DEVICE = 1024,
     IDC_MIC_METER_TEXT = 1025,
     IDC_MONITOR = 1026,
@@ -206,16 +203,6 @@ float SliderToGainDb(int slider) {
     return kMusicGainMinDb + (static_cast<float>(clamped) / static_cast<float>(kMusicGainStepPerDb));
 }
 
-int DuckAmountDbToSlider(float duckAmountDb) {
-    const float reductionDb = std::clamp(-duckAmountDb, 0.0f, 30.0f);
-    return static_cast<int>(reductionDb * 10.0f);
-}
-
-float SliderToDuckAmountDb(int slider) {
-    const float reductionDb = std::clamp(static_cast<float>(slider) / 10.0f, 0.0f, 30.0f);
-    return -reductionDb;
-}
-
 int MeterDbToPixels(float dbfs, int widthPx) {
     const float clamped = std::clamp(dbfs, -60.0f, 0.0f);
     return static_cast<int>(((clamped + 60.0f) / 60.0f) * static_cast<float>(widthPx));
@@ -313,14 +300,6 @@ void UpdateGainLabel(HWND hwnd) {
     wchar_t buf[64];
     swprintf_s(buf, L"%+.1f dB", db);
     SetWindowTextW(GetDlgItem(hwnd, IDC_GAIN_VALUE), buf);
-}
-
-void UpdateDuckAmountLabel(HWND hwnd) {
-    const int slider = static_cast<int>(SendMessageW(GetDlgItem(hwnd, IDC_DUCK_AMOUNT), TBM_GETPOS, 0, 0));
-    const float reductionDb = std::clamp(static_cast<float>(slider) / 10.0f, 0.0f, 30.0f);
-    wchar_t buf[64];
-    swprintf_s(buf, L"%.1f dB", reductionDb);
-    SetWindowTextW(GetDlgItem(hwnd, IDC_DUCK_AMOUNT_VALUE), buf);
 }
 
 bool IsModifierOnlyKey(UINT vk) {
@@ -592,9 +571,6 @@ MicMixSettings CollectSettings(HWND hwnd) {
     }
 
     s.musicGainDb = SliderToGainDb(static_cast<int>(SendMessageW(GetDlgItem(hwnd, IDC_GAIN), TBM_GETPOS, 0, 0)));
-    s.duckingEnabled = false;
-    s.duckingMode = DuckingMode::MicRms;
-    s.duckingAmountDb = 0.0f;
     s.forceTxEnabled = SendMessageW(GetDlgItem(hwnd, IDC_FORCE_TX), BM_GETCHECK, 0, 0) == BST_CHECKED;
     s.musicMuted = SendMessageW(GetDlgItem(hwnd, IDC_MUTE), BM_GETCHECK, 0, 0) == BST_CHECKED;
     s.autostartEnabled = SendMessageW(GetDlgItem(hwnd, IDC_AUTOSTART), BM_GETCHECK, 0, 0) == BST_CHECKED;

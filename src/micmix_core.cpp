@@ -225,12 +225,6 @@ bool IsSameSettings(const MicMixSettings& a, const MicMixSettings& b) {
            a.forceTxEnabled == b.forceTxEnabled &&
            a.bufferTargetMs == b.bufferTargetMs &&
            a.musicMuted == b.musicMuted &&
-           a.duckingEnabled == b.duckingEnabled &&
-           a.duckingMode == b.duckingMode &&
-           NearlyEqual(a.duckingThresholdDbfs, b.duckingThresholdDbfs) &&
-           NearlyEqual(a.duckingAttackMs, b.duckingAttackMs) &&
-           NearlyEqual(a.duckingReleaseMs, b.duckingReleaseMs) &&
-           NearlyEqual(a.duckingAmountDb, b.duckingAmountDb) &&
            a.uiLastOpenTab == b.uiLastOpenTab &&
            a.autoSwitchToLoopback == b.autoSwitchToLoopback &&
            a.muteHotkeyModifiers == b.muteHotkeyModifiers &&
@@ -587,26 +581,6 @@ SourceMode ConfigStore::SourceModeFromString(const std::string& value) {
     return SourceMode::Loopback;
 }
 
-std::string ConfigStore::DuckingModeToString(DuckingMode mode) {
-    if (mode == DuckingMode::PluginHotkey) {
-        return "plugin_hotkey";
-    }
-    if (mode == DuckingMode::Ts3Talkstate) {
-        return "ts3_talkstate";
-    }
-    return "mic_rms";
-}
-
-DuckingMode ConfigStore::DuckingModeFromString(const std::string& value) {
-    if (value == "plugin_hotkey") {
-        return DuckingMode::PluginHotkey;
-    }
-    if (value == "ts3_talkstate") {
-        return DuckingMode::Ts3Talkstate;
-    }
-    return DuckingMode::MicRms;
-}
-
 bool ConfigStore::Load(MicMixSettings& outSettings, std::string& warning) {
     warning.clear();
     auto appendWarning = [&](const char* msg) {
@@ -692,12 +666,6 @@ bool ConfigStore::Load(MicMixSettings& outSettings, std::string& warning) {
         appendWarning("Config parse issue detected; fallback values were used.");
     }
     SanitizeSettings(outSettings);
-    outSettings.duckingEnabled = false;
-    outSettings.duckingMode = DuckingMode::MicRms;
-    outSettings.duckingThresholdDbfs = -30.0f;
-    outSettings.duckingAttackMs = 20.0f;
-    outSettings.duckingReleaseMs = 220.0f;
-    outSettings.duckingAmountDb = 0.0f;
     return true;
 }
 
@@ -771,27 +739,14 @@ void AudioEngine::ApplySettings(const MicMixSettings& settings) {
     forceTxEnabled_.store(settings.forceTxEnabled, std::memory_order_release);
     musicGainLinear_.store(DbToLinear(gainDb), std::memory_order_release);
     bufferTargetMs_.store(bufferMs, std::memory_order_release);
-    duckingEnabled_.store(false, std::memory_order_release);
-    duckingMode_.store(static_cast<int>(DuckingMode::MicRms), std::memory_order_release);
-    duckThresholdLinear_.store(DbToLinear(-30.0f), std::memory_order_release);
-    duckAmountLinear_.store(1.0f, std::memory_order_release);
-    duckAttackMs_.store(20.0f, std::memory_order_release);
-    duckReleaseMs_.store(220.0f, std::memory_order_release);
-    duckCurrent_ = 1.0f;
-    duckMeterLinear_.store(1.0f, std::memory_order_release);
-    duckingNow_.store(false, std::memory_order_release);
     micTalkDetected_.store(false, std::memory_order_release);
     talkState_.store(false, std::memory_order_release);
-    hotkeyDucking_.store(false, std::memory_order_release);
 }
 
 void AudioEngine::SetMusicSourceRunning(bool running) {
     sourceRunning_.store(running, std::memory_order_release);
     if (!running) {
         ring_.Reset();
-        duckCurrent_ = 1.0f;
-        duckMeterLinear_.store(1.0f, std::memory_order_release);
-        duckingNow_.store(false, std::memory_order_release);
         micTalkDetected_.store(false, std::memory_order_release);
         micRmsDbfs_.store(-120.0f, std::memory_order_release);
         externalMicLinear_.store(0.0f, std::memory_order_release);
@@ -801,7 +756,6 @@ void AudioEngine::SetMusicSourceRunning(bool running) {
     }
 }
 void AudioEngine::SetTalkState(bool talking) { talkState_.store(talking, std::memory_order_release); }
-void AudioEngine::SetHotkeyDucking(bool active) { (void)active; }
 void AudioEngine::SetExternalMicLevel(float linear) {
     const float level = std::clamp(linear, 0.0f, 1.0f);
     externalMicLinear_.store(level, std::memory_order_release);
@@ -875,8 +829,6 @@ TelemetrySnapshot AudioEngine::SnapshotTelemetry() const {
     t.musicRmsDbfs = musicRmsDbfs_.load(std::memory_order_relaxed);
     t.musicPeakDbfs = musicPeakDbfs_.load(std::memory_order_relaxed);
     t.musicSendPeakDbfs = musicSendPeakDbfs_.load(std::memory_order_relaxed);
-    t.duckingGainDb = 0.0f;
-    t.duckingActive = false;
     t.talkStateActive = talkState_.load(std::memory_order_relaxed);
     t.micTalkDetected = micTalkDetected_.load(std::memory_order_relaxed);
     t.micRmsDbfs = micRmsDbfs_.load(std::memory_order_relaxed);
@@ -917,9 +869,6 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
         const float prevSendPeakDb = musicSendPeakDbfs_.load(std::memory_order_relaxed);
         const float decayedSendPeakDb = std::max(-120.0f, prevSendPeakDb - 1.8f);
         musicSendPeakDbfs_.store(decayedSendPeakDb, std::memory_order_release);
-        duckCurrent_ = 1.0f;
-        duckMeterLinear_.store(1.0f, std::memory_order_release);
-        duckingNow_.store(false, std::memory_order_release);
         micTalkDetected_.store(talkOpen, std::memory_order_release);
 
         // TS3 bitmask semantics:
@@ -994,9 +943,6 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
         nextSendPeakDb = std::max(targetSendPeakDb, prevSendPeakDb - 1.8f);
     }
     musicSendPeakDbfs_.store(std::clamp(nextSendPeakDb, -120.0f, 0.0f), std::memory_order_release);
-    duckCurrent_ = 1.0f;
-    duckMeterLinear_.store(1.0f, std::memory_order_release);
-    duckingNow_.store(false, std::memory_order_release);
     micTalkDetected_.store(talkOpen, std::memory_order_release);
 
     const bool mixedMusic = touched && anyMusicSignal && sourceRunning && !muted;
