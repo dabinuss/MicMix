@@ -1,6 +1,14 @@
 # MicMix
 
-> **Notice:** This project was developed with the help of Codex. Please use it with appropriate caution. Everyone is encouraged to review the publicly available code and report bugs or issues.
+## Important Disclaimer
+
+> **This project was developed with help from Codex, an AI coding agent by OpenAI.**
+>  
+> AI-assisted development can introduce mistakes, edge-case bugs, or unintended behavior.
+> Please use MicMix with caution, especially in production-like or critical setups.
+>  
+> The full source code is public. Everyone is explicitly encouraged to review the code,
+> verify behavior, and report bugs, regressions, or security concerns.
 
 ![MicMix Logo](assets/branding/MicMix%20Logo.png)
 
