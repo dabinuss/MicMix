@@ -1,5 +1,7 @@
 # MicMix
 
+> **Notice:** This project was developed with the help of Codex. Please use it with appropriate caution. Everyone is encouraged to review the publicly available code and report bugs or issues.
+
 ![MicMix Logo](assets/branding/MicMix%20Logo.png)
 
 MicMix is a Windows plugin for TeamSpeak 3 that mixes a second audio source (music, browser audio, media player audio, etc.) into your microphone stream.
