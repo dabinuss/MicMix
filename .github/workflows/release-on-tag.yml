@@ -90,14 +90,19 @@ jobs:
               }
             }
             if ($start -ge 0) {
-              $end = $lines.Count
-              for ($j = $start + 1; $j -lt $lines.Count; $j++) {
-                if ($lines[$j] -match "^## \[") {
-                  $end = $j
-                  break
+              if ($version -eq "1.2.2") {
+                # 1.2.1 was skipped as an external release; publish cumulative notes.
+                $body = ($lines[$start..($lines.Count - 1)] -join "`n")
+              } else {
+                $end = $lines.Count
+                for ($j = $start + 1; $j -lt $lines.Count; $j++) {
+                  if ($lines[$j] -match "^## \[") {
+                    $end = $j
+                    break
+                  }
                 }
+                $body = ($lines[$start..($end - 1)] -join "`n")
               }
-              $body = ($lines[$start..($end - 1)] -join "`n")
             }
           }
 
