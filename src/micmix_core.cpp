@@ -40,12 +40,19 @@ namespace {
 
 constexpr char kLogChannel[] = "MicMix";
 constexpr int  kTargetRate = 48000;
+constexpr int  kResamplerQuality = 6; // Speex quality: 0 = fastest, 10 = best quality.
 constexpr int  kVoiceTxPollMs = 40;
 constexpr uint64_t kTalkEventFreshMs = 450ULL;
 constexpr uint64_t kForceTxMusicWindowMs = 6000ULL;
 constexpr uint64_t kVoiceTxReapplyMs = 12000ULL;
 constexpr uint64_t kCaptureWatchdogSilenceMs = 4500ULL;
 constexpr uint64_t kCaptureWatchdogCooldownMs = 12000ULL;
+constexpr uint32_t kMinSupportedSourceRate = 8000;
+constexpr uint32_t kMaxSupportedSourceRate = 384000;
+
+bool IsSupportedSourceRate(uint32_t sampleRate) {
+    return sampleRate >= kMinSupportedSourceRate && sampleRate <= kMaxSupportedSourceRate;
+}
 
 std::mutex g_logMutex;
 std::string g_logPath;
@@ -202,6 +209,7 @@ void SanitizeSettings(MicMixSettings& s) {
     s.configVersion = std::clamp(s.configVersion, 1, 8);
     if (!std::isfinite(s.musicGainDb)) { s.musicGainDb = -15.0f; }
     s.musicGainDb = std::clamp(s.musicGainDb, -30.0f, -6.0f);
+    s.resamplerQuality = std::clamp(s.resamplerQuality, 0, 10);
     s.bufferTargetMs = std::clamp(s.bufferTargetMs, 20, 250);
     if (!std::isfinite(s.micGateThresholdDbfs)) { s.micGateThresholdDbfs = -50.0f; }
     s.micGateThresholdDbfs = std::clamp(s.micGateThresholdDbfs, -90.0f, 0.0f);
@@ -234,6 +242,7 @@ bool IsSameSettings(const MicMixSettings& a, const MicMixSettings& b) {
            a.appSessionId == b.appSessionId &&
            a.autostartEnabled == b.autostartEnabled &&
            NearlyEqual(a.musicGainDb, b.musicGainDb) &&
+           a.resamplerQuality == b.resamplerQuality &&
            a.forceTxEnabled == b.forceTxEnabled &&
            a.bufferTargetMs == b.bufferTargetMs &&
            a.musicMuted == b.musicMuted &&
@@ -495,6 +504,9 @@ public:
     }
 
     bool Configure(uint32_t inRate, uint32_t outRate, int quality) {
+        if (!IsSupportedSourceRate(inRate) || !IsSupportedSourceRate(outRate)) {
+            return false;
+        }
         if (state_ && inRate_ == inRate && outRate_ == outRate && quality_ == quality) {
             return true;
         }
@@ -533,7 +545,7 @@ private:
     SpeexResamplerState* state_ = nullptr;
     uint32_t inRate_ = 0;
     uint32_t outRate_ = 0;
-    int quality_ = 6;
+    int quality_ = kResamplerQuality;
 };
 
 } // namespace
@@ -685,6 +697,7 @@ bool ConfigStore::Load(MicMixSettings& outSettings, std::string& warning) {
     if (auto it = kv.find("source.autostart_enabled"); it != kv.end()) outSettings.autostartEnabled = ::ParseBool(it->second, outSettings.autostartEnabled);
     if (auto it = kv.find("source.auto_switch_to_loopback"); it != kv.end()) outSettings.autoSwitchToLoopback = ::ParseBool(it->second, outSettings.autoSwitchToLoopback);
     parseFloat("mix.music_gain_db", outSettings.musicGainDb);
+    parseInt("mix.resampler_quality", outSettings.resamplerQuality);
     if (auto it = kv.find("mix.force_tx_enabled"); it != kv.end()) outSettings.forceTxEnabled = ::ParseBool(it->second, outSettings.forceTxEnabled);
     parseInt("mix.buffer_target_ms", outSettings.bufferTargetMs);
     if (auto it = kv.find("mix.music_muted"); it != kv.end()) outSettings.musicMuted = ::ParseBool(it->second, outSettings.musicMuted);
@@ -717,6 +730,7 @@ bool ConfigStore::Save(const MicMixSettings& settings, std::string& error) {
     ss << "source.autostart_enabled=" << BoolToString(safe.autostartEnabled) << "\n";
     ss << "source.auto_switch_to_loopback=" << BoolToString(safe.autoSwitchToLoopback) << "\n";
     ss << "mix.music_gain_db=" << safe.musicGainDb << "\n";
+    ss << "mix.resampler_quality=" << safe.resamplerQuality << "\n";
     ss << "mix.force_tx_enabled=" << BoolToString(safe.forceTxEnabled) << "\n";
     ss << "mix.buffer_target_ms=" << safe.bufferTargetMs << "\n";
     ss << "mix.music_muted=" << BoolToString(safe.musicMuted) << "\n";
@@ -811,7 +825,12 @@ void AudioEngine::SetExternalMicLevel(float linear) {
     micRmsDbfs_.store(next, std::memory_order_release);
 }
 void AudioEngine::SetMuted(bool muted) { musicMuted_.store(muted, std::memory_order_release); }
-void AudioEngine::ToggleMute() { musicMuted_.store(!musicMuted_.load(std::memory_order_acquire), std::memory_order_release); }
+void AudioEngine::ToggleMute() {
+    bool expected = musicMuted_.load(std::memory_order_relaxed);
+    while (!musicMuted_.compare_exchange_weak(
+        expected, !expected, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+    }
+}
 void AudioEngine::ClearMusicBuffer() {
     ring_.Reset();
 }
@@ -914,7 +933,8 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
     const float targetGateGain = talkOpen ? 1.0f : 0.0f;
     float gateGain = std::clamp(micGateGain_.load(std::memory_order_relaxed), 0.0f, 1.0f);
     float limiterGain = std::clamp(limiterGain_.load(std::memory_order_relaxed), 0.1f, 1.0f);
-    // Smooth mic gate to avoid hard consonant cutoffs and start clicks.
+    // Smooth mic gate to avoid hard consonant cutoffs and start clicks while
+    // still reacting fast enough for normal speech onset.
     constexpr float kGateAttackMs = 8.0f;
     constexpr float kGateReleaseMs = 90.0f;
     const float attackSamples = std::max(1.0f, (static_cast<float>(kTargetRate) * kGateAttackMs) / 1000.0f);
@@ -932,6 +952,10 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
             gateGain = std::max(targetGateGain, gateGain - gateReleaseStep);
         }
     };
+    // Limiter tuning:
+    // - threshold slightly below full-scale leaves headroom against clipping,
+    // - faster attack catches transient peaks,
+    // - slower release avoids audible pumping.
     constexpr float kLimiterThreshold = 0.92f;
     constexpr float kLimiterAttackCoeff = 0.50f;
     constexpr float kLimiterReleaseCoeff = 0.0025f;
@@ -1333,6 +1357,13 @@ private:
         if (!isFloat && !isPcm16) {
             code = "format_unsupported"; msg = "Unsupported loopback format"; releaseWf(); return false;
         }
+        if (!IsSupportedSourceRate(wf->nSamplesPerSec)) {
+            code = "format_unsupported";
+            msg = "Unsupported loopback sample rate";
+            detail = "sample_rate=" + std::to_string(wf->nSamplesPerSec);
+            releaseWf();
+            return false;
+        }
         DWORD initFlags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
         hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, initFlags, 0, 0, wf, nullptr);
         if (FAILED(hr)) {
@@ -1368,7 +1399,8 @@ private:
             closeEvent();
             code = "capture_service_failed"; msg = "Loopback capture service failed"; releaseWf(); return false;
         }
-        if (!resampler_.Configure(wf->nSamplesPerSec, kTargetRate, 6)) {
+        const int resamplerQuality = std::clamp(settings_.resamplerQuality, 0, 10);
+        if (!resampler_.Configure(wf->nSamplesPerSec, kTargetRate, resamplerQuality)) {
             closeEvent();
             code = "resampler_failed"; msg = "Resampler init failed"; releaseWf(); return false;
         }
@@ -1589,6 +1621,22 @@ private:
             isPcm16 = true;
             detail = "pid=" + std::to_string(pid) + " using=fallback_pcm_44100";
         }
+        if (!IsSupportedSourceRate(wf->nSamplesPerSec)) {
+            if (ownsWf) {
+                releaseWf();
+                useFallbackFormat();
+                isPcm16 = true;
+            }
+            if (!IsSupportedSourceRate(wf->nSamplesPerSec)) {
+                code = "format_unsupported";
+                msg = "Unsupported app sample rate";
+                if (!detail.empty()) {
+                    detail += " ";
+                }
+                detail += "pid=" + std::to_string(pid) + " sample_rate=" + std::to_string(wf->nSamplesPerSec);
+                return false;
+            }
+        }
 
         const DWORD flags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
         hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, wf, nullptr);
@@ -1623,7 +1671,8 @@ private:
             detail += "pid=" + std::to_string(pid) + " service_hr=" + HrToHex(hr);
             code = "capture_service_failed"; msg = "App capture service failed"; releaseWf(); return false;
         }
-        if (!resampler_.Configure(wf->nSamplesPerSec, kTargetRate, 6)) {
+        const int resamplerQuality = std::clamp(settings_.resamplerQuality, 0, 10);
+        if (!resampler_.Configure(wf->nSamplesPerSec, kTargetRate, resamplerQuality)) {
             CloseHandle(event);
             code = "resampler_failed"; msg = "Resampler init failed"; releaseWf(); return false;
         }
@@ -2440,8 +2489,9 @@ std::unique_ptr<IAudioSource> AudioSourceManager::CreateSourceLocked() {
     return std::make_unique<LoopbackSource>(settings_, pushFn_, statusForward);
 }
 
-std::vector<LoopbackDeviceInfo> AudioSourceManager::EnumerateLoopbackDevices() {
-    std::vector<LoopbackDeviceInfo> out;
+template <typename DeviceInfoT>
+std::vector<DeviceInfoT> EnumerateDevices(EDataFlow flow, ERole role, const char* fallbackName) {
+    std::vector<DeviceInfoT> out;
     ComInit com;
     if (FAILED(com.hr)) return out;
     ComPtr<IMMDeviceEnumerator> enumerator;
@@ -2449,7 +2499,7 @@ std::vector<LoopbackDeviceInfo> AudioSourceManager::EnumerateLoopbackDevices() {
 
     std::wstring defaultId;
     ComPtr<IMMDevice> def;
-    if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &def)) && def) {
+    if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(flow, role, &def)) && def) {
         LPWSTR id = nullptr;
         if (SUCCEEDED(def->GetId(&id)) && id) {
             defaultId = id;
@@ -2458,7 +2508,7 @@ std::vector<LoopbackDeviceInfo> AudioSourceManager::EnumerateLoopbackDevices() {
     }
 
     ComPtr<IMMDeviceCollection> coll;
-    if (FAILED(enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &coll)) || !coll) return out;
+    if (FAILED(enumerator->EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE, &coll)) || !coll) return out;
     UINT count = 0;
     coll->GetCount(&count);
     out.reserve(count);
@@ -2474,12 +2524,12 @@ std::vector<LoopbackDeviceInfo> AudioSourceManager::EnumerateLoopbackDevices() {
         }
         PROPVARIANT name{};
         PropVariantInit(&name);
-        std::string display = "Device";
+        std::string display = fallbackName;
         if (SUCCEEDED(store->GetValue(PKEY_Device_FriendlyName, &name)) && name.vt == VT_LPWSTR && name.pwszVal) {
             display = WideToUtf8(name.pwszVal);
         }
         PropVariantClear(&name);
-        LoopbackDeviceInfo info;
+        DeviceInfoT info;
         info.id = WideToUtf8(id);
         info.name = display;
         info.isDefault = (_wcsicmp(id, defaultId.c_str()) == 0);
@@ -2489,53 +2539,12 @@ std::vector<LoopbackDeviceInfo> AudioSourceManager::EnumerateLoopbackDevices() {
     return out;
 }
 
+std::vector<LoopbackDeviceInfo> AudioSourceManager::EnumerateLoopbackDevices() {
+    return EnumerateDevices<LoopbackDeviceInfo>(eRender, eMultimedia, "Device");
+}
+
 std::vector<CaptureDeviceInfo> AudioSourceManager::EnumerateCaptureDevices() {
-    std::vector<CaptureDeviceInfo> out;
-    ComInit com;
-    if (FAILED(com.hr)) return out;
-    ComPtr<IMMDeviceEnumerator> enumerator;
-    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator)))) return out;
-
-    std::wstring defaultId;
-    ComPtr<IMMDevice> def;
-    if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eCapture, eCommunications, &def)) && def) {
-        LPWSTR id = nullptr;
-        if (SUCCEEDED(def->GetId(&id)) && id) {
-            defaultId = id;
-            CoTaskMemFree(id);
-        }
-    }
-
-    ComPtr<IMMDeviceCollection> coll;
-    if (FAILED(enumerator->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &coll)) || !coll) return out;
-    UINT count = 0;
-    coll->GetCount(&count);
-    out.reserve(count);
-    for (UINT i = 0; i < count; ++i) {
-        ComPtr<IMMDevice> dev;
-        if (FAILED(coll->Item(i, &dev)) || !dev) continue;
-        LPWSTR id = nullptr;
-        if (FAILED(dev->GetId(&id)) || !id) continue;
-        ComPtr<IPropertyStore> store;
-        if (FAILED(dev->OpenPropertyStore(STGM_READ, &store)) || !store) {
-            CoTaskMemFree(id);
-            continue;
-        }
-        PROPVARIANT name{};
-        PropVariantInit(&name);
-        std::string display = "Microphone";
-        if (SUCCEEDED(store->GetValue(PKEY_Device_FriendlyName, &name)) && name.vt == VT_LPWSTR && name.pwszVal) {
-            display = WideToUtf8(name.pwszVal);
-        }
-        PropVariantClear(&name);
-        CaptureDeviceInfo info;
-        info.id = WideToUtf8(id);
-        info.name = display;
-        info.isDefault = (_wcsicmp(id, defaultId.c_str()) == 0);
-        out.push_back(std::move(info));
-        CoTaskMemFree(id);
-    }
-    return out;
+    return EnumerateDevices<CaptureDeviceInfo>(eCapture, eCommunications, "Microphone");
 }
 
 std::vector<AppProcessInfo> AudioSourceManager::EnumerateAppProcesses(const std::string& processName) {
@@ -2663,6 +2672,22 @@ constexpr std::array<const char*, 18> kMirroredPreprocessorIdents = {
     "continous_transmission",
     "continuous_transmission",
 };
+
+enum class VoiceRecordingState {
+    Inactive = 0,
+    ActiveSameServer = 1,
+    ActiveOtherServer = 2,
+};
+
+VoiceRecordingState ResolveVoiceRecordingState(bool currentlyActive, uint64 currentSchid, uint64 targetSchid) {
+    if (!currentlyActive || currentSchid == 0) {
+        return VoiceRecordingState::Inactive;
+    }
+    if (currentSchid == targetSchid) {
+        return VoiceRecordingState::ActiveSameServer;
+    }
+    return VoiceRecordingState::ActiveOtherServer;
+}
 } // namespace
 
 void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
@@ -2778,14 +2803,15 @@ void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
 
     const uint64_t nowMs = GetTickCount64();
     const uint64_t lastNudgeMs = voiceTxLastNudgeMs_.load(std::memory_order_relaxed);
-    const bool sameSchid = currentlyActive && (currentSchid == schid);
+    const VoiceRecordingState recordingState = ResolveVoiceRecordingState(currentlyActive, currentSchid, schid);
+    const bool sameSchid = (recordingState == VoiceRecordingState::ActiveSameServer);
     const MicMixSettings runtimeSettings = GetSettings();
     const bool forceTsFilters = runtimeSettings.micForceTsFilters;
     if (sameSchid && nowMs <= (lastNudgeMs + kVoiceTxReapplyMs)) {
         return;
     }
 
-    if (currentlyActive && currentSchid != 0 && currentSchid != schid) {
+    if (recordingState == VoiceRecordingState::ActiveOtherServer) {
         restoreStateForSchid(currentSchid);
         resetSavedState();
     }
@@ -3527,7 +3553,6 @@ std::string MicMixApp::GetPreferredTsCaptureDeviceName() const {
     }
     return out;
 }
-void MicMixApp::RefreshAppList() {}
 
 void MicMixApp::EditCapturedVoice(uint64 schid, short* samples, int sampleCount, int channels, int* edited) {
     if (!initialized_.load(std::memory_order_acquire)) return;

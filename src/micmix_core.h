@@ -41,6 +41,7 @@ struct MicMixSettings {
     std::string appSessionId;
     bool        autostartEnabled = false;
     float       musicGainDb = -15.0f;
+    int         resamplerQuality = 6;
     bool        forceTxEnabled = true;
     int         bufferTargetMs = 60;
     bool        musicMuted = false;
@@ -129,6 +130,13 @@ private:
 };
 
 template <typename T>
+// Lock-free ring buffer for exactly one producer thread and one consumer thread.
+// Memory ordering guarantees:
+// - producer publishes writes via writeIndex_ (release),
+// - consumer observes published data via writeIndex_ (acquire),
+// - consumer publishes reads via readIndex_ (release),
+// - producer observes consumed data via readIndex_ (acquire).
+// Using additional producers/consumers is unsupported and will race.
 class SpscRingBuffer {
 public:
     explicit SpscRingBuffer(size_t capacity)
@@ -138,7 +146,7 @@ public:
 
     size_t Size() const {
         const size_t write = writeIndex_.load(std::memory_order_acquire);
-        const size_t read = readIndex_.load(std::memory_order_acquire);
+        const size_t read = readIndex_.load(std::memory_order_relaxed);
         return write - read;
     }
 
@@ -174,6 +182,8 @@ public:
     }
 
 private:
+    static constexpr size_t kIndexPaddingBytes = 64;
+
     static size_t RoundUpPow2(size_t value) {
         size_t out = 1;
         while (out < value) {
@@ -186,9 +196,22 @@ private:
     size_t               mask_;
     std::vector<T>       buffer_;
     std::atomic<size_t>  readIndex_{0};
+    std::array<unsigned char, kIndexPaddingBytes> indexPadding_{};
     std::atomic<size_t>  writeIndex_{0};
 };
 
+// Threading model:
+// - PushMusicSamples: source/capture thread.
+// - EditCapturedVoice: TeamSpeak real-time capture callback thread.
+// - ApplySettings/Set* control methods: UI/hotkey/control threads.
+//
+// Real-time safety:
+// - EditCapturedVoice is designed for RT use (no locks, no allocations on hot path).
+// - PushMusicSamples is lock-free but may touch telemetry atomics and ring buffer.
+//
+// Contract of EditCapturedVoice:
+// - Mixes buffered music into captured PCM16 voice frames in-place.
+// - Preserves upstream edited flags unless it actually modifies outgoing audio.
 class AudioEngine {
 public:
     AudioEngine();
@@ -318,7 +341,6 @@ public:
     bool IsInitialized() const { return initialized_.load(std::memory_order_relaxed); }
 
     void OpenSettingsWindow();
-    void RefreshAppList();
 
 private:
     static constexpr size_t kSavedPreprocessorSlots = 18;

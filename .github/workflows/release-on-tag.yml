@@ -22,13 +22,33 @@ jobs:
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Path "third_party" -Force | Out-Null
 
+          function Invoke-GitCloneWithRetry {
+            param(
+              [Parameter(Mandatory = $true)][string]$Repo,
+              [Parameter(Mandatory = $true)][string]$TargetDir,
+              [int]$MaxAttempts = 3
+            )
+
+            for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+              Remove-Item -LiteralPath $TargetDir -Recurse -Force -ErrorAction SilentlyContinue
+              git clone $Repo $TargetDir
+              if ($LASTEXITCODE -eq 0) {
+                return
+              }
+              if ($attempt -eq $MaxAttempts) {
+                throw "git clone failed after $MaxAttempts attempts: $Repo -> $TargetDir"
+              }
+              Start-Sleep -Seconds (2 * $attempt)
+            }
+          }
+
           if (-not (Test-Path "third_party/ts3_sdk/include/ts3_functions.h")) {
-            git clone https://github.com/teamspeak/ts3client-pluginsdk.git third_party/ts3_sdk
+            Invoke-GitCloneWithRetry -Repo "https://github.com/teamspeak/ts3client-pluginsdk.git" -TargetDir "third_party/ts3_sdk"
             git -C third_party/ts3_sdk checkout 4aa90a53aa150cbf81e13bc97e68c0431b26499f
           }
 
           if (-not (Test-Path "third_party/speexdsp/libspeexdsp/resample.c")) {
-            git clone https://github.com/xiph/speexdsp.git third_party/speexdsp
+            Invoke-GitCloneWithRetry -Repo "https://github.com/xiph/speexdsp.git" -TargetDir "third_party/speexdsp"
             git -C third_party/speexdsp checkout 7a158783df74efe7c2d1c6ee8363c1e695c71226
           }
 
