@@ -352,7 +352,6 @@ private:
     void VoiceTxThreadMain();
     void SetVoiceRecordingState(bool active, uint64 schid);
     void RefreshVoiceTxControl(uint64 schidHint);
-    void NudgeCapturePath(uint64 schid);
 
     std::atomic<bool> initialized_{false};
     std::unique_ptr<ConfigStore> configStore_;

@@ -868,6 +868,8 @@ void AudioEngine::PushMusicSamples(const float* samples, size_t count) {
     }
     nextPeak = std::clamp(nextPeak, -120.0f, 0.0f);
     musicPeakDbfs_.store(nextPeak, std::memory_order_release);
+    // Treat very low-level source noise as "no activity" to avoid extending
+    // force-send windows when only near-silence is present.
     if (peakDb > -72.0f || rmsDb > -78.0f) {
         lastMusicSignalTickMs_.store(GetTickCount64(), std::memory_order_release);
     }
@@ -974,8 +976,13 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
 
     float micRmsAcc = 0.0f;
     for (int i = 0; i < sampleCount; ++i) {
-        const float mic = static_cast<float>(samples[i * channels]) / 32768.0f;
-        micRmsAcc += mic * mic;
+        float micMono = 0.0f;
+        for (int ch = 0; ch < channels; ++ch) {
+            const int idx = (i * channels) + ch;
+            micMono += static_cast<float>(samples[idx]) / 32768.0f;
+        }
+        micMono /= static_cast<float>(channels);
+        micRmsAcc += micMono * micMono;
     }
     const float micRms = std::sqrt(micRmsAcc / static_cast<float>(sampleCount));
     const float micRmsDb = 20.0f * std::log10(std::max(micRms, 0.000001f));
@@ -1011,7 +1018,11 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
                 }
             }
         }
-        limiterGain = std::min(1.0f, limiterGain + 0.05f);
+        // Match limiter recovery behavior to the per-sample release path used
+        // while mixing so transitions stay consistent when music stops.
+        const float recoveryFactor = 1.0f - std::pow(1.0f - kLimiterReleaseCoeff, static_cast<float>(sampleCount));
+        limiterGain += (1.0f - limiterGain) * recoveryFactor;
+        limiterGain = std::clamp(limiterGain, 0.1f, 1.0f);
         micGateGain_.store(gateGain, std::memory_order_relaxed);
         limiterGain_.store(limiterGain, std::memory_order_relaxed);
         int outFlags = upstreamFlags;
@@ -1649,22 +1660,31 @@ private:
         }
 
         HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (!event) {
-            code = "event_failed"; msg = "Could not create event"; releaseWf(); return false;
-        }
-        hr = client->SetEventHandle(event);
-        if (FAILED(hr)) {
-            CloseHandle(event);
+        auto closeEvent = [&]() {
+            if (event) {
+                CloseHandle(event);
+                event = nullptr;
+            }
+        };
+        if (event) {
+            hr = client->SetEventHandle(event);
+            if (FAILED(hr)) {
+                if (!detail.empty()) {
+                    detail += " ";
+                }
+                detail += "pid=" + std::to_string(pid) + " event_hr=" + HrToHex(hr) + " fallback=polling";
+                closeEvent();
+            }
+        } else {
             if (!detail.empty()) {
                 detail += " ";
             }
-            detail += "pid=" + std::to_string(pid) + " event_hr=" + HrToHex(hr);
-            code = "event_set_failed"; msg = "Could not set event"; releaseWf(); return false;
+            detail += "pid=" + std::to_string(pid) + " event_create_failed fallback=polling";
         }
         ComPtr<IAudioCaptureClient> cap;
         hr = client->GetService(IID_PPV_ARGS(&cap));
         if (FAILED(hr) || !cap) {
-            CloseHandle(event);
+            closeEvent();
             if (!detail.empty()) {
                 detail += " ";
             }
@@ -1673,13 +1693,13 @@ private:
         }
         const int resamplerQuality = std::clamp(settings_.resamplerQuality, 0, 10);
         if (!resampler_.Configure(wf->nSamplesPerSec, kTargetRate, resamplerQuality)) {
-            CloseHandle(event);
+            closeEvent();
             code = "resampler_failed"; msg = "Resampler init failed"; releaseWf(); return false;
         }
         const int channels = std::max<int>(1, wf->nChannels);
         hr = client->Start();
         if (FAILED(hr)) {
-            CloseHandle(event);
+            closeEvent();
             if (!detail.empty()) {
                 detail += " ";
             }
@@ -1689,29 +1709,42 @@ private:
         SetStatus(SourceState::Running, "running", "App capture running", "");
 
         while (!StopRequested()) {
-            DWORD wait = WaitForSingleObject(event, 200);
-            if (wait == WAIT_TIMEOUT) {
+            if (event) {
+                const DWORD wait = WaitForSingleObject(event, 200);
+                if (wait == WAIT_TIMEOUT) {
+                    if (!IsProcessAlive(pid)) {
+                        client->Stop();
+                        closeEvent();
+                        releaseWf();
+                        code = "session_lost"; msg = "App process exited"; return false;
+                    }
+                    continue;
+                }
+                if (wait != WAIT_OBJECT_0) {
+                    client->Stop();
+                    closeEvent();
+                    releaseWf();
+                    code = "wait_failed"; msg = "Event wait failed"; return false;
+                }
+            } else {
                 if (!IsProcessAlive(pid)) {
                     client->Stop();
-                    CloseHandle(event);
+                    closeEvent();
                     releaseWf();
                     code = "session_lost"; msg = "App process exited"; return false;
                 }
-                continue;
-            }
-            if (wait != WAIT_OBJECT_0) {
-                client->Stop();
-                CloseHandle(event);
-                releaseWf();
-                code = "wait_failed"; msg = "Event wait failed"; return false;
+                std::this_thread::sleep_for(std::chrono::milliseconds(4));
             }
             UINT32 nextPacket = 0;
             hr = cap->GetNextPacketSize(&nextPacket);
             if (FAILED(hr)) {
                 client->Stop();
-                CloseHandle(event);
+                closeEvent();
                 releaseWf();
                 code = "packet_failed"; msg = "Packet query failed"; return false;
+            }
+            if (nextPacket == 0) {
+                continue;
             }
             while (nextPacket > 0 && !StopRequested()) {
                 BYTE* data = nullptr;
@@ -1720,7 +1753,7 @@ private:
                 hr = cap->GetBuffer(&data, &frames, &flagsRead, nullptr, nullptr);
                 if (FAILED(hr)) {
                     client->Stop();
-                    CloseHandle(event);
+                    closeEvent();
                     releaseWf();
                     code = "buffer_failed"; msg = "Buffer read failed"; return false;
                 }
@@ -1745,7 +1778,7 @@ private:
                 if (!resampler_.Process(monoIn_.data(), monoIn_.size(), monoOut_)) {
                     cap->ReleaseBuffer(frames);
                     client->Stop();
-                    CloseHandle(event);
+                    closeEvent();
                     releaseWf();
                     code = "resample_failed"; msg = "Resample failed"; return false;
                 }
@@ -1754,7 +1787,7 @@ private:
                 hr = cap->GetNextPacketSize(&nextPacket);
                 if (FAILED(hr)) {
                     client->Stop();
-                    CloseHandle(event);
+                    closeEvent();
                     releaseWf();
                     code = "packet_failed"; msg = "Packet query failed"; return false;
                 }
@@ -1762,7 +1795,7 @@ private:
         }
 
         client->Stop();
-        CloseHandle(event);
+        closeEvent();
         releaseWf();
         return true;
     }
@@ -3015,10 +3048,6 @@ void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
     voiceRecordingActive_.store(true, std::memory_order_release);
     voiceRecordingSchid_.store(schid, std::memory_order_release);
     voiceTxLastNudgeMs_.store(nowMs, std::memory_order_release);
-}
-
-void MicMixApp::NudgeCapturePath(uint64 schid) {
-    (void)schid;
 }
 
 void MicMixApp::RefreshVoiceTxControl(uint64 schidHint) {

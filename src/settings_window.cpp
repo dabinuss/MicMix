@@ -46,6 +46,7 @@ enum ControlId {
     IDC_MIC_METER_HINT = 1028,
     IDC_GAIN_HINT = 1029,
     IDC_FORCE_TX_HINT = 1030,
+    IDC_RESAMPLER_QUALITY = 1031,
 };
 
 enum class SourceChoiceType {
@@ -307,6 +308,30 @@ void UpdateGainLabel(HWND hwnd) {
     wchar_t buf[64];
     swprintf_s(buf, L"%+.1f dB", db);
     SetWindowTextW(GetDlgItem(hwnd, IDC_GAIN_VALUE), buf);
+}
+
+void PopulateResamplerQualityCombo(HWND hwnd) {
+    HWND combo = GetDlgItem(hwnd, IDC_RESAMPLER_QUALITY);
+    if (!combo) {
+        return;
+    }
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    for (int quality = 0; quality <= 10; ++quality) {
+        wchar_t label[64]{};
+        if (quality == 0) {
+            swprintf_s(label, L"%d (Economy)", quality);
+        } else if (quality == 6) {
+            swprintf_s(label, L"%d (Balanced)", quality);
+        } else if (quality == 10) {
+            swprintf_s(label, L"%d (High Quality)", quality);
+        } else {
+            swprintf_s(label, L"%d", quality);
+        }
+        const LRESULT idx = SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
+        if (idx >= 0) {
+            SendMessageW(combo, CB_SETITEMDATA, static_cast<WPARAM>(idx), static_cast<LPARAM>(quality));
+        }
+    }
 }
 
 bool IsModifierOnlyKey(UINT vk) {
@@ -571,6 +596,26 @@ void LoadSettings(HWND hwnd) {
     SendMessageW(GetDlgItem(hwnd, IDC_FORCE_TX), BM_SETCHECK, s.forceTxEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(GetDlgItem(hwnd, IDC_MUTE), BM_SETCHECK, s.musicMuted ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(GetDlgItem(hwnd, IDC_AUTOSTART), BM_SETCHECK, s.autostartEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    HWND qualityCombo = GetDlgItem(hwnd, IDC_RESAMPLER_QUALITY);
+    if (qualityCombo) {
+        const int qualityCount = static_cast<int>(SendMessageW(qualityCombo, CB_GETCOUNT, 0, 0));
+        int selected = -1;
+        if (qualityCount > 0) {
+            for (int i = 0; i < qualityCount; ++i) {
+                const LRESULT data = SendMessageW(qualityCombo, CB_GETITEMDATA, static_cast<WPARAM>(i), 0);
+                if (data == s.resamplerQuality) {
+                    selected = i;
+                    break;
+                }
+            }
+            if (selected < 0) {
+                selected = std::clamp(s.resamplerQuality, 0, qualityCount - 1);
+            }
+            if (selected >= 0) {
+                SendMessageW(qualityCombo, CB_SETCURSEL, static_cast<WPARAM>(selected), 0);
+            }
+        }
+    }
     g_muteHotkeyModifiers = static_cast<UINT>(std::max(0, s.muteHotkeyModifiers));
     g_muteHotkeyVk = static_cast<UINT>(std::max(0, s.muteHotkeyVk));
     UpdateGainLabel(hwnd);
@@ -603,6 +648,13 @@ MicMixSettings CollectSettings(HWND hwnd) {
     }
 
     s.musicGainDb = SliderToGainDb(static_cast<int>(SendMessageW(GetDlgItem(hwnd, IDC_GAIN), TBM_GETPOS, 0, 0)));
+    const int qualitySel = static_cast<int>(SendMessageW(GetDlgItem(hwnd, IDC_RESAMPLER_QUALITY), CB_GETCURSEL, 0, 0));
+    if (qualitySel >= 0) {
+        const LRESULT quality = SendMessageW(GetDlgItem(hwnd, IDC_RESAMPLER_QUALITY), CB_GETITEMDATA, static_cast<WPARAM>(qualitySel), 0);
+        if (quality >= 0 && quality <= 10) {
+            s.resamplerQuality = static_cast<int>(quality);
+        }
+    }
     s.forceTxEnabled = SendMessageW(GetDlgItem(hwnd, IDC_FORCE_TX), BM_GETCHECK, 0, 0) == BST_CHECKED;
     s.musicMuted = SendMessageW(GetDlgItem(hwnd, IDC_MUTE), BM_GETCHECK, 0, 0) == BST_CHECKED;
     s.autostartEnabled = SendMessageW(GetDlgItem(hwnd, IDC_AUTOSTART), BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -688,7 +740,7 @@ void ApplyFonts(HWND hwnd) {
 void ComputeLayout() {
     g_rcSession = { S(16), S(82), S(684), S(210) };
     g_rcSource = { S(16), S(222), S(684), S(342) };
-    g_rcMix = { S(16), S(354), S(684), S(590) };
+    g_rcMix = { S(16), S(354), S(684), S(622) };
 }
 
 void DrawCard(HDC hdc, const RECT& rc) {
@@ -796,22 +848,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         SendMessageW(gain, TBM_SETPAGESIZE, 0, 10);
         SendMessageW(gain, TBM_SETLINESIZE, 0, 1);
         CreateWindowW(L"STATIC", L"-15.0 dB", WS_CHILD | WS_VISIBLE, S(560), S(388), S(102), S(24), hwnd, reinterpret_cast<HMENU>(IDC_GAIN_VALUE), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Max is -6 dB to reduce clipping risk", WS_CHILD | WS_VISIBLE, fieldX, S(408), S(330), S(18), hwnd, reinterpret_cast<HMENU>(IDC_GAIN_HINT), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Music Meter", WS_CHILD | WS_VISIBLE, labelX, S(420), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        g_rcMeter = { fieldX, S(418), fieldX + S(360), S(418) + S(20) };
-        CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, S(550), S(420), S(112), S(22), hwnd, reinterpret_cast<HMENU>(IDC_METER_TEXT), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Send music when mic is silent", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, fieldX, S(448), S(260), S(24), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Music keeps sending even when you are not speaking", WS_CHILD | WS_VISIBLE, fieldX, S(468), S(360), S(18), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX_HINT), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Mute music", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, S(460), S(448), S(120), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MUTE), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Mic Meter", WS_CHILD | WS_VISIBLE, labelX, S(480), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        g_rcMicMeter = { fieldX, S(478), fieldX + S(360), S(478) + S(20) };
-        CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, S(550), S(480), S(112), S(22), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_TEXT), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Only while connected", WS_CHILD | WS_VISIBLE, fieldX, S(500), S(180), S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_HINT), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"MicMix-Mute-Hotkey", WS_CHILD | WS_VISIBLE, labelX, S(526), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Set...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, fieldX, S(522), S(160), S(30), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_SET), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Current: Not set", WS_CHILD | WS_VISIBLE, fieldX + S(172), S(526), S(290), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_TEXT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Max is -6 dB to reduce clipping risk", WS_CHILD | WS_VISIBLE, fieldX, S(412), S(330), S(18), hwnd, reinterpret_cast<HMENU>(IDC_GAIN_HINT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Music Meter", WS_CHILD | WS_VISIBLE, labelX, S(438), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
+        g_rcMeter = { fieldX, S(436), fieldX + S(360), S(436) + S(20) };
+        CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, S(550), S(438), S(112), S(22), hwnd, reinterpret_cast<HMENU>(IDC_METER_TEXT), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Send music when mic is silent", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, fieldX, S(466), S(260), S(24), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Mute music", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, S(460), S(466), S(120), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MUTE), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Music keeps sending even when you are not speaking", WS_CHILD | WS_VISIBLE, fieldX, S(486), S(360), S(18), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX_HINT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Mic Meter", WS_CHILD | WS_VISIBLE, labelX, S(518), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
+        g_rcMicMeter = { fieldX, S(516), fieldX + S(360), S(516) + S(20) };
+        CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, S(550), S(518), S(112), S(22), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_TEXT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Only while connected", WS_CHILD | WS_VISIBLE, fieldX, S(538), S(180), S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_HINT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"MicMix-Mute-Hotkey", WS_CHILD | WS_VISIBLE, labelX, S(556), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Set...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, fieldX, S(552), S(160), S(30), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_SET), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Current: Not set", WS_CHILD | WS_VISIBLE, fieldX + S(172), S(556), S(290), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_TEXT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Resampler Quality", WS_CHILD | WS_VISIBLE, labelX, S(586), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
+        HWND qualityCombo = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | CBS_DROPDOWNLIST, fieldX, S(582), S(220), S(200), hwnd, reinterpret_cast<HMENU>(IDC_RESAMPLER_QUALITY), nullptr, nullptr);
+        SendMessageW(qualityCombo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), S(24));
+        SendMessageW(qualityCombo, CB_SETITEMHEIGHT, 0, S(22));
+        SendMessageW(qualityCombo, CB_SETMINVISIBLE, 10, 0);
+        PopulateResamplerQualityCombo(hwnd);
 
-        CreateWindowW(L"STATIC", L"State: Stopped", WS_CHILD | WS_VISIBLE, S(36), S(604), S(626), S(54), hwnd, reinterpret_cast<HMENU>(IDC_STATUS), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"State: Stopped", WS_CHILD | WS_VISIBLE, S(36), S(636), S(626), S(54), hwnd, reinterpret_cast<HMENU>(IDC_STATUS), nullptr, nullptr);
 
         ApplyControlTheme(hwnd);
         ApplyFonts(hwnd);
@@ -945,6 +1003,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_AUTOSTART:
             if (HIWORD(wParam) == BN_CLICKED) {
                 ApplyLiveSettings(hwnd, false);
+                return 0;
+            }
+            break;
+        case IDC_RESAMPLER_QUALITY:
+            if (HIWORD(wParam) == CBN_SELCHANGE) {
+                ApplyLiveSettings(hwnd, true);
                 return 0;
             }
             break;
