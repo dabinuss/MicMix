@@ -86,3 +86,4 @@ third_party/speexdsp/
 
 # Lokale Entwicklungsnotizen (nicht veroeffentlichen)
 LOCAL_DEV.md
+.claude/settings.local.json

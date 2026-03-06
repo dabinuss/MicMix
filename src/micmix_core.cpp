@@ -1471,8 +1471,11 @@ private:
             }
         };
         if (!settings_.appSessionId.empty()) {
-            uint32_t pid = static_cast<uint32_t>(strtoul(settings_.appSessionId.c_str(), nullptr, 10));
-            addCandidate(pid);
+            char* endPtr = nullptr;
+            const unsigned long parsed = strtoul(settings_.appSessionId.c_str(), &endPtr, 10);
+            if (endPtr != settings_.appSessionId.c_str() && *endPtr == '\0') {
+                addCandidate(static_cast<uint32_t>(parsed));
+            }
         }
         if (settings_.appProcessName.empty()) {
             return out;
