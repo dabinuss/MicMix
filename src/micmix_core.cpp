@@ -43,6 +43,9 @@ constexpr int  kTargetRate = 48000;
 constexpr int  kVoiceTxPollMs = 40;
 constexpr uint64_t kTalkEventFreshMs = 450ULL;
 constexpr uint64_t kForceTxMusicWindowMs = 6000ULL;
+constexpr uint64_t kVoiceTxReapplyMs = 12000ULL;
+constexpr uint64_t kCaptureWatchdogSilenceMs = 4500ULL;
+constexpr uint64_t kCaptureWatchdogCooldownMs = 12000ULL;
 
 std::mutex g_logMutex;
 std::string g_logPath;
@@ -571,11 +574,6 @@ ConfigStore::ConfigStore(std::string basePath)
 
 std::string ConfigStore::Trim(const std::string& value) {
     return ::Trim(value);
-}
-
-bool ConfigStore::ParseBool(const std::string& value, bool& out) {
-    out = ::ParseBool(value, out);
-    return true;
 }
 
 std::string ConfigStore::BoolToString(bool value) {
@@ -2771,8 +2769,7 @@ void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
     const bool sameSchid = currentlyActive && (currentSchid == schid);
     const MicMixSettings runtimeSettings = GetSettings();
     const bool forceTsFilters = runtimeSettings.micForceTsFilters;
-    const bool strictTsAutoGate = (runtimeSettings.micGateMode == MicGateMode::AutoTs);
-    if (sameSchid && nowMs <= (lastNudgeMs + 1000ULL)) {
+    if (sameSchid && nowMs <= (lastNudgeMs + kVoiceTxReapplyMs)) {
         return;
     }
 
@@ -2884,11 +2881,11 @@ void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
         }
     }
 
+    // Keep transport always open while force-send path is active, otherwise
+    // TS may only start sending after first local voice trigger.
     const char* desiredVadValue = "false";
-    if (strictTsAutoGate && savedVadValid_) {
-        desiredVadValue = savedVadEnabled_ ? "true" : "false";
-    }
-    const unsigned int errVad = g_ts3Functions.setPreProcessorConfigValue(schid, "vad", desiredVadValue);
+    const char* currentVadValue = vadEnabled ? "true" : "false";
+    const bool needVadUpdate = !sameSchid || (_stricmp(currentVadValue, desiredVadValue) != 0);
     if (!sameSchid) {
         size_t keepAppliedCount = 0;
         std::string keepAppliedKeys;
@@ -2929,18 +2926,39 @@ void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
         }
     }
     int desiredInputState = INPUT_ACTIVE;
-    const unsigned int errInput = g_ts3Functions.setClientSelfVariableAsInt(
-        schid, CLIENT_INPUT_DEACTIVATED, desiredInputState);
-    const unsigned int errFlush = g_ts3Functions.flushClientSelfUpdates(schid, nullptr);
-    const bool ok = (errVad == ERROR_ok || errVad == ERROR_ok_no_update) &&
-                    (errInput == ERROR_ok || errInput == ERROR_ok_no_update) &&
-                    (errFlush == ERROR_ok || errFlush == ERROR_ok_no_update);
+    const bool needInputUpdate = !sameSchid || (inputState != desiredInputState);
+    const bool needFlush = !sameSchid || needVadUpdate || needInputUpdate;
+    if (sameSchid && !needFlush) {
+        voiceTxLastNudgeMs_.store(nowMs, std::memory_order_release);
+        return;
+    }
+
+    unsigned int errVad = ERROR_ok_no_update;
+    if (needVadUpdate) {
+        errVad = g_ts3Functions.setPreProcessorConfigValue(schid, "vad", desiredVadValue);
+    }
+    unsigned int errInput = ERROR_ok_no_update;
+    if (needInputUpdate) {
+        errInput = g_ts3Functions.setClientSelfVariableAsInt(
+            schid, CLIENT_INPUT_DEACTIVATED, desiredInputState);
+    }
+    unsigned int errFlush = ERROR_ok_no_update;
+    if (needFlush) {
+        errFlush = g_ts3Functions.flushClientSelfUpdates(schid, nullptr);
+    }
+    const bool okVad = !needVadUpdate || (errVad == ERROR_ok || errVad == ERROR_ok_no_update);
+    const bool okInput = !needInputUpdate || (errInput == ERROR_ok || errInput == ERROR_ok_no_update);
+    const bool okFlush = !needFlush || (errFlush == ERROR_ok || errFlush == ERROR_ok_no_update);
+    const bool ok = okVad && okInput && okFlush;
     if (!ok) {
         if (nowMs > (lastErrLogMs + 2000ULL)) {
             LogWarn("talk_mode force failed schid=" + std::to_string(schid) +
                     " vad_err=" + std::to_string(errVad) +
                     " input_err=" + std::to_string(errInput) +
-                    " flush_err=" + std::to_string(errFlush));
+                    " flush_err=" + std::to_string(errFlush) +
+                    " need_vad=" + std::to_string(needVadUpdate ? 1 : 0) +
+                    " need_input=" + std::to_string(needInputUpdate ? 1 : 0) +
+                    " need_flush=" + std::to_string(needFlush ? 1 : 0));
             lastErrLogMs = nowMs;
         }
         clearState();
@@ -2948,13 +2966,13 @@ void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
     }
 
     if (!sameSchid) {
-        if (strictTsAutoGate) {
-            LogInfo("talk_mode strict_ts_auto schid=" + std::to_string(schid) +
-                    " vad=" + desiredVadValue +
-                    " input_state=" + std::to_string(desiredInputState));
-        } else {
-            LogInfo("talk_mode forced continuous schid=" + std::to_string(schid));
-        }
+        LogInfo("talk_mode forced continuous schid=" + std::to_string(schid) +
+                " vad=" + desiredVadValue +
+                " input_state=" + std::to_string(desiredInputState));
+    } else if (needVadUpdate || needInputUpdate) {
+        LogInfo("talk_mode refresh schid=" + std::to_string(schid) +
+                " need_vad=" + std::to_string(needVadUpdate ? 1 : 0) +
+                " need_input=" + std::to_string(needInputUpdate ? 1 : 0));
     }
     voiceRecordingActive_.store(true, std::memory_order_release);
     voiceRecordingSchid_.store(schid, std::memory_order_release);
@@ -3191,7 +3209,8 @@ void MicMixApp::VoiceTxThreadMain() {
                         const uint64_t nowMs = GetTickCount64();
                         const uint64_t lastCaptureMs = lastCaptureEditTickMs_.load(std::memory_order_acquire);
                         const uint64_t lastNudgeMs = lastCaptureReopenTickMs_.load(std::memory_order_acquire);
-                        if (nowMs > (lastCaptureMs + 1200ULL) && nowMs > (lastNudgeMs + 1200ULL)) {
+                        if (nowMs > (lastCaptureMs + kCaptureWatchdogSilenceMs) &&
+                            nowMs > (lastNudgeMs + kCaptureWatchdogCooldownMs)) {
                             const unsigned int err = g_ts3Functions.activateCaptureDevice(schid);
                             lastCaptureReopenTickMs_.store(nowMs, std::memory_order_release);
                             if (!(err == ERROR_ok || err == ERROR_ok_no_update)) {

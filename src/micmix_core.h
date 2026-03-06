@@ -121,7 +121,6 @@ private:
     std::string logPath_;
 
     static std::string Trim(const std::string& value);
-    static bool ParseBool(const std::string& value, bool& out);
     static std::string BoolToString(bool value);
     static std::string SourceModeToString(SourceMode mode);
     static SourceMode SourceModeFromString(const std::string& value);

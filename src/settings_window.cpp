@@ -36,8 +36,6 @@ enum ControlId {
     IDC_STOP = 1013,
     IDC_SAVE = 1014,
     IDC_STATUS = 1015,
-    IDC_MIC_INFO = 1017,
-    IDC_METER_BAR = 1018,
     IDC_METER_TEXT = 1019,
     IDC_MUTE_HOTKEY_SET = 1020,
     IDC_MUTE_HOTKEY_TEXT = 1021,
@@ -89,8 +87,6 @@ std::vector<LoopbackDeviceInfo> g_pendingLoopbacks;
 std::vector<CaptureDeviceInfo> g_pendingCaptureDevices;
 std::vector<AppProcessInfo> g_pendingApps;
 std::atomic_uint64_t g_sourceRefreshSeq{0};
-std::atomic_uint64_t g_sourceRefreshApplied{0};
-std::atomic<bool> g_sourceRefreshInFlight{false};
 std::atomic<bool> g_sourceRefreshReloadSettings{false};
 
 constexpr INT_PTR kSourceItemHeader = -10;
@@ -400,7 +396,6 @@ void RequestSourceRefresh(HWND hwnd, bool reloadSettings) {
         return;
     }
     const uint64_t seq = g_sourceRefreshSeq.fetch_add(1, std::memory_order_acq_rel) + 1ULL;
-    g_sourceRefreshInFlight.store(true, std::memory_order_release);
     if (reloadSettings) {
         g_sourceRefreshReloadSettings.store(true, std::memory_order_release);
     }
@@ -679,7 +674,6 @@ void ApplyFonts(HWND hwnd) {
     }, 0);
     SetControlFont(hwnd, IDC_TITLE, g_fontTitle);
     SetControlFont(hwnd, IDC_SUBTITLE, g_fontSmall);
-    SetControlFont(hwnd, IDC_MIC_INFO, g_fontSmall);
     SetControlFont(hwnd, IDC_METER_TEXT, g_fontSmall);
     SetControlFont(hwnd, IDC_MIC_METER_TEXT, g_fontSmall);
     SetControlFont(hwnd, IDC_MONITOR_HINT, g_fontHint ? g_fontHint : g_fontSmall);
@@ -841,8 +835,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_captureDevices = g_pendingCaptureDevices;
             g_apps = g_pendingApps;
         }
-        g_sourceRefreshApplied.store(seq, std::memory_order_release);
-        g_sourceRefreshInFlight.store(false, std::memory_order_release);
         PopulateCombos(hwnd);
         if (g_sourceRefreshReloadSettings.exchange(false, std::memory_order_acq_rel)) {
             LoadSettings(hwnd);
