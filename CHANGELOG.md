@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.2.2] - 2026-03-06
+
+### Fixed
+
+- Stabilized force-send behavior for already-running music streams so transport activation no longer depends on a first mic trigger.
+- Reduced periodic TS reapply pressure and softened capture watchdog timing to improve long-session voice stability and reduce risk of robotic artifacts.
+- Fixed release automation by fetching required third-party dependencies in CI/release workflows before CMake configure.
+
 ## [1.2.1] - 2026-03-06
 
 ### Changed
