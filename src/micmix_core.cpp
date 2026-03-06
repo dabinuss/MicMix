@@ -40,6 +40,9 @@ namespace {
 
 constexpr char kLogChannel[] = "MicMix";
 constexpr int  kTargetRate = 48000;
+constexpr int  kVoiceTxPollMs = 40;
+constexpr uint64_t kTalkEventFreshMs = 450ULL;
+constexpr uint64_t kForceTxMusicWindowMs = 6000ULL;
 
 std::mutex g_logMutex;
 std::string g_logPath;
@@ -196,9 +199,13 @@ void SanitizeSettings(MicMixSettings& s) {
     s.configVersion = std::clamp(s.configVersion, 1, 8);
     s.musicGainDb = std::clamp(s.musicGainDb, -30.0f, -6.0f);
     s.bufferTargetMs = std::clamp(s.bufferTargetMs, 20, 250);
+    s.micGateThresholdDbfs = std::clamp(s.micGateThresholdDbfs, -90.0f, 0.0f);
     s.muteHotkeyModifiers &= (MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN);
     s.muteHotkeyVk = std::clamp(s.muteHotkeyVk, 0, 255);
     s.uiLastOpenTab = std::max(0, s.uiLastOpenTab);
+    if (s.micGateMode != MicGateMode::AutoTs && s.micGateMode != MicGateMode::Custom) {
+        s.micGateMode = MicGateMode::AutoTs;
+    }
 
     StripConfigControlChars(s.loopbackDeviceId, 512);
     StripConfigControlChars(s.appProcessName, 128);
@@ -229,7 +236,12 @@ bool IsSameSettings(const MicMixSettings& a, const MicMixSettings& b) {
            a.autoSwitchToLoopback == b.autoSwitchToLoopback &&
            a.muteHotkeyModifiers == b.muteHotkeyModifiers &&
            a.muteHotkeyVk == b.muteHotkeyVk &&
-           a.captureDeviceId == b.captureDeviceId;
+           a.captureDeviceId == b.captureDeviceId &&
+           a.micGateMode == b.micGateMode &&
+           NearlyEqual(a.micGateThresholdDbfs, b.micGateThresholdDbfs) &&
+           a.micUseSmoothGate == b.micUseSmoothGate &&
+           a.micUseKeyboardGuard == b.micUseKeyboardGuard &&
+           a.micForceTsFilters == b.micForceTsFilters;
 }
 
 bool IsBlockedUiProcess(uint32_t pid, const std::wstring& exeName) {
@@ -581,6 +593,17 @@ SourceMode ConfigStore::SourceModeFromString(const std::string& value) {
     return SourceMode::Loopback;
 }
 
+std::string ConfigStore::MicGateModeToString(MicGateMode mode) {
+    return mode == MicGateMode::Custom ? "custom" : "auto_ts";
+}
+
+MicGateMode ConfigStore::MicGateModeFromString(const std::string& value) {
+    if (value == "custom" || value == "custom_threshold") {
+        return MicGateMode::Custom;
+    }
+    return MicGateMode::AutoTs;
+}
+
 bool ConfigStore::Load(MicMixSettings& outSettings, std::string& warning) {
     warning.clear();
     auto appendWarning = [&](const char* msg) {
@@ -661,6 +684,11 @@ bool ConfigStore::Load(MicMixSettings& outSettings, std::string& warning) {
     parseInt("hotkey.mute.modifiers", outSettings.muteHotkeyModifiers);
     parseInt("hotkey.mute.vk", outSettings.muteHotkeyVk);
     if (auto it = kv.find("capture.device_id"); it != kv.end()) outSettings.captureDeviceId = it->second;
+    if (auto it = kv.find("mic.gate.mode"); it != kv.end()) outSettings.micGateMode = MicGateModeFromString(it->second);
+    parseFloat("mic.gate.threshold_dbfs", outSettings.micGateThresholdDbfs);
+    if (auto it = kv.find("mic.gate.smooth"); it != kv.end()) outSettings.micUseSmoothGate = ::ParseBool(it->second, outSettings.micUseSmoothGate);
+    if (auto it = kv.find("mic.gate.keyboard_guard"); it != kv.end()) outSettings.micUseKeyboardGuard = ::ParseBool(it->second, outSettings.micUseKeyboardGuard);
+    if (auto it = kv.find("mic.force_ts_filters"); it != kv.end()) outSettings.micForceTsFilters = ::ParseBool(it->second, outSettings.micForceTsFilters);
     parseInt("ui.last_open_tab", outSettings.uiLastOpenTab);
     if (parseIssue) {
         appendWarning("Config parse issue detected; fallback values were used.");
@@ -688,6 +716,11 @@ bool ConfigStore::Save(const MicMixSettings& settings, std::string& error) {
     ss << "hotkey.mute.modifiers=" << safe.muteHotkeyModifiers << "\n";
     ss << "hotkey.mute.vk=" << safe.muteHotkeyVk << "\n";
     ss << "capture.device_id=" << safe.captureDeviceId << "\n";
+    ss << "mic.gate.mode=" << MicGateModeToString(safe.micGateMode) << "\n";
+    ss << "mic.gate.threshold_dbfs=" << safe.micGateThresholdDbfs << "\n";
+    ss << "mic.gate.smooth=" << BoolToString(safe.micUseSmoothGate) << "\n";
+    ss << "mic.gate.keyboard_guard=" << BoolToString(safe.micUseKeyboardGuard) << "\n";
+    ss << "mic.force_ts_filters=" << BoolToString(safe.micForceTsFilters) << "\n";
     ss << "ui.last_open_tab=" << safe.uiLastOpenTab << "\n";
 
     {
@@ -739,8 +772,11 @@ void AudioEngine::ApplySettings(const MicMixSettings& settings) {
     forceTxEnabled_.store(settings.forceTxEnabled, std::memory_order_release);
     musicGainLinear_.store(DbToLinear(gainDb), std::memory_order_release);
     bufferTargetMs_.store(bufferMs, std::memory_order_release);
+    micUseSmoothGate_.store(settings.micUseSmoothGate, std::memory_order_release);
     micTalkDetected_.store(false, std::memory_order_release);
     talkState_.store(false, std::memory_order_release);
+    micGateGain_.store(1.0f, std::memory_order_release);
+    limiterGain_.store(1.0f, std::memory_order_release);
 }
 
 void AudioEngine::SetMusicSourceRunning(bool running) {
@@ -753,6 +789,8 @@ void AudioEngine::SetMusicSourceRunning(bool running) {
         musicRmsDbfs_.store(-120.0f, std::memory_order_release);
         musicPeakDbfs_.store(-120.0f, std::memory_order_release);
         musicSendPeakDbfs_.store(-120.0f, std::memory_order_release);
+        micGateGain_.store(1.0f, std::memory_order_release);
+        limiterGain_.store(1.0f, std::memory_order_release);
     }
 }
 void AudioEngine::SetTalkState(bool talking) { talkState_.store(talking, std::memory_order_release); }
@@ -767,7 +805,9 @@ void AudioEngine::SetExternalMicLevel(float linear) {
 }
 void AudioEngine::SetMuted(bool muted) { musicMuted_.store(muted, std::memory_order_release); }
 void AudioEngine::ToggleMute() { musicMuted_.store(!musicMuted_.load(std::memory_order_acquire), std::memory_order_release); }
-void AudioEngine::ClearMusicBuffer() { ring_.Reset(); }
+void AudioEngine::ClearMusicBuffer() {
+    ring_.Reset();
+}
 
 void AudioEngine::PushMusicSamples(const float* samples, size_t count) {
     if (!samples || count == 0) {
@@ -813,7 +853,18 @@ void AudioEngine::PushMusicSamples(const float* samples, size_t count) {
         // Drop stale buffered audio so producer cannot accumulate endless backlog.
         ring_.Reset();
     }
-    const size_t written = ring_.Write(samples, count);
+    const int targetMs = std::clamp(bufferTargetMs_.load(std::memory_order_relaxed), 20, 250);
+    size_t maxQueued = (static_cast<size_t>(targetMs) * static_cast<size_t>(kTargetRate)) / 1000U;
+    maxQueued += static_cast<size_t>(kTargetRate / 100); // ~10ms safety headroom.
+    maxQueued = std::min(maxQueued, ring_.Capacity() > 0 ? (ring_.Capacity() - 1) : 0U);
+
+    size_t allowed = 0;
+    const size_t queued = ring_.Size();
+    if (queued < maxQueued) {
+        allowed = maxQueued - queued;
+    }
+    const size_t requestWrite = std::min(count, allowed);
+    const size_t written = (requestWrite > 0) ? ring_.Write(samples, requestWrite) : 0;
     if (written < count) {
         overruns_.fetch_add(count - written, std::memory_order_relaxed);
     }
@@ -837,6 +888,10 @@ TelemetrySnapshot AudioEngine::SnapshotTelemetry() const {
     return t;
 }
 
+void AudioEngine::NoteReconnect() {
+    reconnectsMirror_.fetch_add(1, std::memory_order_relaxed);
+}
+
 void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channels, int* edited) {
     if (!samples || sampleCount <= 0 || channels <= 0 || !edited) {
         return;
@@ -848,9 +903,43 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
     const bool sourceRunning = sourceRunning_.load(std::memory_order_relaxed);
     const bool forceTx = forceTxEnabled_.load(std::memory_order_relaxed);
     const bool talkOpen = talkState_.load(std::memory_order_relaxed);
+    const bool smoothGate = micUseSmoothGate_.load(std::memory_order_relaxed);
+    const float targetGateGain = talkOpen ? 1.0f : 0.0f;
+    float gateGain = std::clamp(micGateGain_.load(std::memory_order_relaxed), 0.0f, 1.0f);
+    float limiterGain = std::clamp(limiterGain_.load(std::memory_order_relaxed), 0.1f, 1.0f);
+    // Smooth mic gate to avoid hard consonant cutoffs and start clicks.
+    constexpr float kGateAttackMs = 8.0f;
+    constexpr float kGateReleaseMs = 90.0f;
+    const float attackSamples = std::max(1.0f, (static_cast<float>(kTargetRate) * kGateAttackMs) / 1000.0f);
+    const float releaseSamples = std::max(1.0f, (static_cast<float>(kTargetRate) * kGateReleaseMs) / 1000.0f);
+    const float gateAttackStep = 1.0f / attackSamples;
+    const float gateReleaseStep = 1.0f / releaseSamples;
+    auto advanceGate = [&]() {
+        if (!smoothGate) {
+            gateGain = targetGateGain;
+            return;
+        }
+        if (targetGateGain > gateGain) {
+            gateGain = std::min(targetGateGain, gateGain + gateAttackStep);
+        } else if (targetGateGain < gateGain) {
+            gateGain = std::max(targetGateGain, gateGain - gateReleaseStep);
+        }
+    };
+    constexpr float kLimiterThreshold = 0.92f;
+    constexpr float kLimiterAttackCoeff = 0.50f;
+    constexpr float kLimiterReleaseCoeff = 0.0025f;
+    auto advanceLimiter = [&](float preAbs) {
+        float target = 1.0f;
+        if (preAbs > kLimiterThreshold) {
+            target = kLimiterThreshold / std::max(preAbs, 0.000001f);
+        }
+        const float coeff = (target < limiterGain) ? kLimiterAttackCoeff : kLimiterReleaseCoeff;
+        limiterGain += (target - limiterGain) * coeff;
+        limiterGain = std::clamp(limiterGain, 0.1f, 1.0f);
+    };
     const bool hasQueuedMusic = ring_.Size() > 0;
     const uint64_t lastSignalMs = lastMusicSignalTickMs_.load(std::memory_order_relaxed);
-    const bool recentMusicSignal = sourceRunning && !muted && (nowMs <= (lastSignalMs + 2500ULL));
+    const bool recentMusicSignal = sourceRunning && !muted && (nowMs <= (lastSignalMs + kForceTxMusicWindowMs));
 
     float micRmsAcc = 0.0f;
     for (int i = 0; i < sampleCount; ++i) {
@@ -870,17 +959,32 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
         const float decayedSendPeakDb = std::max(-120.0f, prevSendPeakDb - 1.8f);
         musicSendPeakDbfs_.store(decayedSendPeakDb, std::memory_order_release);
         micTalkDetected_.store(talkOpen, std::memory_order_release);
+        bool gateTouched = false;
 
         // TS3 bitmask semantics:
         // bit 1 (value 1): audio buffer modified
         // bit 2 (value 2): packet should be sent
         // Keep upstream flags untouched when we did not mix anything.
-        if (!talkOpen) {
-            const size_t frameCount = static_cast<size_t>(sampleCount) * static_cast<size_t>(channels);
-            std::fill(samples, samples + frameCount, static_cast<short>(0));
+        if (gateGain < 0.9999f || targetGateGain < 0.9999f) {
+            for (int i = 0; i < sampleCount; ++i) {
+                advanceGate();
+                for (int ch = 0; ch < channels; ++ch) {
+                    const int idx = (i * channels) + ch;
+                    const float dry = (static_cast<float>(samples[idx]) / 32768.0f) * gateGain;
+                    const float clipped = std::clamp(dry, -1.0f, 1.0f);
+                    const short next = static_cast<short>(std::lrintf(clipped * 32767.0f));
+                    if (next != samples[idx]) {
+                        gateTouched = true;
+                        samples[idx] = next;
+                    }
+                }
+            }
         }
+        limiterGain = std::min(1.0f, limiterGain + 0.05f);
+        micGateGain_.store(gateGain, std::memory_order_relaxed);
+        limiterGain_.store(limiterGain, std::memory_order_relaxed);
         int outFlags = upstreamFlags;
-        if (!talkOpen) {
+        if (gateTouched || !talkOpen) {
             outFlags |= 1;
         }
         if (forceTx && recentMusicSignal) {
@@ -893,6 +997,7 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
     thread_local std::array<float, kCallbackScratch> music{};
     bool anyMusicSignal = false;
     bool touched = false;
+    bool gateTouched = false;
     float mixPeak = 0.0f;
     const float musicGain = musicGainLinear_.load(std::memory_order_relaxed);
     int offset = 0;
@@ -905,6 +1010,7 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
         }
 
         for (int i = 0; i < chunk; ++i) {
+            advanceGate();
             const float m = music[i] * musicGain;
             const float absM = std::fabs(m);
             if (absM > 0.0005f) {
@@ -913,21 +1019,30 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
             if (absM > mixPeak) {
                 mixPeak = absM;
             }
-            if (absM <= 0.000001f) {
-                continue;
-            }
+            float framePrePeak = 0.0f;
             for (int ch = 0; ch < channels; ++ch) {
                 const int idx = ((offset + i) * channels) + ch;
-                const float dry = talkOpen ? (static_cast<float>(samples[idx]) / 32768.0f) : 0.0f;
+                const float dry = (static_cast<float>(samples[idx]) / 32768.0f) * gateGain;
+                const float pre = dry + m;
+                framePrePeak = std::max(framePrePeak, std::fabs(pre));
+            }
+            advanceLimiter(framePrePeak);
+            for (int ch = 0; ch < channels; ++ch) {
+                const int idx = ((offset + i) * channels) + ch;
+                const short prevSample = samples[idx];
+                const float dry = (static_cast<float>(samples[idx]) / 32768.0f) * gateGain;
                 float out = dry + m;
-                if (out > 1.0f) {
-                    out = 1.0f;
+                out *= limiterGain;
+                const float absOut = std::fabs(out);
+                if (absOut > 1.0f) {
                     clippedSamples_.fetch_add(1, std::memory_order_relaxed);
-                } else if (out < -1.0f) {
-                    out = -1.0f;
-                    clippedSamples_.fetch_add(1, std::memory_order_relaxed);
+                    out = std::copysign(1.0f, out);
                 }
-                samples[idx] = static_cast<short>(std::lrintf(out * 32767.0f));
+                const short nextSample = static_cast<short>(std::lrintf(std::clamp(out, -1.0f, 1.0f) * 32767.0f));
+                if (nextSample != prevSample) {
+                    gateTouched = true;
+                }
+                samples[idx] = nextSample;
             }
         }
         if (!muted && pulled > 0) {
@@ -944,12 +1059,14 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
     }
     musicSendPeakDbfs_.store(std::clamp(nextSendPeakDb, -120.0f, 0.0f), std::memory_order_release);
     micTalkDetected_.store(talkOpen, std::memory_order_release);
+    micGateGain_.store(gateGain, std::memory_order_relaxed);
+    limiterGain_.store(limiterGain, std::memory_order_relaxed);
 
     const bool mixedMusic = touched && anyMusicSignal && sourceRunning && !muted;
     const bool forceMusicTx = forceTx && (recentMusicSignal || mixedMusic);
 
     int outFlags = upstreamFlags;
-    if (mixedMusic) {
+    if (mixedMusic || gateTouched) {
         outFlags |= 1;
     }
     if (forceMusicTx) {
@@ -1083,6 +1200,7 @@ public:
 
     void Stop() override {
         stop_.store(true, std::memory_order_release);
+        stopCv_.notify_all();
         if (thread_.joinable()) {
             thread_.join();
         }
@@ -1104,12 +1222,22 @@ protected:
 
 private:
     std::thread thread_;
+    std::mutex stopMutex_;
+    std::condition_variable stopCv_;
 
     static bool IsRetryableFailureCode(const std::string& code) {
         if (code == "activate_unsupported") {
             return false;
         }
         return true;
+    }
+
+    bool WaitReacquireBackoff(int seconds) {
+        const auto timeout = std::chrono::seconds(std::max(0, seconds));
+        std::unique_lock<std::mutex> lock(stopMutex_);
+        return stopCv_.wait_for(lock, timeout, [this]() {
+            return StopRequested();
+        });
     }
 
     void Run() {
@@ -1144,7 +1272,9 @@ private:
                 break;
             }
             SetStatus(SourceState::Reacquiring, code.empty() ? "reacquire" : code, msg.empty() ? "Reacquiring source" : msg, detail);
-            std::this_thread::sleep_for(std::chrono::seconds(backoff));
+            if (WaitReacquireBackoff(backoff)) {
+                break;
+            }
             backoff = std::min(backoff * 2, 15);
         }
         SetStatus(SourceState::Stopped, "stopped", "Source stopped", "");
@@ -1162,6 +1292,7 @@ public:
 
 private:
     bool CaptureOnce(std::string& code, std::string& msg, std::string& detail) override {
+        (void)detail;
         ComPtr<IMMDeviceEnumerator> enumerator;
         HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
         if (FAILED(hr)) {
@@ -2499,31 +2630,96 @@ bool IsConnectedForTx(uint64 schid) {
     }
     return status == STATUS_CONNECTED || status == STATUS_CONNECTION_ESTABLISHED;
 }
+
+// These keys are mirrored only if TS3 accepts them. Besides official keys, this
+// includes community-observed idents used by some TS3 versions/builds.
+constexpr std::array<const char*, 18> kMirroredPreprocessorIdents = {
+    "agc",
+    "agc_level",
+    "agc_max_gain",
+    "denoise",
+    "echo_canceling",
+    "typing_suppression",
+    "echo_reduction",
+    "echo_reduction_db",
+    "vad_mode",
+    "vad_rnn",
+    "denoiser_level",
+    "aec",
+    "echo_cancellation",
+    "vad_over_ptt",
+    "delay_ptt",
+    "delay_ptt_msecs",
+    "continous_transmission",
+    "continuous_transmission",
+};
 } // namespace
 
 void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
     std::lock_guard<std::mutex> lock(voiceTxMutex_);
     static uint64_t lastErrLogMs = 0;
+    auto appendIdent = [](std::string& out, const char* ident) {
+        if (!out.empty()) {
+            out += ",";
+        }
+        out += ident;
+    };
 
     const bool currentlyActive = voiceRecordingActive_.load(std::memory_order_relaxed);
     const uint64 currentSchid = voiceRecordingSchid_.load(std::memory_order_relaxed);
-    auto clearState = [this]() {
+    auto resetSavedState = [this]() {
         savedInputStateValid_ = false;
         savedVadValid_ = false;
         savedVadThresholdValid_ = false;
         savedVadThresholdDbfs_ = -50.0f;
+        savedVadExtraBufferValid_ = false;
+        savedVadExtraBufferSize_ = 0;
+        for (size_t i = 0; i < savedPreprocessorValuesValid_.size(); ++i) {
+            savedPreprocessorValuesValid_[i] = false;
+            savedPreprocessorValues_[i].clear();
+        }
+    };
+
+    auto clearState = [this, &resetSavedState]() {
+        resetSavedState();
         voiceRecordingActive_.store(false, std::memory_order_release);
         voiceRecordingSchid_.store(0, std::memory_order_release);
         voiceTxLastNudgeMs_.store(0, std::memory_order_release);
+        forceTxHoldUntilMs_.store(0, std::memory_order_release);
         engine_.SetTalkState(true);
     };
 
-    auto restoreStateForSchid = [this](uint64 targetSchid) {
+    auto restoreStateForSchid = [this, &appendIdent](uint64 targetSchid) {
         bool ok = true;
+        size_t restoredCount = 0;
+        std::string restoredKeys;
         if (savedVadValid_ && g_ts3Functions.setPreProcessorConfigValue) {
             const unsigned int errVad = g_ts3Functions.setPreProcessorConfigValue(
                 targetSchid, "vad", savedVadEnabled_ ? "true" : "false");
             ok = ok && (errVad == ERROR_ok || errVad == ERROR_ok_no_update);
+            if (errVad == ERROR_ok || errVad == ERROR_ok_no_update) {
+                ++restoredCount;
+                appendIdent(restoredKeys, "vad");
+            }
+        }
+        for (size_t i = 0; i < kMirroredPreprocessorIdents.size(); ++i) {
+            if (!savedPreprocessorValuesValid_[i] || !g_ts3Functions.setPreProcessorConfigValue) {
+                continue;
+            }
+            const unsigned int err = g_ts3Functions.setPreProcessorConfigValue(
+                targetSchid, kMirroredPreprocessorIdents[i], savedPreprocessorValues_[i].c_str());
+            if (err == ERROR_ok || err == ERROR_ok_no_update) {
+                ++restoredCount;
+                appendIdent(restoredKeys, kMirroredPreprocessorIdents[i]);
+            } else {
+                const uint64_t nowMs = GetTickCount64();
+                if (nowMs > (lastErrLogMs + 4000ULL)) {
+                    LogWarn("talk_mode restore preproc failed schid=" + std::to_string(targetSchid) +
+                            " ident=" + kMirroredPreprocessorIdents[i] +
+                            " err=" + std::to_string(err));
+                    lastErrLogMs = nowMs;
+                }
+            }
         }
         if (savedInputStateValid_ && g_ts3Functions.setClientSelfVariableAsInt) {
             const unsigned int errInput = g_ts3Functions.setClientSelfVariableAsInt(
@@ -2535,6 +2731,11 @@ void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
             ok = ok && (errFlush == ERROR_ok || errFlush == ERROR_ok_no_update);
         } else {
             ok = false;
+        }
+        if (!restoredKeys.empty()) {
+            LogInfo("talk_mode restore preproc schid=" + std::to_string(targetSchid) +
+                    " restored=" + std::to_string(restoredCount) +
+                    " keys=" + restoredKeys);
         }
         return ok;
     };
@@ -2568,19 +2769,36 @@ void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
     const uint64_t nowMs = GetTickCount64();
     const uint64_t lastNudgeMs = voiceTxLastNudgeMs_.load(std::memory_order_relaxed);
     const bool sameSchid = currentlyActive && (currentSchid == schid);
+    const MicMixSettings runtimeSettings = GetSettings();
+    const bool forceTsFilters = runtimeSettings.micForceTsFilters;
+    const bool strictTsAutoGate = (runtimeSettings.micGateMode == MicGateMode::AutoTs);
     if (sameSchid && nowMs <= (lastNudgeMs + 1000ULL)) {
         return;
     }
 
     if (currentlyActive && currentSchid != 0 && currentSchid != schid) {
         restoreStateForSchid(currentSchid);
-        savedInputStateValid_ = false;
-        savedVadValid_ = false;
+        resetSavedState();
     }
 
     int inputState = INPUT_DEACTIVATED;
     const unsigned int errGetInput = g_ts3Functions.getClientSelfVariableAsInt(
         schid, CLIENT_INPUT_DEACTIVATED, &inputState);
+    auto readPreprocessorConfigValue = [schid](const char* ident, std::string& outValue) -> bool {
+        if (!g_ts3Functions.getPreProcessorConfigValue) {
+            return false;
+        }
+        char* value = nullptr;
+        const unsigned int err = g_ts3Functions.getPreProcessorConfigValue(schid, ident, &value);
+        const bool ok = (err == ERROR_ok || err == ERROR_ok_no_update) && value;
+        if (ok) {
+            outValue.assign(value);
+        }
+        if (value && g_ts3Functions.freeMemory) {
+            g_ts3Functions.freeMemory(value);
+        }
+        return ok;
+    };
     char* vadStr = nullptr;
     const unsigned int errGetVad = g_ts3Functions.getPreProcessorConfigValue(schid, "vad", &vadStr);
     bool vadEnabled = false;
@@ -2605,6 +2823,36 @@ void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
     if (vadLevelStr && g_ts3Functions.freeMemory) {
         g_ts3Functions.freeMemory(vadLevelStr);
     }
+    bool vadExtraBufferValid = false;
+    int vadExtraBufferSize = 0;
+    std::string vadExtraBufferStr;
+    if (readPreprocessorConfigValue("vad_extrabuffersize", vadExtraBufferStr)) {
+        char* endPtr = nullptr;
+        const long parsed = std::strtol(vadExtraBufferStr.c_str(), &endPtr, 10);
+        if (endPtr && endPtr != vadExtraBufferStr.c_str()) {
+            vadExtraBufferSize = static_cast<int>(std::clamp(parsed, 0L, 50L));
+            vadExtraBufferValid = true;
+        }
+    }
+
+    std::array<std::string, kMirroredPreprocessorIdents.size()> mirroredValues{};
+    std::array<bool, kMirroredPreprocessorIdents.size()> mirroredValueValid{};
+    for (size_t i = 0; i < kMirroredPreprocessorIdents.size(); ++i) {
+        mirroredValueValid[i] = readPreprocessorConfigValue(kMirroredPreprocessorIdents[i], mirroredValues[i]);
+    }
+    if (!sameSchid) {
+        std::string supported;
+        std::string unsupported;
+        for (size_t i = 0; i < kMirroredPreprocessorIdents.size(); ++i) {
+            if (mirroredValueValid[i]) {
+                appendIdent(supported, kMirroredPreprocessorIdents[i]);
+            } else {
+                appendIdent(unsupported, kMirroredPreprocessorIdents[i]);
+            }
+        }
+        LogInfo("talk_mode probe preproc schid=" + std::to_string(schid) +
+                " supported=[" + supported + "] unsupported=[" + unsupported + "]");
+    }
 
     if (!(errGetInput == ERROR_ok || errGetInput == ERROR_ok_no_update) ||
         !(errGetVad == ERROR_ok || errGetVad == ERROR_ok_no_update)) {
@@ -2624,11 +2872,65 @@ void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
         savedVadEnabled_ = vadEnabled;
         savedVadThresholdValid_ = vadThresholdValid;
         savedVadThresholdDbfs_ = vadThreshold;
+        savedVadExtraBufferValid_ = vadExtraBufferValid;
+        savedVadExtraBufferSize_ = vadExtraBufferSize;
+        for (size_t i = 0; i < kMirroredPreprocessorIdents.size(); ++i) {
+            savedPreprocessorValuesValid_[i] = mirroredValueValid[i];
+            if (mirroredValueValid[i]) {
+                savedPreprocessorValues_[i] = mirroredValues[i];
+            } else {
+                savedPreprocessorValues_[i].clear();
+            }
+        }
     }
 
-    const unsigned int errVad = g_ts3Functions.setPreProcessorConfigValue(schid, "vad", "false");
+    const char* desiredVadValue = "false";
+    if (strictTsAutoGate && savedVadValid_) {
+        desiredVadValue = savedVadEnabled_ ? "true" : "false";
+    }
+    const unsigned int errVad = g_ts3Functions.setPreProcessorConfigValue(schid, "vad", desiredVadValue);
+    if (!sameSchid) {
+        size_t keepAppliedCount = 0;
+        std::string keepAppliedKeys;
+        std::string forcedFilterKeys;
+        for (size_t i = 0; i < kMirroredPreprocessorIdents.size(); ++i) {
+            if (!savedPreprocessorValuesValid_[i] || !g_ts3Functions.setPreProcessorConfigValue) {
+                continue;
+            }
+            std::string applyValue = savedPreprocessorValues_[i];
+            const bool isTypingSuppression = (_stricmp(kMirroredPreprocessorIdents[i], "typing_suppression") == 0);
+            const bool isDenoise = (_stricmp(kMirroredPreprocessorIdents[i], "denoise") == 0);
+            if (forceTsFilters && (isTypingSuppression || isDenoise) && _stricmp(applyValue.c_str(), "true") != 0) {
+                applyValue = "true";
+                appendIdent(forcedFilterKeys, kMirroredPreprocessorIdents[i]);
+            }
+            const unsigned int err = g_ts3Functions.setPreProcessorConfigValue(
+                schid, kMirroredPreprocessorIdents[i], applyValue.c_str());
+            if (err == ERROR_ok || err == ERROR_ok_no_update) {
+                ++keepAppliedCount;
+                appendIdent(keepAppliedKeys, kMirroredPreprocessorIdents[i]);
+            } else {
+                if (nowMs > (lastErrLogMs + 4000ULL)) {
+                    LogWarn("talk_mode keep preproc failed schid=" + std::to_string(schid) +
+                            " ident=" + kMirroredPreprocessorIdents[i] +
+                            " err=" + std::to_string(err));
+                    lastErrLogMs = nowMs;
+                }
+            }
+        }
+        if (!keepAppliedKeys.empty()) {
+            LogInfo("talk_mode keep preproc schid=" + std::to_string(schid) +
+                    " applied=" + std::to_string(keepAppliedCount) +
+                    " keys=" + keepAppliedKeys);
+        }
+        if (!forcedFilterKeys.empty()) {
+            LogInfo("talk_mode forced filters schid=" + std::to_string(schid) +
+                    " keys=" + forcedFilterKeys + " value=true");
+        }
+    }
+    int desiredInputState = INPUT_ACTIVE;
     const unsigned int errInput = g_ts3Functions.setClientSelfVariableAsInt(
-        schid, CLIENT_INPUT_DEACTIVATED, INPUT_ACTIVE);
+        schid, CLIENT_INPUT_DEACTIVATED, desiredInputState);
     const unsigned int errFlush = g_ts3Functions.flushClientSelfUpdates(schid, nullptr);
     const bool ok = (errVad == ERROR_ok || errVad == ERROR_ok_no_update) &&
                     (errInput == ERROR_ok || errInput == ERROR_ok_no_update) &&
@@ -2646,7 +2948,13 @@ void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
     }
 
     if (!sameSchid) {
-        LogInfo("talk_mode forced continuous schid=" + std::to_string(schid));
+        if (strictTsAutoGate) {
+            LogInfo("talk_mode strict_ts_auto schid=" + std::to_string(schid) +
+                    " vad=" + desiredVadValue +
+                    " input_state=" + std::to_string(desiredInputState));
+        } else {
+            LogInfo("talk_mode forced continuous schid=" + std::to_string(schid));
+        }
     }
     voiceRecordingActive_.store(true, std::memory_order_release);
     voiceRecordingSchid_.store(schid, std::memory_order_release);
@@ -2679,7 +2987,20 @@ void MicMixApp::RefreshVoiceTxControl(uint64 schidHint) {
     const bool sourceUp = (st.state == SourceState::Running) ||
                           (st.state == SourceState::Starting) ||
                           (st.state == SourceState::Reacquiring);
-    const bool shouldKeepCaptureActive = s.forceTxEnabled && sourceUp && !s.musicMuted && t.musicActive;
+    const uint64_t nowMs = GetTickCount64();
+    const bool baseEligible = s.forceTxEnabled && sourceUp && !s.musicMuted;
+    bool shouldKeepCaptureActive = false;
+    if (baseEligible) {
+        if (t.musicActive) {
+            forceTxHoldUntilMs_.store(nowMs + kForceTxMusicWindowMs, std::memory_order_release);
+            shouldKeepCaptureActive = true;
+        } else {
+            const uint64_t holdUntilMs = forceTxHoldUntilMs_.load(std::memory_order_acquire);
+            shouldKeepCaptureActive = (holdUntilMs != 0ULL) && (nowMs <= holdUntilMs);
+        }
+    } else {
+        forceTxHoldUntilMs_.store(0ULL, std::memory_order_release);
+    }
     SetVoiceRecordingState(shouldKeepCaptureActive, schid);
 }
 
@@ -2688,6 +3009,9 @@ void MicMixApp::VoiceTxThreadMain() {
     try {
         uint64_t lastLogMs = 0;
         uint64_t lastVadFallbackLogMs = 0;
+        uint64_t vadGateHoldUntilMs = 0;
+        uint64_t vadAboveThresholdSinceMs = 0;
+        bool vadQualifiedOpen = false;
         while (!voiceTxStop_.load(std::memory_order_acquire)) {
             uint64 schid = activeSchid_.load(std::memory_order_acquire);
             if (schid == 0 && g_ts3Functions.getCurrentServerConnectionHandlerID) {
@@ -2728,38 +3052,139 @@ void MicMixApp::VoiceTxThreadMain() {
                     if (shouldEnsureCapture) {
                         bool gateByVad = false;
                         float vadThresholdDb = -50.0f;
+                        int vadExtraBufferSize = 0;
+                        bool keyboardGuardEnabled = true;
+                        MicGateMode gateMode = MicGateMode::AutoTs;
+                        {
+                            const MicMixSettings runtimeSettings = GetSettings();
+                            gateMode = runtimeSettings.micGateMode;
+                            keyboardGuardEnabled = runtimeSettings.micUseKeyboardGuard;
+                            if (gateMode == MicGateMode::Custom) {
+                                vadThresholdDb = std::clamp(runtimeSettings.micGateThresholdDbfs, -90.0f, 0.0f);
+                            }
+                        }
                         {
                             std::lock_guard<std::mutex> lock(voiceTxMutex_);
-                            gateByVad = savedVadValid_ && savedVadEnabled_;
-                            if (savedVadThresholdValid_) {
+                            gateByVad = (gateMode == MicGateMode::Custom) ? true : (savedVadValid_ && savedVadEnabled_);
+                            if (gateMode != MicGateMode::Custom && savedVadThresholdValid_) {
                                 vadThresholdDb = savedVadThresholdDbfs_;
+                            }
+                            if (savedVadExtraBufferValid_) {
+                                vadExtraBufferSize = savedVadExtraBufferSize_;
                             }
                         }
                         bool talkOpen = true;
                         if (gateByVad) {
-                            bool decided = false;
+                            const uint64_t nowMs = GetTickCount64();
+                            bool candidateOpen = false;
+                            bool haveDecision = false;
+
+                            const uint64_t talkEventMs = ownTalkStatusTickMs_.load(std::memory_order_acquire);
+                            if (talkEventMs != 0 && nowMs <= (talkEventMs + kTalkEventFreshMs)) {
+                                candidateOpen = ownTalkStatusActive_.load(std::memory_order_acquire);
+                                haveDecision = true;
+                            }
+
+                            float micDb = -120.0f;
+                            bool haveMicDb = false;
                             if (g_ts3Functions.getPreProcessorInfoValueFloat) {
-                                float micDb = -120.0f;
                                 const unsigned int errDb = g_ts3Functions.getPreProcessorInfoValueFloat(
                                     schid, "decibel_last_period", &micDb);
                                 if (errDb == ERROR_ok || errDb == ERROR_ok_no_update) {
-                                    talkOpen = micDb >= (vadThresholdDb - 1.0f);
-                                    decided = true;
+                                    haveMicDb = true;
                                 }
                             }
-                            if (!decided) {
+
+                            if (gateMode == MicGateMode::AutoTs) {
+                                // Strict TS auto mode: trust TS talk-status event for open/close
+                                // instead of local dB heuristics.
+                                if (talkEventMs != 0 && nowMs <= (talkEventMs + kTalkEventFreshMs)) {
+                                    candidateOpen = ownTalkStatusActive_.load(std::memory_order_acquire);
+                                    haveDecision = true;
+                                } else {
+                                    if (haveMicDb) {
+                                        candidateOpen = micDb >= vadThresholdDb;
+                                    } else {
+                                        const TelemetrySnapshot tel = engine_.SnapshotTelemetry();
+                                        candidateOpen = tel.micRmsDbfs >= (vadThresholdDb - 1.0f);
+                                    }
+                                    haveDecision = true;
+                                    if (nowMs > (lastVadFallbackLogMs + 4000ULL)) {
+                                        LogWarn("talk_gate auto_ts stale event schid=" + std::to_string(schid));
+                                        lastVadFallbackLogMs = nowMs;
+                                    }
+                                }
+                                vadAboveThresholdSinceMs = candidateOpen ? nowMs : 0;
+                                vadQualifiedOpen = candidateOpen;
+                            } else if (haveMicDb) {
+                                // Custom mode: local hysteresis + qualification to tame transients.
+                                const float openThresholdDb = vadThresholdDb + 1.0f;
+                                const float closeThresholdDb = vadThresholdDb - 2.5f;
+                                if (keyboardGuardEnabled) {
+                                    if (candidateOpen) {
+                                        vadAboveThresholdSinceMs = nowMs;
+                                        vadQualifiedOpen = true;
+                                    } else {
+                                        if (vadQualifiedOpen) {
+                                            candidateOpen = micDb >= closeThresholdDb;
+                                        } else {
+                                            if (micDb >= openThresholdDb) {
+                                                if (vadAboveThresholdSinceMs == 0) {
+                                                    vadAboveThresholdSinceMs = nowMs;
+                                                }
+                                                candidateOpen = nowMs >= (vadAboveThresholdSinceMs + 60ULL);
+                                            } else {
+                                                vadAboveThresholdSinceMs = 0;
+                                                candidateOpen = false;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    if (!candidateOpen) {
+                                        candidateOpen = micDb >= vadThresholdDb;
+                                    }
+                                    vadAboveThresholdSinceMs = candidateOpen ? nowMs : 0;
+                                    vadQualifiedOpen = candidateOpen;
+                                }
+                                haveDecision = true;
+                            } else if (!haveDecision) {
                                 const TelemetrySnapshot tel = engine_.SnapshotTelemetry();
                                 if (tel.micRmsDbfs > -119.0f) {
-                                    talkOpen = tel.micRmsDbfs >= (vadThresholdDb - 1.0f);
+                                    candidateOpen = tel.micRmsDbfs >= (vadThresholdDb - 1.0f);
                                 } else {
-                                    talkOpen = tel.talkStateActive;
+                                    candidateOpen = tel.talkStateActive;
                                 }
-                                const uint64_t nowMs = GetTickCount64();
+                                haveDecision = true;
                                 if (nowMs > (lastVadFallbackLogMs + 4000ULL)) {
                                     LogWarn("talk_gate fallback used schid=" + std::to_string(schid));
                                     lastVadFallbackLogMs = nowMs;
                                 }
                             }
+
+                            if (!haveDecision) {
+                                candidateOpen = true;
+                            }
+
+                            const uint64_t vadHoldMs = static_cast<uint64_t>(std::clamp(vadExtraBufferSize, 0, 50)) * 20ULL;
+                            uint64_t effectiveHoldMs = vadHoldMs;
+                            if (gateMode != MicGateMode::AutoTs) {
+                                const uint64_t minHoldMs = keyboardGuardEnabled ? 160ULL : 40ULL;
+                                effectiveHoldMs = std::max<uint64_t>(vadHoldMs, minHoldMs);
+                            }
+                            if (candidateOpen) {
+                                vadGateHoldUntilMs = nowMs + effectiveHoldMs;
+                                vadQualifiedOpen = true;
+                                talkOpen = true;
+                            } else if (effectiveHoldMs > 0 && nowMs <= vadGateHoldUntilMs) {
+                                talkOpen = true;
+                            } else {
+                                talkOpen = false;
+                                vadQualifiedOpen = false;
+                            }
+                        } else {
+                            vadGateHoldUntilMs = 0;
+                            vadAboveThresholdSinceMs = 0;
+                            vadQualifiedOpen = false;
                         }
                         engine_.SetTalkState(talkOpen);
 
@@ -2786,7 +3211,7 @@ void MicMixApp::VoiceTxThreadMain() {
                     }
                 }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            std::this_thread::sleep_for(std::chrono::milliseconds(kVoiceTxPollMs));
         }
     } catch (const std::exception& ex) {
         LogError(std::string("voice_tx thread exception: ") + ex.what());
@@ -2844,6 +3269,9 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
             [this](const float* data, size_t count) { engine_.PushMusicSamples(data, count); },
             [this](SourceState st, const std::string& code, const std::string& msg, const std::string& detail) {
                 engine_.SetMusicSourceRunning(st == SourceState::Running);
+                if (st == SourceState::Reacquiring) {
+                    engine_.NoteReconnect();
+                }
                 std::string line = "source=" + SourceStateToString(st) + " code=" + code + " msg=" + msg;
                 if (!detail.empty()) line += " detail=" + detail;
                 LogInfo(line);
@@ -2952,19 +3380,46 @@ void MicMixApp::ToggleMonitor() {
 }
 
 void MicMixApp::SetPushToPlayActive(bool active) {
-    pushToPlayActive_.store(active, std::memory_order_release);
-    engine_.SetMuted(!active);
+    const bool wasActive = pushToPlayActive_.exchange(active, std::memory_order_acq_rel);
+    if (active && !wasActive) {
+        const bool currentMuted = engine_.IsMuted();
+        pushToPlaySavedMuteState_.store(currentMuted, std::memory_order_release);
+        pushToPlaySavedMuteValid_.store(true, std::memory_order_release);
+        engine_.SetMuted(false);
+    } else if (!active && wasActive) {
+        bool restoreMuted = engine_.IsMuted();
+        if (pushToPlaySavedMuteValid_.load(std::memory_order_acquire)) {
+            restoreMuted = pushToPlaySavedMuteState_.load(std::memory_order_acquire);
+        }
+        pushToPlaySavedMuteValid_.store(false, std::memory_order_release);
+        engine_.SetMuted(restoreMuted);
+    }
     auto s = GetSettings();
-    s.musicMuted = !active;
+    s.musicMuted = engine_.IsMuted();
     ApplySettings(s, false, true);
 }
 
 void MicMixApp::TogglePushToPlay() { SetPushToPlayActive(!pushToPlayActive_.load(std::memory_order_acquire)); }
 
 void MicMixApp::SetTalkStateForOwnClient(uint64 schid, anyID clientId, int talkStatus) {
-    (void)schid;
-    (void)clientId;
-    (void)talkStatus;
+    if (!initialized_.load(std::memory_order_acquire) || schid == 0 || clientId == 0) {
+        return;
+    }
+
+    anyID ownClientId = 0;
+    if (g_ts3Functions.getClientID) {
+        const unsigned int err = g_ts3Functions.getClientID(schid, &ownClientId);
+        if (!(err == ERROR_ok || err == ERROR_ok_no_update)) {
+            return;
+        }
+        if (ownClientId != 0 && ownClientId != clientId) {
+            return;
+        }
+    }
+
+    const bool talking = (talkStatus == STATUS_TALKING || talkStatus == STATUS_TALKING_WHILE_DISABLED);
+    ownTalkStatusActive_.store(talking, std::memory_order_release);
+    ownTalkStatusTickMs_.store(GetTickCount64(), std::memory_order_release);
 }
 
 void MicMixApp::SetActiveServer(uint64 schid) {

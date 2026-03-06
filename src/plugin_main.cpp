@@ -180,14 +180,25 @@ void ts3plugin_initHotkeys(struct PluginHotkey*** hotkeys) {
         return;
     }
     *hotkeys = nullptr;
-    const size_t sz = 2;
+    const size_t sz = 5;
     auto** keys = static_cast<PluginHotkey**>(std::calloc(sz, sizeof(PluginHotkey*)));
     if (!keys) {
         return;
     }
-    keys[0] = CreateHotkey("music_toggle_mute", "MicMix: Music mute (toggle)");
-    if (!keys[0]) {
+    auto releaseKeys = [keys]() {
+        for (size_t i = 0; keys[i] != nullptr; ++i) {
+            std::free(keys[i]);
+            keys[i] = nullptr;
+        }
         std::free(keys);
+    };
+
+    keys[0] = CreateHotkey("music_toggle_mute", "MicMix: Music mute (toggle)");
+    keys[1] = CreateHotkey("music_toggle_push_to_play", "MicMix: Push-to-play mode (toggle)");
+    keys[2] = CreateHotkey("music_push_to_play_on", "MicMix: Push-to-play mode on");
+    keys[3] = CreateHotkey("music_push_to_play_off", "MicMix: Push-to-play mode off");
+    if (!keys[0] || !keys[1] || !keys[2] || !keys[3]) {
+        releaseKeys();
         return;
     }
     *hotkeys = keys;
@@ -208,6 +219,18 @@ void ts3plugin_onHotkeyEvent(const char* keyword) {
         if (!keyword) return;
         if (std::strcmp(keyword, "music_toggle_mute") == 0) {
             MicMixApp::Instance().ToggleMute();
+            return;
+        }
+        if (std::strcmp(keyword, "music_toggle_push_to_play") == 0) {
+            MicMixApp::Instance().TogglePushToPlay();
+            return;
+        }
+        if (std::strcmp(keyword, "music_push_to_play_on") == 0) {
+            MicMixApp::Instance().SetPushToPlayActive(true);
+            return;
+        }
+        if (std::strcmp(keyword, "music_push_to_play_off") == 0) {
+            MicMixApp::Instance().SetPushToPlayActive(false);
         }
     });
 }

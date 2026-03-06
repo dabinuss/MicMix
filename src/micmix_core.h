@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 #include <mmdeviceapi.h>
+#include <array>
 #include <string>
 #include <vector>
 #include <atomic>
@@ -27,6 +28,11 @@ enum class SourceState {
     Error = 4,
 };
 
+enum class MicGateMode {
+    AutoTs = 0,
+    Custom = 1,
+};
+
 struct MicMixSettings {
     int         configVersion = 1;
     SourceMode  sourceMode = SourceMode::Loopback;
@@ -43,6 +49,11 @@ struct MicMixSettings {
     int         muteHotkeyModifiers = 0;
     int         muteHotkeyVk = 0;
     std::string captureDeviceId;
+    MicGateMode micGateMode = MicGateMode::AutoTs;
+    float       micGateThresholdDbfs = -50.0f;
+    bool        micUseSmoothGate = true;
+    bool        micUseKeyboardGuard = true;
+    bool        micForceTsFilters = true;
 };
 
 struct LoopbackDeviceInfo {
@@ -114,6 +125,8 @@ private:
     static std::string BoolToString(bool value);
     static std::string SourceModeToString(SourceMode mode);
     static SourceMode SourceModeFromString(const std::string& value);
+    static std::string MicGateModeToString(MicGateMode mode);
+    static MicGateMode MicGateModeFromString(const std::string& value);
 };
 
 template <typename T>
@@ -192,6 +205,7 @@ public:
     void PushMusicSamples(const float* samples, size_t count);
     void ClearMusicBuffer();
     void EditCapturedVoice(short* samples, int sampleCount, int channels, int* edited);
+    void NoteReconnect();
 
     TelemetrySnapshot SnapshotTelemetry() const;
 
@@ -211,6 +225,9 @@ private:
     std::atomic<bool>  micTalkDetected_{false};
     std::atomic<float> micRmsDbfs_{-120.0f};
     std::atomic<float> externalMicLinear_{0.0f};
+    std::atomic<float> micGateGain_{1.0f};
+    std::atomic<float> limiterGain_{1.0f};
+    std::atomic<bool>  micUseSmoothGate_{true};
 
     std::atomic_uint64_t underruns_{0};
     std::atomic_uint64_t overruns_{0};
@@ -305,6 +322,8 @@ public:
     void RefreshAppList();
 
 private:
+    static constexpr size_t kSavedPreprocessorSlots = 18;
+
     MicMixApp();
     ~MicMixApp();
     void StartVoiceTxThread();
@@ -325,6 +344,10 @@ private:
     std::unique_ptr<MixMonitorPlayer> mixMonitorPlayer_;
     std::atomic<uint64> activeSchid_{0};
     std::atomic<bool> pushToPlayActive_{false};
+    std::atomic<bool> pushToPlaySavedMuteValid_{false};
+    std::atomic<bool> pushToPlaySavedMuteState_{false};
+    std::atomic<bool> ownTalkStatusActive_{false};
+    std::atomic_uint64_t ownTalkStatusTickMs_{0};
     std::thread voiceTxThread_;
     std::atomic<bool> voiceTxStop_{false};
     std::atomic<bool> voiceTxThreadRunning_{false};
@@ -332,6 +355,7 @@ private:
     std::atomic<uint64> voiceRecordingSchid_{0};
     std::atomic_uint64_t voiceTxLastNudgeMs_{0};
     std::atomic_uint64_t voiceControlLastEvalMs_{0};
+    std::atomic_uint64_t forceTxHoldUntilMs_{0};
     std::atomic_uint64_t lastCaptureEditTickMs_{0};
     std::atomic_uint64_t lastCaptureReopenTickMs_{0};
     std::mutex voiceTxMutex_;
@@ -341,6 +365,10 @@ private:
     bool savedVadEnabled_ = false;
     bool savedVadThresholdValid_ = false;
     float savedVadThresholdDbfs_ = -50.0f;
+    bool savedVadExtraBufferValid_ = false;
+    int savedVadExtraBufferSize_ = 0;
+    std::array<std::string, kSavedPreprocessorSlots> savedPreprocessorValues_{};
+    std::array<bool, kSavedPreprocessorSlots> savedPreprocessorValuesValid_{};
 };
 
 std::string SourceStateToString(SourceState state);

@@ -74,6 +74,13 @@ target_compile_definitions(micmix PRIVATE
   BUILDING_DLL
 )
 
+if(MSVC)
+  target_compile_options(micmix PRIVATE
+    /W4
+    /permissive-
+  )
+endif()
+
 target_link_libraries(micmix PRIVATE
   speexdsp_resampler
   ole32
