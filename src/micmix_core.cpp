@@ -54,6 +54,24 @@ bool IsSupportedSourceRate(uint32_t sampleRate) {
     return sampleRate >= kMinSupportedSourceRate && sampleRate <= kMaxSupportedSourceRate;
 }
 
+uint32_t GetLogicalCpuCount() {
+    SYSTEM_INFO si{};
+    GetNativeSystemInfo(&si);
+    return std::max<uint32_t>(1U, si.dwNumberOfProcessors);
+}
+
+int DetermineAutoResamplerQualityFromCpu(uint32_t logicalCpuCount) {
+    // CPU-only heuristic with zero runtime benchmark overhead.
+    if (logicalCpuCount <= 4U) return 5;
+    if (logicalCpuCount <= 8U) return 6;
+    if (logicalCpuCount <= 12U) return 7;
+    return 8;
+}
+
+int DetermineAutoResamplerQuality() {
+    return DetermineAutoResamplerQualityFromCpu(GetLogicalCpuCount());
+}
+
 std::mutex g_logMutex;
 std::string g_logPath;
 std::string g_lastLogPayload;
@@ -209,7 +227,7 @@ void SanitizeSettings(MicMixSettings& s) {
     s.configVersion = std::clamp(s.configVersion, 1, 8);
     if (!std::isfinite(s.musicGainDb)) { s.musicGainDb = -15.0f; }
     s.musicGainDb = std::clamp(s.musicGainDb, -30.0f, -6.0f);
-    s.resamplerQuality = std::clamp(s.resamplerQuality, 0, 10);
+    s.resamplerQuality = DetermineAutoResamplerQuality();
     s.bufferTargetMs = std::clamp(s.bufferTargetMs, 20, 250);
     if (!std::isfinite(s.micGateThresholdDbfs)) { s.micGateThresholdDbfs = -50.0f; }
     s.micGateThresholdDbfs = std::clamp(s.micGateThresholdDbfs, -90.0f, 0.0f);
@@ -3365,6 +3383,8 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
         sourceManager_->ApplySettings(settings_);
         mixMonitorPlayer_ = std::make_unique<MixMonitorPlayer>();
         if (settings_.autostartEnabled) sourceManager_->Start();
+        LogInfo("resampler auto_cpu quality=" + std::to_string(settings_.resamplerQuality) +
+                " logical_cpus=" + std::to_string(GetLogicalCpuCount()));
         const uint64_t nowMs = GetTickCount64();
         lastCaptureEditTickMs_.store(nowMs, std::memory_order_release);
         lastCaptureReopenTickMs_.store(0, std::memory_order_release);
