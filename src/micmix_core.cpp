@@ -200,8 +200,10 @@ bool IsDigitsOnly(const std::string& value) {
 
 void SanitizeSettings(MicMixSettings& s) {
     s.configVersion = std::clamp(s.configVersion, 1, 8);
+    if (!std::isfinite(s.musicGainDb)) { s.musicGainDb = -15.0f; }
     s.musicGainDb = std::clamp(s.musicGainDb, -30.0f, -6.0f);
     s.bufferTargetMs = std::clamp(s.bufferTargetMs, 20, 250);
+    if (!std::isfinite(s.micGateThresholdDbfs)) { s.micGateThresholdDbfs = -50.0f; }
     s.micGateThresholdDbfs = std::clamp(s.micGateThresholdDbfs, -90.0f, 0.0f);
     s.muteHotkeyModifiers &= (MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN);
     s.muteHotkeyVk = std::clamp(s.muteHotkeyVk, 0, 255);
@@ -564,7 +566,14 @@ ConfigStore::ConfigStore(std::string basePath)
         basePath_.push_back('\\');
     }
     const std::filesystem::path dir = std::filesystem::path(Utf8ToWide(basePath_)) / L"plugins" / L"micmix";
-    std::filesystem::create_directories(dir);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        std::error_code existsEc;
+        if (!std::filesystem::exists(dir, existsEc)) {
+            LogWarn("Config directory create failed: " + WideToUtf8(dir.wstring()) + " (" + ec.message() + ")", 0);
+        }
+    }
     configPath_ = WideToUtf8((dir / L"config.ini").wstring());
     legacyConfigPath_ = WideToUtf8((dir / L"config.json").wstring());
     tmpPath_ = WideToUtf8((dir / L"config.tmp").wstring());

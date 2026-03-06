@@ -78,6 +78,10 @@ if(MSVC)
   target_compile_options(micmix PRIVATE
     /W4
     /permissive-
+    /guard:cf
+  )
+  target_link_options(micmix PRIVATE
+    /GUARD:CF
   )
 endif()
 
