@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.2.3] - 2026-03-08
+
+### Added
+
+- Added configurable resampler quality in settings with related runtime integration.
+- Added inline UI hints for gain and force-transmission controls to improve discoverability.
+
+### Changed
+
+- Improved audio robustness and automatic resampler policy behavior for varying source rates.
+- Refined settings UX and validation/sanitization paths for more predictable configuration handling.
+- Streamlined README wording in selected sections for clearer guidance.
+
+### Fixed
+
+- Fixed app session ID candidate parsing to avoid invalid entries in edge cases.
+- Improved directory creation error handling in configuration paths.
+
 ## [1.2.2] - 2026-03-06
 
 ### Changed
