@@ -70,7 +70,9 @@ struct UiTheme {
 
 std::mutex g_mutex;
 std::mutex g_enumMutex;
+std::mutex g_sourceRefreshThreadMutex;
 std::thread g_thread;
+std::thread g_sourceRefreshThread;
 std::atomic<bool> g_running{false};
 std::atomic<HWND> g_hwnd{nullptr};
 std::vector<LoopbackDeviceInfo> g_loopbacks;
@@ -96,7 +98,7 @@ constexpr INT_PTR kSourceItemDivider = -11;
 constexpr INT_PTR kSourceItemPlaceholder = -12;
 constexpr UINT kMsgSourceRefreshDone = WM_APP + 0x31;
 constexpr float kMusicGainMinDb = -30.0f;
-constexpr float kMusicGainMaxDb = -6.0f;
+constexpr float kMusicGainMaxDb = -2.0f;
 constexpr int kMusicGainStepPerDb = 10;
 constexpr int kMusicGainSliderMax = static_cast<int>((kMusicGainMaxDb - kMusicGainMinDb) * static_cast<float>(kMusicGainStepPerDb));
 
@@ -393,6 +395,18 @@ void BeginHotkeyCapture(HWND hwnd) {
     SetFocus(hwnd);
 }
 
+void JoinSourceRefreshThread() {
+    std::thread worker;
+    {
+        std::lock_guard<std::mutex> lock(g_sourceRefreshThreadMutex);
+        if (!g_sourceRefreshThread.joinable()) {
+            return;
+        }
+        worker = std::move(g_sourceRefreshThread);
+    }
+    worker.join();
+}
+
 void RequestSourceRefresh(HWND hwnd, bool reloadSettings) {
     if (!hwnd) {
         return;
@@ -407,7 +421,8 @@ void RequestSourceRefresh(HWND hwnd, bool reloadSettings) {
     }
     SetStatusText(hwnd, L"Refreshing source list...");
 
-    std::thread([hwnd, seq]() {
+    JoinSourceRefreshThread();
+    std::thread worker([hwnd, seq]() {
         auto& app = MicMixApp::Instance();
         std::vector<LoopbackDeviceInfo> loopbacks = app.GetLoopbackDevices();
         std::vector<CaptureDeviceInfo> captureDevices = app.GetCaptureDevices();
@@ -419,7 +434,11 @@ void RequestSourceRefresh(HWND hwnd, bool reloadSettings) {
             g_pendingApps = std::move(apps);
         }
         PostMessageW(hwnd, kMsgSourceRefreshDone, static_cast<WPARAM>(seq), 0);
-    }).detach();
+    });
+    {
+        std::lock_guard<std::mutex> lock(g_sourceRefreshThreadMutex);
+        g_sourceRefreshThread = std::move(worker);
+    }
 }
 
 void PopulateCombos(HWND hwnd) {
@@ -636,10 +655,11 @@ void UpdateStatus(HWND hwnd) {
     sprintf_s(micBuf, "mic=%.1fdB", t.micRmsDbfs);
     char sendBuf[64]{};
     sprintf_s(sendBuf, "send=%.1fdB src=%.1fdB", shownSendPeakDb, t.musicPeakDbfs);
+    const std::string resamplerText = (s.resamplerQuality < 0) ? "auto-cpu" : std::to_string(s.resamplerQuality);
     std::string line2 = "underrun=" + std::to_string(t.underruns) +
         "  overrun=" + std::to_string(t.overruns) +
         "  clip=" + std::to_string(t.clippedSamples) +
-        "  resampler=" + std::to_string(s.resamplerQuality) + "(auto-cpu)" +
+        "  resampler=" + resamplerText +
         "  " + micBuf +
         "  " + sendBuf;
     SetStatusText(hwnd, Utf8ToWide(line1 + "\r\n" + line2));
@@ -797,7 +817,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         SendMessageW(gain, TBM_SETPAGESIZE, 0, 10);
         SendMessageW(gain, TBM_SETLINESIZE, 0, 1);
         CreateWindowW(L"STATIC", L"-15.0 dB", WS_CHILD | WS_VISIBLE, S(560), S(388), S(102), S(24), hwnd, reinterpret_cast<HMENU>(IDC_GAIN_VALUE), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Max is -6 dB to reduce clipping risk", WS_CHILD | WS_VISIBLE, fieldX, S(412), S(330), S(18), hwnd, reinterpret_cast<HMENU>(IDC_GAIN_HINT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Max is -2 dB to reduce clipping risk", WS_CHILD | WS_VISIBLE, fieldX, S(412), S(330), S(18), hwnd, reinterpret_cast<HMENU>(IDC_GAIN_HINT), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Music Meter", WS_CHILD | WS_VISIBLE, labelX, S(438), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
         g_rcMeter = { fieldX, S(436), fieldX + S(360), S(436) + S(20) };
         CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, S(550), S(438), S(112), S(22), hwnd, reinterpret_cast<HMENU>(IDC_METER_TEXT), nullptr, nullptr);
@@ -1012,6 +1032,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_hwnd.store(nullptr, std::memory_order_release);
         g_lastStatusText.clear();
         KillTimer(hwnd, 1);
+        JoinSourceRefreshThread();
         ReleaseUiResources();
         PostQuitMessage(0);
         return 0;
@@ -1104,6 +1125,7 @@ void SettingsWindowController::Close() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_running.load(std::memory_order_acquire)) {
         if (g_thread.joinable()) g_thread.join();
+        JoinSourceRefreshThread();
         return;
     }
     HWND hwnd = g_hwnd.load(std::memory_order_acquire);
@@ -1113,4 +1135,5 @@ void SettingsWindowController::Close() {
     if (g_thread.joinable()) {
         g_thread.join();
     }
+    JoinSourceRefreshThread();
 }

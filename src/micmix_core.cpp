@@ -72,6 +72,13 @@ int DetermineAutoResamplerQuality() {
     return DetermineAutoResamplerQualityFromCpu(GetLogicalCpuCount());
 }
 
+int ResolveResamplerQualitySetting(int configuredValue) {
+    if (configuredValue < 0) {
+        return DetermineAutoResamplerQuality();
+    }
+    return std::clamp(configuredValue, 0, 10);
+}
+
 std::mutex g_logMutex;
 std::string g_logPath;
 std::string g_lastLogPayload;
@@ -226,8 +233,12 @@ bool IsDigitsOnly(const std::string& value) {
 void SanitizeSettings(MicMixSettings& s) {
     s.configVersion = std::clamp(s.configVersion, 1, 8);
     if (!std::isfinite(s.musicGainDb)) { s.musicGainDb = -15.0f; }
-    s.musicGainDb = std::clamp(s.musicGainDb, -30.0f, -6.0f);
-    s.resamplerQuality = DetermineAutoResamplerQuality();
+    s.musicGainDb = std::clamp(s.musicGainDb, -30.0f, -2.0f);
+    if (s.resamplerQuality < -1) {
+        s.resamplerQuality = -1;
+    } else if (s.resamplerQuality > 10) {
+        s.resamplerQuality = 10;
+    }
     s.bufferTargetMs = std::clamp(s.bufferTargetMs, 20, 250);
     if (!std::isfinite(s.micGateThresholdDbfs)) { s.micGateThresholdDbfs = -50.0f; }
     s.micGateThresholdDbfs = std::clamp(s.micGateThresholdDbfs, -90.0f, 0.0f);
@@ -805,7 +816,7 @@ float AudioEngine::DbToLinear(float db) {
 }
 
 void AudioEngine::ApplySettings(const MicMixSettings& settings) {
-    const float gainDb = std::clamp(settings.musicGainDb, -30.0f, -6.0f);
+    const float gainDb = std::clamp(settings.musicGainDb, -30.0f, -2.0f);
     const int bufferMs = std::clamp(settings.bufferTargetMs, 20, 250);
     musicMuted_.store(settings.musicMuted, std::memory_order_release);
     forceTxEnabled_.store(settings.forceTxEnabled, std::memory_order_release);
@@ -1428,7 +1439,7 @@ private:
             closeEvent();
             code = "capture_service_failed"; msg = "Loopback capture service failed"; releaseWf(); return false;
         }
-        const int resamplerQuality = std::clamp(settings_.resamplerQuality, 0, 10);
+        const int resamplerQuality = ResolveResamplerQualitySetting(settings_.resamplerQuality);
         if (!resampler_.Configure(wf->nSamplesPerSec, kTargetRate, resamplerQuality)) {
             closeEvent();
             code = "resampler_failed"; msg = "Resampler init failed"; releaseWf(); return false;
@@ -1709,7 +1720,7 @@ private:
             detail += "pid=" + std::to_string(pid) + " service_hr=" + HrToHex(hr);
             code = "capture_service_failed"; msg = "App capture service failed"; releaseWf(); return false;
         }
-        const int resamplerQuality = std::clamp(settings_.resamplerQuality, 0, 10);
+        const int resamplerQuality = ResolveResamplerQualitySetting(settings_.resamplerQuality);
         if (!resampler_.Configure(wf->nSamplesPerSec, kTargetRate, resamplerQuality)) {
             closeEvent();
             code = "resampler_failed"; msg = "Resampler init failed"; releaseWf(); return false;
@@ -3383,7 +3394,9 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
         sourceManager_->ApplySettings(settings_);
         mixMonitorPlayer_ = std::make_unique<MixMonitorPlayer>();
         if (settings_.autostartEnabled) sourceManager_->Start();
-        LogInfo("resampler auto_cpu quality=" + std::to_string(settings_.resamplerQuality) +
+        const int activeResamplerQuality = ResolveResamplerQualitySetting(settings_.resamplerQuality);
+        const std::string mode = (settings_.resamplerQuality < 0) ? "auto_cpu" : "manual";
+        LogInfo("resampler " + mode + " quality=" + std::to_string(activeResamplerQuality) +
                 " logical_cpus=" + std::to_string(GetLogicalCpuCount()));
         const uint64_t nowMs = GetTickCount64();
         lastCaptureEditTickMs_.store(nowMs, std::memory_order_release);

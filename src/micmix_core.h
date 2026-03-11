@@ -41,7 +41,7 @@ struct MicMixSettings {
     std::string appSessionId;
     bool        autostartEnabled = false;
     float       musicGainDb = -15.0f;
-    int         resamplerQuality = 6;
+    int         resamplerQuality = -1;
     bool        forceTxEnabled = true;
     int         bufferTargetMs = 60;
     bool        musicMuted = false;

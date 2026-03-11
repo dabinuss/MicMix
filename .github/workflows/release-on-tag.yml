@@ -33,8 +33,8 @@ jobs:
               Remove-Item -LiteralPath $TargetDir -Recurse -Force -ErrorAction SilentlyContinue
               git clone $Repo $TargetDir
               if ($LASTEXITCODE -eq 0) {
-          
-              }      return
+                return
+              }
               if ($attempt -eq $MaxAttempts) {
                 throw "git clone failed after $MaxAttempts attempts: $Repo -> $TargetDir"
               }
