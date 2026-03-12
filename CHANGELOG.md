@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.2.5] - 2026-03-12
+
+### Fixed
+
+- Hotfix: prevented `CLIENT_META_DATA` updates during plugin shutdown to reduce TeamSpeak client teardown crashes caused by late metadata sync calls.
+
 ## [1.2.4] - 2026-03-12
 
 ### Added
