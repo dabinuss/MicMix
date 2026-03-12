@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 #include <CommCtrl.h>
+#include <shellapi.h>
 #include <uxtheme.h>
 
 #include <atomic>
@@ -11,6 +12,8 @@
 #include <exception>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <string>
 
@@ -18,6 +21,7 @@
 #include "resource.h"
 
 #pragma comment(lib, "Comctl32.lib")
+#pragma comment(lib, "Shell32.lib")
 #pragma comment(lib, "UxTheme.lib")
 
 namespace {
@@ -57,6 +61,7 @@ struct SourceChoice {
     SourceChoiceType type = SourceChoiceType::Loopback;
     std::string id;
     std::string processName;
+    uint32_t pid = 0;
 };
 
 struct UiTheme {
@@ -92,6 +97,9 @@ std::vector<CaptureDeviceInfo> g_pendingCaptureDevices;
 std::vector<AppProcessInfo> g_pendingApps;
 std::atomic_uint64_t g_sourceRefreshSeq{0};
 std::atomic<bool> g_sourceRefreshReloadSettings{false};
+std::unordered_map<uint32_t, HICON> g_appIconsByPid;
+HICON g_loopbackFallbackIcon = nullptr;
+HICON g_appFallbackIcon = nullptr;
 
 constexpr INT_PTR kSourceItemHeader = -10;
 constexpr INT_PTR kSourceItemDivider = -11;
@@ -101,6 +109,7 @@ constexpr float kMusicGainMinDb = -30.0f;
 constexpr float kMusicGainMaxDb = -2.0f;
 constexpr int kMusicGainStepPerDb = 10;
 constexpr int kMusicGainSliderMax = static_cast<int>((kMusicGainMaxDb - kMusicGainMinDb) * static_cast<float>(kMusicGainStepPerDb));
+constexpr int kSourceIconSizePx = 16;
 
 HFONT g_fontBody = nullptr;
 HFONT g_fontSmall = nullptr;
@@ -133,6 +142,113 @@ std::wstring Utf8ToWide(const std::string& text) {
     MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, out.data(), len);
     if (!out.empty() && out.back() == L'\0') out.pop_back();
     return out;
+}
+
+void DestroyIconHandle(HICON& icon) {
+    if (icon) {
+        DestroyIcon(icon);
+        icon = nullptr;
+    }
+}
+
+void ClearAppIconCache() {
+    for (auto& entry : g_appIconsByPid) {
+        DestroyIconHandle(entry.second);
+    }
+    g_appIconsByPid.clear();
+}
+
+HICON CopySharedIcon(HICON sharedIcon) {
+    if (!sharedIcon) {
+        return nullptr;
+    }
+    return CopyIcon(sharedIcon);
+}
+
+HICON LoadStockSmallIcon(SHSTOCKICONID stockId) {
+    SHSTOCKICONINFO sii{};
+    sii.cbSize = sizeof(sii);
+    if (SUCCEEDED(SHGetStockIconInfo(stockId, SHGSI_ICON | SHGSI_SMALLICON, &sii)) && sii.hIcon) {
+        return sii.hIcon;
+    }
+    return nullptr;
+}
+
+bool TryGetProcessImagePath(uint32_t pid, std::wstring& outPath) {
+    outPath.clear();
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) {
+        return false;
+    }
+    std::wstring buffer(MAX_PATH, L'\0');
+    DWORD size = static_cast<DWORD>(buffer.size());
+    while (QueryFullProcessImageNameW(process, 0, buffer.data(), &size) == FALSE) {
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || buffer.size() >= 32768) {
+            CloseHandle(process);
+            return false;
+        }
+        buffer.resize(buffer.size() * 2);
+        size = static_cast<DWORD>(buffer.size());
+    }
+    buffer.resize(size);
+    outPath = std::move(buffer);
+    CloseHandle(process);
+    return true;
+}
+
+HICON TryLoadExeSmallIcon(const std::wstring& exePath) {
+    if (exePath.empty()) {
+        return nullptr;
+    }
+    SHFILEINFOW sfi{};
+    if (SHGetFileInfoW(exePath.c_str(), 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_SMALLICON) == 0) {
+        return nullptr;
+    }
+    return sfi.hIcon;
+}
+
+void EnsureFallbackIcons() {
+    if (!g_loopbackFallbackIcon) {
+        g_loopbackFallbackIcon = LoadStockSmallIcon(SIID_AUDIOFILES);
+        if (!g_loopbackFallbackIcon) {
+            g_loopbackFallbackIcon = CopySharedIcon(LoadIconW(nullptr, IDI_INFORMATION));
+        }
+    }
+    if (!g_appFallbackIcon) {
+        g_appFallbackIcon = LoadStockSmallIcon(SIID_APPLICATION);
+        if (!g_appFallbackIcon) {
+            g_appFallbackIcon = CopySharedIcon(LoadIconW(nullptr, IDI_APPLICATION));
+        }
+    }
+}
+
+void EnsureAppIconForPid(uint32_t pid) {
+    if (pid == 0 || g_appIconsByPid.find(pid) != g_appIconsByPid.end()) {
+        return;
+    }
+    std::wstring exePath;
+    if (TryGetProcessImagePath(pid, exePath)) {
+        if (HICON icon = TryLoadExeSmallIcon(exePath)) {
+            g_appIconsByPid.emplace(pid, icon);
+            return;
+        }
+    }
+    if (g_appFallbackIcon) {
+        if (HICON iconCopy = CopyIcon(g_appFallbackIcon)) {
+            g_appIconsByPid.emplace(pid, iconCopy);
+        }
+    }
+}
+
+void PruneAppIconCache(const std::unordered_set<uint32_t>& activePids) {
+    for (auto it = g_appIconsByPid.begin(); it != g_appIconsByPid.end();) {
+        if (activePids.find(it->first) == activePids.end()) {
+            DestroyIconHandle(it->second);
+            it = g_appIconsByPid.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 std::wstring ToLowerWide(std::wstring text) {
@@ -176,9 +292,13 @@ void EnsureUiResources() {
     if (!g_fontHint) g_fontHint = CreateFontW(-S(11), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     if (!g_fontTitle) g_fontTitle = CreateFontW(-S(24), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI Semibold");
     if (!g_fontMono) g_fontMono = CreateFontW(-S(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
+    EnsureFallbackIcons();
 }
 
 void ReleaseUiResources() {
+    ClearAppIconCache();
+    DestroyIconHandle(g_loopbackFallbackIcon);
+    DestroyIconHandle(g_appFallbackIcon);
     if (g_fontBody) { DeleteObject(g_fontBody); g_fontBody = nullptr; }
     if (g_fontSmall) { DeleteObject(g_fontSmall); g_fontSmall = nullptr; }
     if (g_fontHint) { DeleteObject(g_fontHint); g_fontHint = nullptr; }
@@ -444,6 +564,8 @@ void RequestSourceRefresh(HWND hwnd, bool reloadSettings) {
 void PopulateCombos(HWND hwnd) {
     g_sourceChoices.clear();
     g_lastValidSourceSel = -1;
+    EnsureFallbackIcons();
+    std::unordered_set<uint32_t> activeAppPids;
 
     auto addStaticItem = [](HWND combo, const wchar_t* text, INT_PTR data) {
         const LRESULT idx = SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text));
@@ -493,9 +615,13 @@ void PopulateCombos(HWND hwnd) {
             choice.type = SourceChoiceType::App;
             choice.id = std::to_string(p.pid);
             choice.processName = p.exeName;
+            choice.pid = p.pid;
             addSelectableItem(source, label, choice);
+            activeAppPids.insert(p.pid);
+            EnsureAppIconForPid(p.pid);
         }
     }
+    PruneAppIconCache(activeAppPids);
 
     HWND mic = GetDlgItem(hwnd, IDC_MIC_DEVICE);
     if (mic) {
@@ -776,6 +902,75 @@ void DrawLevelMeter(HDC hdc, const RECT& meterRect, bool active, float visualDb,
     DeleteObject(border);
 }
 
+void DrawSourceComboItem(const DRAWITEMSTRUCT* dis) {
+    if (!dis || dis->itemID == static_cast<UINT>(-1)) {
+        return;
+    }
+    const bool selected = (dis->itemState & ODS_SELECTED) != 0;
+    const bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+
+    wchar_t textBuf[512]{};
+    SendMessageW(dis->hwndItem, CB_GETLBTEXT, dis->itemID, reinterpret_cast<LPARAM>(textBuf));
+
+    RECT rc = dis->rcItem;
+    if (selected) {
+        FillSolidRect(dis->hDC, rc, RGB(218, 234, 255));
+    } else {
+        FillSolidRect(dis->hDC, rc, RGB(255, 255, 255));
+    }
+
+    const LRESULT itemData = SendMessageW(dis->hwndItem, CB_GETITEMDATA, dis->itemID, 0);
+    const bool isSelectableSource = !(itemData < 0 || itemData == CB_ERR || static_cast<size_t>(itemData) >= g_sourceChoices.size());
+
+    HICON icon = nullptr;
+    if (isSelectableSource) {
+        const SourceChoice& choice = g_sourceChoices[static_cast<size_t>(itemData)];
+        if (choice.type == SourceChoiceType::Loopback) {
+            icon = g_loopbackFallbackIcon;
+        } else {
+            EnsureAppIconForPid(choice.pid);
+            if (auto it = g_appIconsByPid.find(choice.pid); it != g_appIconsByPid.end()) {
+                icon = it->second;
+            } else {
+                icon = g_appFallbackIcon;
+            }
+        }
+    }
+
+    int textLeft = rc.left + S(10);
+    const int iconSize = S(kSourceIconSizePx);
+    if (icon) {
+        const int iconY = rc.top + ((rc.bottom - rc.top - iconSize) / 2);
+        DrawIconEx(dis->hDC, rc.left + S(8), iconY, icon, iconSize, iconSize, 0, nullptr, DI_NORMAL);
+        textLeft = rc.left + S(8) + iconSize + S(8);
+    }
+
+    SetBkMode(dis->hDC, TRANSPARENT);
+    if (disabled) {
+        SetTextColor(dis->hDC, RGB(150, 156, 166));
+    } else if (itemData == kSourceItemHeader) {
+        SetTextColor(dis->hDC, RGB(104, 112, 124));
+    } else if (itemData == kSourceItemDivider) {
+        SetTextColor(dis->hDC, RGB(184, 190, 200));
+    } else if (itemData == kSourceItemPlaceholder) {
+        SetTextColor(dis->hDC, RGB(132, 138, 148));
+    } else {
+        SetTextColor(dis->hDC, RGB(32, 36, 44));
+    }
+    SelectObject(dis->hDC, g_fontBody ? g_fontBody : GetStockObject(DEFAULT_GUI_FONT));
+
+    RECT textRc = rc;
+    textRc.left = textLeft;
+    DrawTextW(dis->hDC, textBuf, -1, &textRc, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+
+    if ((dis->itemState & ODS_FOCUS) != 0) {
+        RECT focus = rc;
+        focus.left += S(2);
+        focus.right -= S(2);
+        DrawFocusRect(dis->hDC, &focus);
+    }
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
@@ -798,7 +993,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         CreateWindowW(L"BUTTON", L"Auto-enable when TeamSpeak starts", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, S(36), S(170), S(320), S(24), hwnd, reinterpret_cast<HMENU>(IDC_AUTOSTART), nullptr, nullptr);
 
         CreateWindowW(L"STATIC", L"Audio Source", WS_CHILD | WS_VISIBLE, labelX, S(252), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        HWND source = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | CBS_DROPDOWNLIST, fieldX, S(248), sourceW, S(360), hwnd, reinterpret_cast<HMENU>(IDC_SOURCE), nullptr, nullptr);
+        HWND source = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS, fieldX, S(248), sourceW, S(360), hwnd, reinterpret_cast<HMENU>(IDC_SOURCE), nullptr, nullptr);
         SendMessageW(source, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), S(24));
         SendMessageW(source, CB_SETITEMHEIGHT, 0, S(22));
         SendMessageW(source, CB_SETMINVISIBLE, 18, 0);
@@ -849,6 +1044,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ApplyLiveSettings(hwnd, false);
         }
         return 0;
+    case WM_MEASUREITEM: {
+        auto* mis = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+        if (!mis) {
+            return FALSE;
+        }
+        if (mis->CtlID == IDC_SOURCE) {
+            mis->itemHeight = static_cast<UINT>(S(24));
+            return TRUE;
+        }
+        return FALSE;
+    }
+    case WM_DRAWITEM: {
+        auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if (!dis) {
+            return FALSE;
+        }
+        if (dis->CtlID == IDC_SOURCE) {
+            DrawSourceComboItem(dis);
+            return TRUE;
+        }
+        return FALSE;
+    }
     case kMsgSourceRefreshDone: {
         const uint64_t seq = static_cast<uint64_t>(wParam);
         const uint64_t latest = g_sourceRefreshSeq.load(std::memory_order_acquire);
