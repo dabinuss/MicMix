@@ -353,6 +353,7 @@ private:
     void VoiceTxThreadMain();
     void SetVoiceRecordingState(bool active, uint64 schid);
     void RefreshVoiceTxControl(uint64 schidHint);
+    void SyncMusicActivityMeta(uint64 schid, bool musicActive, bool force);
 
     std::atomic<bool> initialized_{false};
     std::unique_ptr<ConfigStore> configStore_;
@@ -382,6 +383,11 @@ private:
     std::atomic<bool> shutdownRequested_{false};
     std::atomic<uint32_t> captureCallbacksInFlight_{0};
     std::mutex voiceTxMutex_;
+    std::mutex musicMetaMutex_;
+    uint64 musicMetaSchid_ = 0;
+    bool musicMetaLastStateValid_ = false;
+    bool musicMetaLastState_ = false;
+    uint64_t musicMetaLastAttemptMs_ = 0;
     bool savedInputStateValid_ = false;
     int savedInputDeactivated_ = INPUT_DEACTIVATED;
     bool savedVadValid_ = false;

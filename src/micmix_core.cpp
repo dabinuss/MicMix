@@ -47,6 +47,7 @@ constexpr uint64_t kForceTxMusicWindowMs = 6000ULL;
 constexpr uint64_t kVoiceTxReapplyMs = 12000ULL;
 constexpr uint64_t kCaptureWatchdogSilenceMs = 4500ULL;
 constexpr uint64_t kCaptureWatchdogCooldownMs = 12000ULL;
+constexpr uint64_t kMusicMetaUpdateMinIntervalMs = 2000ULL;
 constexpr uint32_t kMinSupportedSourceRate = 8000;
 constexpr uint32_t kMaxSupportedSourceRate = 384000;
 
@@ -2624,6 +2625,49 @@ std::vector<DeviceInfoT> EnumerateDevices(EDataFlow flow, ERole role, const char
     return out;
 }
 
+std::string BuildMusicMetaValue(const std::string& currentValue, bool active) {
+    constexpr const char* kKeyPrefix = "micmix_active=";
+    std::vector<std::string> parts;
+    parts.reserve(8);
+
+    size_t begin = 0;
+    while (begin <= currentValue.size()) {
+        size_t end = currentValue.find(';', begin);
+        if (end == std::string::npos) {
+            end = currentValue.size();
+        }
+        std::string token = currentValue.substr(begin, end - begin);
+        size_t left = 0;
+        while (left < token.size() && std::isspace(static_cast<unsigned char>(token[left])) != 0) {
+            ++left;
+        }
+        size_t right = token.size();
+        while (right > left && std::isspace(static_cast<unsigned char>(token[right - 1])) != 0) {
+            --right;
+        }
+        if (right > left) {
+            token = token.substr(left, right - left);
+            if (token.rfind(kKeyPrefix, 0) != 0) {
+                parts.push_back(std::move(token));
+            }
+        }
+        if (end == currentValue.size()) {
+            break;
+        }
+        begin = end + 1;
+    }
+
+    parts.push_back(std::string(kKeyPrefix) + (active ? "1" : "0"));
+    std::string out;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) {
+            out.push_back(';');
+        }
+        out += parts[i];
+    }
+    return out;
+}
+
 std::vector<LoopbackDeviceInfo> AudioSourceManager::EnumerateLoopbackDevices() {
     return EnumerateDevices<LoopbackDeviceInfo>(eRender, eMultimedia, "Device");
 }
@@ -3171,6 +3215,73 @@ void MicMixApp::RefreshVoiceTxControl(uint64 schidHint) {
     SetVoiceRecordingState(shouldKeepCaptureActive, schid);
 }
 
+void MicMixApp::SyncMusicActivityMeta(uint64 schid, bool musicActive, bool force) {
+    if (!g_ts3Functions.setClientSelfVariableAsString || !g_ts3Functions.flushClientSelfUpdates) {
+        return;
+    }
+    if (schid == 0 || !IsConnectedForTx(schid)) {
+        return;
+    }
+
+    const uint64_t nowMs = GetTickCount64();
+    std::lock_guard<std::mutex> lock(musicMetaMutex_);
+
+    if (musicMetaSchid_ != schid) {
+        musicMetaSchid_ = schid;
+        musicMetaLastStateValid_ = false;
+        musicMetaLastAttemptMs_ = 0;
+    }
+
+    if (!force && musicMetaLastStateValid_ && musicMetaLastState_ == musicActive) {
+        return;
+    }
+    if (!force && nowMs <= (musicMetaLastAttemptMs_ + kMusicMetaUpdateMinIntervalMs)) {
+        return;
+    }
+
+    std::string currentMeta;
+    if (g_ts3Functions.getClientSelfVariableAsString) {
+        char* currentMetaRaw = nullptr;
+        const unsigned int errRead = g_ts3Functions.getClientSelfVariableAsString(
+            schid, CLIENT_META_DATA, &currentMetaRaw);
+        if ((errRead == ERROR_ok || errRead == ERROR_ok_no_update) && currentMetaRaw) {
+            currentMeta.assign(currentMetaRaw);
+        }
+        if (currentMetaRaw && g_ts3Functions.freeMemory) {
+            g_ts3Functions.freeMemory(currentMetaRaw);
+        }
+    }
+
+    const std::string desiredMeta = BuildMusicMetaValue(currentMeta, musicActive);
+    if (!force && desiredMeta == currentMeta) {
+        musicMetaLastStateValid_ = true;
+        musicMetaLastState_ = musicActive;
+        return;
+    }
+
+    musicMetaLastAttemptMs_ = nowMs;
+    const unsigned int errSet = g_ts3Functions.setClientSelfVariableAsString(
+        schid, CLIENT_META_DATA, desiredMeta.c_str());
+    const bool okSet = (errSet == ERROR_ok || errSet == ERROR_ok_no_update);
+    unsigned int errFlush = ERROR_ok_no_update;
+    if (okSet) {
+        errFlush = g_ts3Functions.flushClientSelfUpdates(schid, nullptr);
+    }
+    const bool okFlush = (errFlush == ERROR_ok || errFlush == ERROR_ok_no_update);
+
+    if (okSet && okFlush) {
+        musicMetaLastStateValid_ = true;
+        musicMetaLastState_ = musicActive;
+        LogInfo(std::string("music_meta sync schid=") + std::to_string(schid) +
+                " active=" + std::to_string(musicActive ? 1 : 0));
+        return;
+    }
+
+    LogWarn(std::string("music_meta sync failed schid=") + std::to_string(schid) +
+            " set_err=" + std::to_string(errSet) +
+            " flush_err=" + std::to_string(errFlush));
+}
+
 void MicMixApp::VoiceTxThreadMain() {
     voiceTxThreadRunning_.store(true, std::memory_order_release);
     try {
@@ -3191,6 +3302,10 @@ void MicMixApp::VoiceTxThreadMain() {
                 }
             }
             RefreshVoiceTxControl(schid);
+            if (schid != 0) {
+                const TelemetrySnapshot t = engine_.SnapshotTelemetry();
+                SyncMusicActivityMeta(schid, t.musicActive, false);
+            }
 
             if (schid != 0 && g_ts3Functions.getPreProcessorInfoValueFloat) {
                 float micDb = -120.0f;
@@ -3389,6 +3504,13 @@ void MicMixApp::VoiceTxThreadMain() {
     } catch (...) {
         LogError("voice_tx thread exception: unknown");
     }
+    uint64 schid = voiceRecordingSchid_.load(std::memory_order_acquire);
+    if (schid == 0) {
+        schid = activeSchid_.load(std::memory_order_acquire);
+    }
+    if (schid != 0) {
+        SyncMusicActivityMeta(schid, false, true);
+    }
     SetVoiceRecordingState(false, 0);
     voiceTxThreadRunning_.store(false, std::memory_order_release);
 }
@@ -3422,6 +3544,13 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
     try {
         shutdownRequested_.store(false, std::memory_order_release);
         captureCallbacksInFlight_.store(0, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(musicMetaMutex_);
+            musicMetaSchid_ = 0;
+            musicMetaLastStateValid_ = false;
+            musicMetaLastState_ = false;
+            musicMetaLastAttemptMs_ = 0;
+        }
         configStore_ = std::make_unique<ConfigStore>(configBasePath);
         g_logPath = configStore_->LogPath();
         std::string warn;
@@ -3491,6 +3620,10 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
 void MicMixApp::Shutdown() {
     if (!initialized_.exchange(false)) return;
     shutdownRequested_.store(true, std::memory_order_release);
+    uint64 schid = activeSchid_.load(std::memory_order_acquire);
+    if (schid != 0) {
+        SyncMusicActivityMeta(schid, false, true);
+    }
     SettingsWindowController::Instance().Close();
     if (hotkeyManager_) hotkeyManager_->Stop();
     StopVoiceTxThread();
@@ -3641,6 +3774,13 @@ void MicMixApp::OnConnectStatusChange(uint64 schid, int newStatus, unsigned int 
     }
     (void)errorNumber;
     if (newStatus == STATUS_DISCONNECTED) {
+        {
+            std::lock_guard<std::mutex> lock(musicMetaMutex_);
+            if (musicMetaSchid_ == schid) {
+                musicMetaLastStateValid_ = false;
+                musicMetaLastAttemptMs_ = 0;
+            }
+        }
         if (activeSchid_.load(std::memory_order_acquire) == schid) {
             activeSchid_.store(0, std::memory_order_release);
         }
@@ -3648,6 +3788,13 @@ void MicMixApp::OnConnectStatusChange(uint64 schid, int newStatus, unsigned int 
         return;
     }
     if (newStatus == STATUS_CONNECTION_ESTABLISHED || newStatus == STATUS_CONNECTION_ESTABLISHING || newStatus == STATUS_CONNECTED) {
+        {
+            std::lock_guard<std::mutex> lock(musicMetaMutex_);
+            if (musicMetaSchid_ == schid) {
+                musicMetaLastStateValid_ = false;
+                musicMetaLastAttemptMs_ = 0;
+            }
+        }
         activeSchid_.store(schid, std::memory_order_release);
         RefreshVoiceTxControl(schid);
     }
