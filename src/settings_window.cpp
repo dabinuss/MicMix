@@ -52,6 +52,7 @@ enum ControlId {
     IDC_GAIN_HINT = 1029,
     IDC_FORCE_TX_HINT = 1030,
     IDC_VERSION = 1031,
+    IDC_REPO_LINK = 1032,
 };
 
 enum class SourceChoiceType {
@@ -117,6 +118,7 @@ constexpr int kClientHeightPx = 690;
 constexpr int kCardMarginPx = 16;
 constexpr int kCardGapPx = 12;
 constexpr int kCardInnerPaddingPx = 20;
+constexpr wchar_t kRepoUrl[] = L"https://github.com/dabinuss/MicMix";
 
 HFONT g_fontBody = nullptr;
 HFONT g_fontSmall = nullptr;
@@ -843,6 +845,7 @@ void ApplyFonts(HWND hwnd) {
     SetControlFont(hwnd, IDC_TITLE, g_fontTitle);
     SetControlFont(hwnd, IDC_SUBTITLE, g_fontSmall);
     SetControlFont(hwnd, IDC_VERSION, g_fontSmall);
+    SetControlFont(hwnd, IDC_REPO_LINK, g_fontSmall);
     SetControlFont(hwnd, IDC_METER_TEXT, g_fontSmall);
     SetControlFont(hwnd, IDC_MIC_METER_TEXT, g_fontSmall);
     SetControlFont(hwnd, IDC_MONITOR_HINT, g_fontHint ? g_fontHint : g_fontSmall);
@@ -1000,7 +1003,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_dpi = GetDpiForWindow(hwnd);
         EnsureUiResources();
         ComputeLayout();
-        const std::wstring versionText = Utf8ToWide(std::string("v") + MICMIX_VERSION);
+        const std::wstring versionText = Utf8ToWide(std::string("v") + MICMIX_VERSION + "  by dabinuss");
 
         const int contentLeft = S(kCardMarginPx + kCardInnerPaddingPx);
         const int contentRight = S(kClientWidthPx - kCardMarginPx - kCardInnerPaddingPx);
@@ -1019,16 +1022,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const int valueTextX = fieldX + gainSliderW;
         const int muteToggleX = fieldX + S(262);
         const int hintTopOffset = S(38);
-        const int headerVersionW = S(120);
-        const int headerVersionX = contentRight - headerVersionW;
+        const int headerMetaW = S(300);
+        const int headerMetaX = contentRight - headerMetaW;
         const int statusX = contentLeft;
         const int statusY = S(610);
         const int statusW = contentRight - statusX;
         const int statusH = S(44);
 
         CreateWindowW(L"STATIC", L"MicMix", WS_CHILD | WS_VISIBLE, contentLeft, S(14), S(220), S(36), hwnd, reinterpret_cast<HMENU>(IDC_TITLE), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Configure MicMix and route one audio source to your mic output", WS_CHILD | WS_VISIBLE, contentLeft, S(44), headerVersionX - contentLeft - S(8), S(20), hwnd, reinterpret_cast<HMENU>(IDC_SUBTITLE), nullptr, nullptr);
-        CreateWindowW(L"STATIC", versionText.c_str(), WS_CHILD | WS_VISIBLE | SS_RIGHT, headerVersionX, S(18), headerVersionW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_VERSION), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Configure MicMix and route one audio source to your mic output", WS_CHILD | WS_VISIBLE, contentLeft, S(44), headerMetaX - contentLeft - S(8), S(20), hwnd, reinterpret_cast<HMENU>(IDC_SUBTITLE), nullptr, nullptr);
+        CreateWindowW(L"STATIC", versionText.c_str(), WS_CHILD | WS_VISIBLE | SS_RIGHT, headerMetaX, S(18), headerMetaW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_VERSION), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"github.com/dabinuss/MicMix", WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_NOTIFY, headerMetaX, S(36), headerMetaW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_REPO_LINK), nullptr, nullptr);
 
         CreateWindowW(L"BUTTON", L"Enable MicMix", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, contentLeft, S(108), actionButtonW, S(34), hwnd, reinterpret_cast<HMENU>(IDC_START), nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Disable MicMix", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, contentLeft + actionButtonW + controlGap, S(108), actionButtonW, S(34), hwnd, reinterpret_cast<HMENU>(IDC_STOP), nullptr, nullptr);
@@ -1171,6 +1175,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return DefWindowProcW(hwnd, msg, wParam, lParam);
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
+        case IDC_REPO_LINK:
+            if (HIWORD(wParam) == STN_CLICKED) {
+                ShellExecuteW(hwnd, L"open", kRepoUrl, nullptr, nullptr, SW_SHOWNORMAL);
+                return 0;
+            }
+            break;
         case IDC_RESCAN:
             RequestSourceRefresh(hwnd, true);
             return 0;
@@ -1248,6 +1258,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetTextColor(hdc, g_theme.text);
         } else if (id == IDC_SUBTITLE || id == IDC_VERSION) {
             SetTextColor(hdc, g_theme.muted);
+        } else if (id == IDC_REPO_LINK) {
+            SetTextColor(hdc, RGB(25, 100, 200));
         } else if (id == IDC_MONITOR_HINT || id == IDC_MIC_METER_HINT || id == IDC_GAIN_HINT || id == IDC_FORCE_TX_HINT) {
             SetTextColor(hdc, g_theme.muted);
         } else if (id == IDC_STATUS) {
@@ -1257,6 +1269,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return reinterpret_cast<INT_PTR>(inCard ? g_brushCard : g_brushBg);
     }
+    case WM_SETCURSOR:
+        if (reinterpret_cast<HWND>(wParam) == GetDlgItem(hwnd, IDC_REPO_LINK)) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
     case WM_PAINT: {
         PAINTSTRUCT ps{};
         HDC hdc = BeginPaint(hwnd, &ps);
