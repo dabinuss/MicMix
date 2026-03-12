@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.2.4] - 2026-03-12
+
+### Added
+
+- Added application icons for audio source entries with robust fallback behavior when icons are unavailable.
+- Added MicMix activity publication via TeamSpeak client metadata with anti-spam throttling and synchronization guards.
+
+### Changed
+
+- Refined settings UI layout for better consistency, compactness, and safer control bounds.
+- Improved app-session source selection to prefer processes with active audio sessions.
+- Improved music meter behavior with a telemetry-based fallback so signal activity remains visible in more scenarios.
+
+### Fixed
+
+- Hardened plugin lifecycle and shutdown paths to reduce close-time crash risk.
+- Improved thread safety around monitor enable/disable transitions and UI shutdown sequencing.
+- Hardened core thread-safety and shutdown race handling in MicMix runtime paths.
+- Improved shutdown cleanup and refresh-completion handling robustness.
+- Improved safety/logging when posting source-refresh completion messages fails.
+- Ensured `VERSION` updates trigger CMake reconfigure so generated version metadata stays in sync.
+
 ## [1.2.3] - 2026-03-08
 
 ### Added
