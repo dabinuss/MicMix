@@ -2831,6 +2831,13 @@ void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
         engine_.SetTalkState(true);
     };
 
+    // During plugin shutdown, avoid any further TeamSpeak API calls from this path.
+    // The client is tearing down and late preprocessor/input updates can crash TS3.
+    if (shutdownRequested_.load(std::memory_order_acquire)) {
+        clearState();
+        return;
+    }
+
     auto restoreStateForSchid = [this, &appendIdent](uint64 targetSchid) {
         bool ok = true;
         size_t restoredCount = 0;
@@ -3173,6 +3180,9 @@ void MicMixApp::VoiceTxThreadMain() {
         uint64_t vadAboveThresholdSinceMs = 0;
         bool vadQualifiedOpen = false;
         while (!voiceTxStop_.load(std::memory_order_acquire)) {
+            if (shutdownRequested_.load(std::memory_order_acquire)) {
+                break;
+            }
             uint64 schid = activeSchid_.load(std::memory_order_acquire);
             if (schid == 0 && g_ts3Functions.getCurrentServerConnectionHandlerID) {
                 schid = g_ts3Functions.getCurrentServerConnectionHandlerID();
