@@ -3216,6 +3216,11 @@ void MicMixApp::RefreshVoiceTxControl(uint64 schidHint) {
 }
 
 void MicMixApp::SyncMusicActivityMeta(uint64 schid, bool musicActive, bool force) {
+    // During plugin shutdown, avoid TS API calls from this path.
+    // Late metadata updates can race client teardown in some TS3 builds.
+    if (shutdownRequested_.load(std::memory_order_acquire)) {
+        return;
+    }
     if (!g_ts3Functions.setClientSelfVariableAsString || !g_ts3Functions.flushClientSelfUpdates) {
         return;
     }
@@ -3508,7 +3513,7 @@ void MicMixApp::VoiceTxThreadMain() {
     if (schid == 0) {
         schid = activeSchid_.load(std::memory_order_acquire);
     }
-    if (schid != 0) {
+    if (schid != 0 && !shutdownRequested_.load(std::memory_order_acquire)) {
         SyncMusicActivityMeta(schid, false, true);
     }
     SetVoiceRecordingState(false, 0);
@@ -3620,9 +3625,10 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
 void MicMixApp::Shutdown() {
     if (!initialized_.exchange(false)) return;
     shutdownRequested_.store(true, std::memory_order_release);
-    uint64 schid = activeSchid_.load(std::memory_order_acquire);
-    if (schid != 0) {
-        SyncMusicActivityMeta(schid, false, true);
+    {
+        std::lock_guard<std::mutex> lock(musicMetaMutex_);
+        musicMetaLastStateValid_ = false;
+        musicMetaLastAttemptMs_ = 0;
     }
     SettingsWindowController::Instance().Close();
     if (hotkeyManager_) hotkeyManager_->Stop();
