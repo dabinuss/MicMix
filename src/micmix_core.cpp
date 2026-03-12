@@ -1551,19 +1551,40 @@ private:
                 out.push_back(pid);
             }
         };
+        uint32_t stickyPid = 0;
+        bool stickyParsed = false;
         if (!settings_.appSessionId.empty()) {
             char* endPtr = nullptr;
             const unsigned long parsed = strtoul(settings_.appSessionId.c_str(), &endPtr, 10);
             if (endPtr != settings_.appSessionId.c_str() && *endPtr == '\0') {
-                addCandidate(static_cast<uint32_t>(parsed));
+                stickyPid = static_cast<uint32_t>(parsed);
+                stickyParsed = true;
             }
         }
         if (settings_.appProcessName.empty()) {
+            if (stickyParsed) {
+                addCandidate(stickyPid);
+            }
             return out;
         }
+        const auto audioPids = EnumerateAudioSessionPids();
+        bool stickyAdded = false;
+        if (stickyParsed && audioPids.find(stickyPid) != audioPids.end()) {
+            addCandidate(stickyPid);
+            stickyAdded = true;
+        }
         const auto list = AudioSourceManager::EnumerateAppProcesses(settings_.appProcessName);
+        // Prefer process instances with an active audio session first.
+        for (const auto& item : list) {
+            if (audioPids.find(item.pid) != audioPids.end()) {
+                addCandidate(item.pid);
+            }
+        }
         for (const auto& item : list) {
             addCandidate(item.pid);
+        }
+        if (stickyParsed && !stickyAdded) {
+            addCandidate(stickyPid);
         }
         return out;
     }

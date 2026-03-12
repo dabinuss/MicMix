@@ -337,6 +337,12 @@ int MeterDbToPixels(float dbfs, int widthPx) {
     return static_cast<int>(((clamped + 60.0f) / 60.0f) * static_cast<float>(widthPx));
 }
 
+bool IsMusicMeterActive(const TelemetrySnapshot& t) {
+    const float shownPeakDb = (t.musicSendPeakDbfs > -119.0f) ? t.musicSendPeakDbfs : t.musicPeakDbfs;
+    const bool levelSuggestsSignal = (shownPeakDb > -96.0f) || (t.musicRmsDbfs > -100.0f);
+    return t.musicActive || levelSuggestsSignal;
+}
+
 void UpdateMusicMeter(HWND hwnd) {
     HWND txt = GetDlgItem(hwnd, IDC_METER_TEXT);
     if (!txt) {
@@ -344,9 +350,10 @@ void UpdateMusicMeter(HWND hwnd) {
     }
     const TelemetrySnapshot t = g_lastTelemetry;
     const float shownPeakDb = (t.musicSendPeakDbfs > -119.0f) ? t.musicSendPeakDbfs : t.musicPeakDbfs;
+    const bool meterActive = IsMusicMeterActive(t);
 
     float targetDb = -60.0f;
-    if (t.musicActive) {
+    if (meterActive) {
         targetDb = std::clamp(shownPeakDb, -60.0f, 0.0f);
     }
     if (targetDb > g_meterVisualDb) {
@@ -362,7 +369,7 @@ void UpdateMusicMeter(HWND hwnd) {
         g_meterHoldDb = std::max(-60.0f, g_meterHoldDb - 1.2f);
     }
 
-    if (!t.musicActive) {
+    if (!meterActive) {
         SetWindowTextW(txt, L"No signal");
     } else {
         const wchar_t* grade = L"ok";
@@ -1225,7 +1232,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         DrawCard(hdc, g_rcSource);
         DrawCard(hdc, g_rcMix);
         DrawCard(hdc, g_rcSession);
-        DrawLevelMeter(hdc, g_rcMeter, g_lastTelemetry.musicActive, g_meterVisualDb, g_meterHoldDb);
+        DrawLevelMeter(hdc, g_rcMeter, IsMusicMeterActive(g_lastTelemetry), g_meterVisualDb, g_meterHoldDb);
         DrawLevelMeter(hdc, g_rcMicMeter, g_lastTelemetry.micRmsDbfs > -119.0f, g_micMeterVisualDb, g_micMeterHoldDb);
 
         SetBkMode(hdc, TRANSPARENT);
@@ -1243,9 +1250,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_ERASEBKGND:
         return 1;
     case WM_CLOSE:
+        if (MicMixApp::Instance().IsMonitorEnabled()) {
+            MicMixApp::Instance().SetMonitorEnabled(false);
+        }
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
+        if (MicMixApp::Instance().IsMonitorEnabled()) {
+            MicMixApp::Instance().SetMonitorEnabled(false);
+        }
         g_hwnd.store(nullptr, std::memory_order_release);
         g_lastStatusText.clear();
         KillTimer(hwnd, 1);
@@ -1340,6 +1353,9 @@ void SettingsWindowController::Open() {
 
 void SettingsWindowController::Close() {
     std::lock_guard<std::mutex> lock(g_mutex);
+    if (MicMixApp::Instance().IsMonitorEnabled()) {
+        MicMixApp::Instance().SetMonitorEnabled(false);
+    }
     if (!g_running.load(std::memory_order_acquire)) {
         if (g_thread.joinable()) g_thread.join();
         JoinSourceRefreshThread();
