@@ -10,6 +10,7 @@
 #include <mutex>
 #include <thread>
 #include <functional>
+#include <cstdint>
 
 #include "teamspeak/public_definitions.h"
 #include "teamspeak/public_errors.h"
@@ -358,10 +359,10 @@ private:
     MicMixSettings settings_;
     mutable std::mutex settingsMutex_;
     AudioEngine engine_;
-    std::unique_ptr<AudioSourceManager> sourceManager_;
+    std::atomic<std::shared_ptr<AudioSourceManager>> sourceManager_{};
     std::unique_ptr<GlobalHotkeyManager> hotkeyManager_;
     std::unique_ptr<MicLevelMonitor> micLevelMonitor_;
-    std::unique_ptr<MixMonitorPlayer> mixMonitorPlayer_;
+    std::atomic<std::shared_ptr<MixMonitorPlayer>> mixMonitorPlayer_{};
     std::atomic<uint64> activeSchid_{0};
     std::atomic<bool> pushToPlayActive_{false};
     std::atomic<bool> pushToPlaySavedMuteValid_{false};
@@ -378,6 +379,8 @@ private:
     std::atomic_uint64_t forceTxHoldUntilMs_{0};
     std::atomic_uint64_t lastCaptureEditTickMs_{0};
     std::atomic_uint64_t lastCaptureReopenTickMs_{0};
+    std::atomic<bool> shutdownRequested_{false};
+    std::atomic<uint32_t> captureCallbacksInFlight_{0};
     std::mutex voiceTxMutex_;
     bool savedInputStateValid_ = false;
     int savedInputDeactivated_ = INPUT_DEACTIVATED;
@@ -389,6 +392,9 @@ private:
     int savedVadExtraBufferSize_ = 0;
     std::array<std::string, kSavedPreprocessorSlots> savedPreprocessorValues_{};
     std::array<bool, kSavedPreprocessorSlots> savedPreprocessorValuesValid_{};
+
+    bool TryEnterCaptureCallback();
+    void LeaveCaptureCallback();
 };
 
 std::string SourceStateToString(SourceState state);

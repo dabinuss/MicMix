@@ -2775,6 +2775,28 @@ VoiceRecordingState ResolveVoiceRecordingState(bool currentlyActive, uint64 curr
 }
 } // namespace
 
+bool MicMixApp::TryEnterCaptureCallback() {
+    if (shutdownRequested_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    captureCallbacksInFlight_.fetch_add(1, std::memory_order_acq_rel);
+    if (shutdownRequested_.load(std::memory_order_acquire)) {
+        LeaveCaptureCallback();
+        return false;
+    }
+    return true;
+}
+
+void MicMixApp::LeaveCaptureCallback() {
+    uint32_t current = captureCallbacksInFlight_.load(std::memory_order_acquire);
+    while (current > 0) {
+        if (captureCallbacksInFlight_.compare_exchange_weak(
+                current, current - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return;
+        }
+    }
+}
+
 void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
     std::lock_guard<std::mutex> lock(voiceTxMutex_);
     static uint64_t lastErrLogMs = 0;
@@ -3119,7 +3141,8 @@ void MicMixApp::RefreshVoiceTxControl(uint64 schidHint) {
     }
 
     const MicMixSettings s = GetSettings();
-    const SourceStatus st = sourceManager_ ? sourceManager_->GetStatus() : SourceStatus{};
+    const auto sourceManager = sourceManager_.load(std::memory_order_acquire);
+    const SourceStatus st = sourceManager ? sourceManager->GetStatus() : SourceStatus{};
     const TelemetrySnapshot t = engine_.SnapshotTelemetry();
     const bool sourceUp = (st.state == SourceState::Running) ||
                           (st.state == SourceState::Starting) ||
@@ -3387,6 +3410,8 @@ void MicMixApp::StopVoiceTxThread() {
 bool MicMixApp::Initialize(const std::string& configBasePath) {
     if (initialized_.exchange(true)) return true;
     try {
+        shutdownRequested_.store(false, std::memory_order_release);
+        captureCallbacksInFlight_.store(0, std::memory_order_release);
         configStore_ = std::make_unique<ConfigStore>(configBasePath);
         g_logPath = configStore_->LogPath();
         std::string warn;
@@ -3403,7 +3428,7 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
         });
         hotkeyManager_->Start();
         hotkeyManager_->ApplySettings(settings_);
-        sourceManager_ = std::make_unique<AudioSourceManager>(
+        auto sourceManager = std::make_shared<AudioSourceManager>(
             [this](const float* data, size_t count) { engine_.PushMusicSamples(data, count); },
             [this](SourceState st, const std::string& code, const std::string& msg, const std::string& detail) {
                 engine_.SetMusicSourceRunning(st == SourceState::Running);
@@ -3414,9 +3439,11 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
                 if (!detail.empty()) line += " detail=" + detail;
                 LogInfo(line);
             });
-        sourceManager_->ApplySettings(settings_);
-        mixMonitorPlayer_ = std::make_unique<MixMonitorPlayer>();
-        if (settings_.autostartEnabled) sourceManager_->Start();
+        sourceManager->ApplySettings(settings_);
+        sourceManager_.store(sourceManager, std::memory_order_release);
+        auto mixMonitor = std::make_shared<MixMonitorPlayer>();
+        mixMonitorPlayer_.store(mixMonitor, std::memory_order_release);
+        if (settings_.autostartEnabled) sourceManager->Start();
         const int activeResamplerQuality = ResolveResamplerQualitySetting(settings_.resamplerQuality);
         const std::string mode = (settings_.resamplerQuality < 0) ? "auto_cpu" : "manual";
         LogInfo("resampler " + mode + " quality=" + std::to_string(activeResamplerQuality) +
@@ -3435,32 +3462,45 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
 
     StopVoiceTxThread();
     if (hotkeyManager_) hotkeyManager_->Stop();
-    if (sourceManager_) sourceManager_->Stop();
-    if (mixMonitorPlayer_) mixMonitorPlayer_->SetEnabled(false);
+    if (const auto sourceManager = sourceManager_.load(std::memory_order_acquire)) {
+        sourceManager->Stop();
+    }
+    if (const auto mixMonitor = mixMonitorPlayer_.load(std::memory_order_acquire)) {
+        mixMonitor->SetEnabled(false);
+    }
     micLevelMonitor_.reset();
     hotkeyManager_.reset();
-    sourceManager_.reset();
-    mixMonitorPlayer_.reset();
+    sourceManager_.store({}, std::memory_order_release);
+    mixMonitorPlayer_.store({}, std::memory_order_release);
     configStore_.reset();
     initialized_.store(false, std::memory_order_release);
+    shutdownRequested_.store(true, std::memory_order_release);
     return false;
 }
 
 void MicMixApp::Shutdown() {
     if (!initialized_.exchange(false)) return;
+    shutdownRequested_.store(true, std::memory_order_release);
     SettingsWindowController::Instance().Close();
     if (hotkeyManager_) hotkeyManager_->Stop();
-    if (sourceManager_) sourceManager_->Stop();
-    if (mixMonitorPlayer_) mixMonitorPlayer_->SetEnabled(false);
     StopVoiceTxThread();
+    for (int i = 0; i < 100 && captureCallbacksInFlight_.load(std::memory_order_acquire) > 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    if (const auto sourceManager = sourceManager_.load(std::memory_order_acquire)) {
+        sourceManager->Stop();
+    }
+    if (const auto mixMonitor = mixMonitorPlayer_.load(std::memory_order_acquire)) {
+        mixMonitor->SetEnabled(false);
+    }
     if (configStore_) {
         std::string err;
         configStore_->Save(settings_, err);
         if (!err.empty()) LogWarn("Config save warning: " + err);
     }
     hotkeyManager_.reset();
-    sourceManager_.reset();
-    mixMonitorPlayer_.reset();
+    sourceManager_.store({}, std::memory_order_release);
+    mixMonitorPlayer_.store({}, std::memory_order_release);
     configStore_.reset();
 }
 
@@ -3486,9 +3526,9 @@ void MicMixApp::ApplySettings(const MicMixSettings& settings, bool restartSource
     if (hotkeyManager_) {
         hotkeyManager_->ApplySettings(safe);
     }
-    if (sourceManager_) {
-        sourceManager_->ApplySettings(safe);
-        if (restartSource && sourceManager_->IsRunning()) sourceManager_->Restart();
+    if (const auto sourceManager = sourceManager_.load(std::memory_order_acquire)) {
+        sourceManager->ApplySettings(safe);
+        if (restartSource && sourceManager->IsRunning()) sourceManager->Restart();
     }
     if (saveConfig && changed && configStore_) {
         std::string err;
@@ -3496,8 +3536,16 @@ void MicMixApp::ApplySettings(const MicMixSettings& settings, bool restartSource
     }
 }
 
-void MicMixApp::StartSource() { if (sourceManager_) sourceManager_->Start(); }
-void MicMixApp::StopSource() { if (sourceManager_) sourceManager_->Stop(); }
+void MicMixApp::StartSource() {
+    if (const auto sourceManager = sourceManager_.load(std::memory_order_acquire)) {
+        sourceManager->Start();
+    }
+}
+void MicMixApp::StopSource() {
+    if (const auto sourceManager = sourceManager_.load(std::memory_order_acquire)) {
+        sourceManager->Stop();
+    }
+}
 
 void MicMixApp::ToggleMute() {
     engine_.ToggleMute();
@@ -3507,14 +3555,17 @@ void MicMixApp::ToggleMute() {
 }
 
 void MicMixApp::SetMonitorEnabled(bool enabled) {
-    if (mixMonitorPlayer_) {
-        mixMonitorPlayer_->SetEnabled(enabled);
-        LogInfo(std::string("mix_monitor ") + (mixMonitorPlayer_->IsEnabled() ? "enabled" : "disabled"));
+    if (const auto mixMonitor = mixMonitorPlayer_.load(std::memory_order_acquire)) {
+        mixMonitor->SetEnabled(enabled);
+        LogInfo(std::string("mix_monitor ") + (mixMonitor->IsEnabled() ? "enabled" : "disabled"));
     }
 }
 
 bool MicMixApp::IsMonitorEnabled() const {
-    return mixMonitorPlayer_ ? mixMonitorPlayer_->IsEnabled() : false;
+    if (const auto mixMonitor = mixMonitorPlayer_.load(std::memory_order_acquire)) {
+        return mixMonitor->IsEnabled();
+    }
+    return false;
 }
 
 void MicMixApp::ToggleMonitor() {
@@ -3565,11 +3616,19 @@ void MicMixApp::SetTalkStateForOwnClient(uint64 schid, anyID clientId, int talkS
 }
 
 void MicMixApp::SetActiveServer(uint64 schid) {
+    if (!initialized_.load(std::memory_order_acquire) ||
+        shutdownRequested_.load(std::memory_order_acquire)) {
+        return;
+    }
     activeSchid_.store(schid, std::memory_order_release);
     RefreshVoiceTxControl(schid);
 }
 
 void MicMixApp::OnConnectStatusChange(uint64 schid, int newStatus, unsigned int errorNumber) {
+    if (!initialized_.load(std::memory_order_acquire) ||
+        shutdownRequested_.load(std::memory_order_acquire)) {
+        return;
+    }
     (void)errorNumber;
     if (newStatus == STATUS_DISCONNECTED) {
         if (activeSchid_.load(std::memory_order_acquire) == schid) {
@@ -3588,7 +3647,12 @@ std::vector<CaptureDeviceInfo> MicMixApp::GetCaptureDevices() const { return Aud
 std::vector<AppProcessInfo> MicMixApp::GetAppProcesses() const {
     return AudioSourceManager::EnumerateAppProcesses();
 }
-SourceStatus MicMixApp::GetSourceStatus() const { return sourceManager_ ? sourceManager_->GetStatus() : SourceStatus{}; }
+SourceStatus MicMixApp::GetSourceStatus() const {
+    if (const auto sourceManager = sourceManager_.load(std::memory_order_acquire)) {
+        return sourceManager->GetStatus();
+    }
+    return {};
+}
 TelemetrySnapshot MicMixApp::GetTelemetry() const {
     TelemetrySnapshot t = engine_.SnapshotTelemetry();
     if (t.micRmsDbfs > -119.0f || !g_ts3Functions.getPreProcessorInfoValueFloat) {
@@ -3640,13 +3704,27 @@ std::string MicMixApp::GetPreferredTsCaptureDeviceName() const {
 }
 
 void MicMixApp::EditCapturedVoice(uint64 schid, short* samples, int sampleCount, int channels, int* edited) {
-    if (!initialized_.load(std::memory_order_acquire)) return;
+    if (!initialized_.load(std::memory_order_acquire) ||
+        shutdownRequested_.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (!TryEnterCaptureCallback()) {
+        return;
+    }
+    struct LeaveGuard {
+        MicMixApp* app;
+        ~LeaveGuard() {
+            if (app) {
+                app->LeaveCaptureCallback();
+            }
+        }
+    } leaveGuard{this};
     const uint64_t nowMs = GetTickCount64();
     lastCaptureEditTickMs_.store(nowMs, std::memory_order_release);
     (void)schid;
     engine_.EditCapturedVoice(samples, sampleCount, channels, edited);
-    if (mixMonitorPlayer_) {
-        mixMonitorPlayer_->PushCaptured(samples, sampleCount, channels);
+    if (const auto mixMonitor = mixMonitorPlayer_.load(std::memory_order_acquire)) {
+        mixMonitor->PushCaptured(samples, sampleCount, channels);
     }
 }
 
