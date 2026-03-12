@@ -17,7 +17,7 @@ It is built for people who want to speak and play audio in the same voice channe
 
 Add your settings screenshot here (recommended path: `assets/screenshots/micmix-settings.png`).
 
-<img width="705" height="717" alt="grafik" src="https://github.com/user-attachments/assets/4ed95ffe-ec18-4509-a5a0-a81520272d88" />
+<img width="682" height="722" alt="grafik" src="https://github.com/user-attachments/assets/1c35abc2-b4cf-4ed6-88ec-c1358bf794c6" />
 
 ## What MicMix Can Do
 
