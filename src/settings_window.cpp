@@ -18,6 +18,7 @@
 #include <string>
 
 #include "micmix_core.h"
+#include "micmix_version.h"
 #include "resource.h"
 
 #pragma comment(lib, "Comctl32.lib")
@@ -50,6 +51,7 @@ enum ControlId {
     IDC_MIC_METER_HINT = 1028,
     IDC_GAIN_HINT = 1029,
     IDC_FORCE_TX_HINT = 1030,
+    IDC_VERSION = 1031,
 };
 
 enum class SourceChoiceType {
@@ -560,7 +562,9 @@ void RequestSourceRefresh(HWND hwnd, bool reloadSettings) {
             g_pendingCaptureDevices = std::move(captureDevices);
             g_pendingApps = std::move(apps);
         }
-        PostMessageW(hwnd, kMsgSourceRefreshDone, static_cast<WPARAM>(seq), 0);
+        if (!PostMessageW(hwnd, kMsgSourceRefreshDone, static_cast<WPARAM>(seq), 0)) {
+            LogWarn("settings_window refresh completion post failed");
+        }
     });
     {
         std::lock_guard<std::mutex> lock(g_sourceRefreshThreadMutex);
@@ -830,6 +834,7 @@ void ApplyFonts(HWND hwnd) {
     }, 0);
     SetControlFont(hwnd, IDC_TITLE, g_fontTitle);
     SetControlFont(hwnd, IDC_SUBTITLE, g_fontSmall);
+    SetControlFont(hwnd, IDC_VERSION, g_fontSmall);
     SetControlFont(hwnd, IDC_METER_TEXT, g_fontSmall);
     SetControlFont(hwnd, IDC_MIC_METER_TEXT, g_fontSmall);
     SetControlFont(hwnd, IDC_MONITOR_HINT, g_fontHint ? g_fontHint : g_fontSmall);
@@ -984,9 +989,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_dpi = GetDpiForWindow(hwnd);
         EnsureUiResources();
         ComputeLayout();
+        const std::wstring versionText = Utf8ToWide(std::string("v") + MICMIX_VERSION);
 
         CreateWindowW(L"STATIC", L"MicMix", WS_CHILD | WS_VISIBLE, S(20), S(14), S(220), S(36), hwnd, reinterpret_cast<HMENU>(IDC_TITLE), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Configure MicMix and route one audio source to your mic output", WS_CHILD | WS_VISIBLE, S(22), S(44), S(620), S(20), hwnd, reinterpret_cast<HMENU>(IDC_SUBTITLE), nullptr, nullptr);
+        CreateWindowW(L"STATIC", versionText.c_str(), WS_CHILD | WS_VISIBLE | SS_RIGHT, S(560), S(18), S(120), S(18), hwnd, reinterpret_cast<HMENU>(IDC_VERSION), nullptr, nullptr);
 
         const int labelX = S(36);
         const int fieldX = S(180);
@@ -1208,7 +1215,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         SetBkMode(hdc, TRANSPARENT);
         if (id == IDC_TITLE) {
             SetTextColor(hdc, g_theme.text);
-        } else if (id == IDC_SUBTITLE) {
+        } else if (id == IDC_SUBTITLE || id == IDC_VERSION) {
             SetTextColor(hdc, g_theme.muted);
         } else if (id == IDC_MONITOR_HINT || id == IDC_MIC_METER_HINT || id == IDC_GAIN_HINT || id == IDC_FORCE_TX_HINT) {
             SetTextColor(hdc, g_theme.muted);
@@ -1262,7 +1269,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_hwnd.store(nullptr, std::memory_order_release);
         g_lastStatusText.clear();
         KillTimer(hwnd, 1);
-        JoinSourceRefreshThread();
         ReleaseUiResources();
         PostQuitMessage(0);
         return 0;

@@ -125,7 +125,8 @@ void ts3plugin_registerPluginID(const char* id) {
         return;
     }
     strcpy_s(g_pluginIdRaw, len, id);
-    g_pluginId = id;
+    // SDK note: the incoming id pointer is only valid during this callback.
+    g_pluginId = g_pluginIdRaw;
 }
 
 int ts3plugin_requestAutoload() {

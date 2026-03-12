@@ -2326,14 +2326,15 @@ public:
         : ring_(kTargetRate * 4) {}
 
     ~MixMonitorPlayer() {
-        Stop();
+        SetEnabled(false);
     }
 
     void SetEnabled(bool enabled) {
+        std::lock_guard<std::mutex> lock(stateMutex_);
         if (enabled) {
-            Start();
+            StartLocked();
         } else {
-            Stop();
+            StopLocked();
         }
     }
 
@@ -2377,8 +2378,9 @@ private:
     std::atomic<bool> enabled_{false};
     std::atomic<bool> stop_{false};
     std::atomic_uint64_t droppedSamples_{0};
+    std::mutex stateMutex_;
 
-    void Start() {
+    void StartLocked() {
         if (thread_.joinable()) {
             return;
         }
@@ -2399,7 +2401,7 @@ private:
         }
     }
 
-    void Stop() {
+    void StopLocked() {
         enabled_.store(false, std::memory_order_release);
         stop_.store(true, std::memory_order_release);
         if (thread_.joinable()) {
