@@ -109,6 +109,7 @@ void ts3plugin_shutdown() {
         std::free(g_pluginIdRaw);
         g_pluginIdRaw = nullptr;
     }
+    g_pluginId = nullptr;
 }
 
 void ts3plugin_registerPluginID(const char* id) {

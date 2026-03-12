@@ -563,7 +563,10 @@ void RequestSourceRefresh(HWND hwnd, bool reloadSettings) {
             g_pendingApps = std::move(apps);
         }
         if (!PostMessageW(hwnd, kMsgSourceRefreshDone, static_cast<WPARAM>(seq), 0)) {
-            LogWarn("settings_window refresh completion post failed");
+            const HWND currentHwnd = g_hwnd.load(std::memory_order_acquire);
+            if (currentHwnd != nullptr) {
+                LogWarn("settings_window refresh completion post failed");
+            }
         }
     });
     {
