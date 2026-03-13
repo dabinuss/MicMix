@@ -1198,8 +1198,21 @@ void DrawSourceComboItem(const DRAWITEMSTRUCT* dis) {
     const bool selected = (dis->itemState & ODS_SELECTED) != 0;
     const bool disabled = (dis->itemState & ODS_DISABLED) != 0;
 
-    wchar_t textBuf[512]{};
-    SendMessageW(dis->hwndItem, CB_GETLBTEXT, dis->itemID, reinterpret_cast<LPARAM>(textBuf));
+    std::wstring itemText;
+    const LRESULT textLen = SendMessageW(dis->hwndItem, CB_GETLBTEXTLEN, dis->itemID, 0);
+    if (textLen > 0 && textLen != CB_ERR) {
+        itemText.resize(static_cast<size_t>(textLen) + 1U);
+        const LRESULT copied = SendMessageW(
+            dis->hwndItem,
+            CB_GETLBTEXT,
+            dis->itemID,
+            reinterpret_cast<LPARAM>(itemText.data()));
+        if (copied != CB_ERR && copied >= 0) {
+            itemText.resize(static_cast<size_t>(copied));
+        } else {
+            itemText.clear();
+        }
+    }
 
     RECT rc = dis->rcItem;
     if (selected) {
@@ -1250,7 +1263,7 @@ void DrawSourceComboItem(const DRAWITEMSTRUCT* dis) {
 
     RECT textRc = rc;
     textRc.left = textLeft;
-    DrawTextW(dis->hDC, textBuf, -1, &textRc, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    DrawTextW(dis->hDC, itemText.c_str(), -1, &textRc, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
     if ((dis->itemState & ODS_FOCUS) != 0) {
         RECT focus = rc;

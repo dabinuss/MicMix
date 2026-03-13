@@ -826,13 +826,15 @@ float AudioEngine::DbToLinear(float db) {
 void AudioEngine::ApplySettings(const MicMixSettings& settings) {
     const float gainDb = std::clamp(settings.musicGainDb, -30.0f, -2.0f);
     const int bufferMs = std::clamp(settings.bufferTargetMs, 20, 250);
-    musicMuted_.store(settings.musicMuted, std::memory_order_release);
+    const bool wasMuted = musicMuted_.exchange(settings.musicMuted, std::memory_order_acq_rel);
+    if (settings.musicMuted && !wasMuted) {
+        ring_.Reset();
+    }
     forceTxEnabled_.store(settings.forceTxEnabled, std::memory_order_release);
     musicGainLinear_.store(DbToLinear(gainDb), std::memory_order_release);
     bufferTargetMs_.store(bufferMs, std::memory_order_release);
     micUseSmoothGate_.store(settings.micUseSmoothGate, std::memory_order_release);
     micTalkDetected_.store(false, std::memory_order_release);
-    talkState_.store(false, std::memory_order_release);
     micGateGain_.store(1.0f, std::memory_order_release);
     limiterGain_.store(1.0f, std::memory_order_release);
 }
@@ -864,11 +866,19 @@ void AudioEngine::SetExternalMicLevel(float linear) {
     const float next = std::clamp(prev + ((db - prev) * alpha), -120.0f, 0.0f);
     micRmsDbfs_.store(next, std::memory_order_release);
 }
-void AudioEngine::SetMuted(bool muted) { musicMuted_.store(muted, std::memory_order_release); }
+void AudioEngine::SetMuted(bool muted) {
+    const bool wasMuted = musicMuted_.exchange(muted, std::memory_order_acq_rel);
+    if (muted && !wasMuted) {
+        ring_.Reset();
+    }
+}
 void AudioEngine::ToggleMute() {
     bool expected = musicMuted_.load(std::memory_order_relaxed);
     while (!musicMuted_.compare_exchange_weak(
         expected, !expected, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+    }
+    if (!expected) {
+        ring_.Reset();
     }
 }
 void AudioEngine::ClearMusicBuffer() {
@@ -922,6 +932,10 @@ void AudioEngine::PushMusicSamples(const float* samples, size_t count) {
         const uint64_t nowMs = GetTickCount64();
         sourceClipEvents_.fetch_add(1, std::memory_order_relaxed);
         lastSourceClipTickMs_.store(nowMs, std::memory_order_release);
+    }
+    if (muted) {
+        ring_.Reset();
+        return;
     }
 
     const uint64_t nowMs = GetTickCount64();
@@ -1309,12 +1323,9 @@ public:
         try {
             thread_ = std::thread([this] { Run(); });
             return true;
-        } catch (const std::exception& ex) {
-            SetStatus(SourceState::Error, "thread_start_failed", "Source thread start failed", ex.what());
         } catch (...) {
-            SetStatus(SourceState::Error, "thread_start_failed", "Source thread start failed", "");
+            return false;
         }
-        return false;
     }
 
     void Stop() override {
@@ -1915,6 +1926,7 @@ public:
         if (thread_.joinable()) {
             return;
         }
+        stopRequested_.store(false, std::memory_order_release);
         threadReady_ = false;
         try {
             thread_ = std::thread([this]() { ThreadMain(); });
@@ -1931,6 +1943,7 @@ public:
     }
 
     void Stop() {
+        stopRequested_.store(true, std::memory_order_release);
         DWORD threadId = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1942,6 +1955,7 @@ public:
         if (thread_.joinable()) {
             thread_.join();
         }
+        stopRequested_.store(false, std::memory_order_release);
     }
 
     void ApplySettings(const MicMixSettings& settings) {
@@ -1980,6 +1994,7 @@ private:
     UINT registeredMods_ = 0;
     UINT registeredVk_ = 0;
     bool registeredValid_ = false;
+    std::atomic<bool> stopRequested_{false};
 
     void ApplyRegistration() {
         UINT mods = 0;
@@ -2029,25 +2044,32 @@ private:
 
         ApplyRegistration();
 
-        while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-            if (msg.message == WM_APP + 0x11) {
-                ApplyRegistration();
-                continue;
-            }
-            if (msg.message == WM_APP + 0x12) {
-                break;
-            }
-            if (msg.message == WM_HOTKEY && static_cast<int>(msg.wParam) == kHotkeyId) {
-                if (onHotkey_) {
-                    try {
-                        onHotkey_();
-                    } catch (const std::exception& ex) {
-                        LogError(std::string("mute_hotkey callback exception: ") + ex.what());
-                    } catch (...) {
-                        LogError("mute_hotkey callback exception: unknown");
+        while (!stopRequested_.load(std::memory_order_acquire)) {
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                if (msg.message == WM_APP + 0x11) {
+                    ApplyRegistration();
+                    continue;
+                }
+                if (msg.message == WM_APP + 0x12 || msg.message == WM_QUIT) {
+                    stopRequested_.store(true, std::memory_order_release);
+                    break;
+                }
+                if (msg.message == WM_HOTKEY && static_cast<int>(msg.wParam) == kHotkeyId) {
+                    if (onHotkey_) {
+                        try {
+                            onHotkey_();
+                        } catch (const std::exception& ex) {
+                            LogError(std::string("mute_hotkey callback exception: ") + ex.what());
+                        } catch (...) {
+                            LogError("mute_hotkey callback exception: unknown");
+                        }
                     }
                 }
             }
+            if (stopRequested_.load(std::memory_order_acquire)) {
+                break;
+            }
+            MsgWaitForMultipleObjectsEx(0, nullptr, 200, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         }
 
         UnregisterHotKey(nullptr, kHotkeyId);
@@ -2556,6 +2578,10 @@ bool AudioSourceManager::Start() {
         return false;
     }
     running_ = source_->Start();
+    if (!running_) {
+        source_.reset();
+        SetStatus(SourceState::Error, "thread_start_failed", "Source thread start failed", "");
+    }
     return running_;
 }
 
