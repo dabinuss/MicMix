@@ -99,7 +99,10 @@ std::vector<LoopbackDeviceInfo> g_pendingLoopbacks;
 std::vector<CaptureDeviceInfo> g_pendingCaptureDevices;
 std::vector<AppProcessInfo> g_pendingApps;
 std::atomic_uint64_t g_sourceRefreshSeq{0};
-std::atomic<bool> g_sourceRefreshReloadSettings{false};
+std::atomic<bool> g_sourceRefreshInFlight{false};
+std::atomic<bool> g_sourceRefreshPending{false};
+std::atomic<bool> g_sourceRefreshPendingReload{false};
+std::atomic<bool> g_saveDebouncePending{false};
 std::unordered_map<uint32_t, HICON> g_appIconsByPid;
 HICON g_loopbackFallbackIcon = nullptr;
 HICON g_appFallbackIcon = nullptr;
@@ -108,6 +111,9 @@ constexpr INT_PTR kSourceItemHeader = -10;
 constexpr INT_PTR kSourceItemDivider = -11;
 constexpr INT_PTR kSourceItemPlaceholder = -12;
 constexpr UINT kMsgSourceRefreshDone = WM_APP + 0x31;
+constexpr UINT kTimerStatusUpdate = 1;
+constexpr UINT kTimerDebouncedSave = 2;
+constexpr UINT kDebouncedSaveMs = 300;
 constexpr float kMusicGainMinDb = -30.0f;
 constexpr float kMusicGainMaxDb = -2.0f;
 constexpr int kMusicGainStepPerDb = 10;
@@ -543,13 +549,53 @@ void JoinSourceRefreshThread() {
     worker.join();
 }
 
+bool StartSourceRefreshWorker(HWND hwnd, uint64_t seq) {
+    if (!hwnd) {
+        return false;
+    }
+
+    JoinSourceRefreshThread();
+    try {
+        std::thread worker([hwnd, seq]() {
+            auto& app = MicMixApp::Instance();
+            std::vector<LoopbackDeviceInfo> loopbacks = app.GetLoopbackDevices();
+            std::vector<CaptureDeviceInfo> captureDevices = app.GetCaptureDevices();
+            std::vector<AppProcessInfo> apps = app.GetAppProcesses();
+            {
+                std::lock_guard<std::mutex> lock(g_enumMutex);
+                g_pendingLoopbacks = std::move(loopbacks);
+                g_pendingCaptureDevices = std::move(captureDevices);
+                g_pendingApps = std::move(apps);
+            }
+            if (!PostMessageW(hwnd, kMsgSourceRefreshDone, static_cast<WPARAM>(seq), 0)) {
+                g_sourceRefreshInFlight.store(false, std::memory_order_release);
+                const HWND currentHwnd = g_hwnd.load(std::memory_order_acquire);
+                if (currentHwnd != nullptr) {
+                    LogWarn("settings_window refresh completion post failed");
+                }
+            }
+        });
+        {
+            std::lock_guard<std::mutex> lock(g_sourceRefreshThreadMutex);
+            g_sourceRefreshThread = std::move(worker);
+        }
+        return true;
+    } catch (const std::exception& ex) {
+        g_sourceRefreshInFlight.store(false, std::memory_order_release);
+        LogError(std::string("settings_window refresh thread start failed: ") + ex.what());
+    } catch (...) {
+        g_sourceRefreshInFlight.store(false, std::memory_order_release);
+        LogError("settings_window refresh thread start failed: unknown");
+    }
+    return false;
+}
+
 void RequestSourceRefresh(HWND hwnd, bool reloadSettings) {
     if (!hwnd) {
         return;
     }
-    const uint64_t seq = g_sourceRefreshSeq.fetch_add(1, std::memory_order_acq_rel) + 1ULL;
     if (reloadSettings) {
-        g_sourceRefreshReloadSettings.store(true, std::memory_order_release);
+        g_sourceRefreshPendingReload.store(true, std::memory_order_release);
     }
     HWND refreshBtn = GetDlgItem(hwnd, IDC_RESCAN);
     if (refreshBtn) {
@@ -557,28 +603,16 @@ void RequestSourceRefresh(HWND hwnd, bool reloadSettings) {
     }
     SetStatusText(hwnd, L"Refreshing source list...");
 
-    JoinSourceRefreshThread();
-    std::thread worker([hwnd, seq]() {
-        auto& app = MicMixApp::Instance();
-        std::vector<LoopbackDeviceInfo> loopbacks = app.GetLoopbackDevices();
-        std::vector<CaptureDeviceInfo> captureDevices = app.GetCaptureDevices();
-        std::vector<AppProcessInfo> apps = app.GetAppProcesses();
-        {
-            std::lock_guard<std::mutex> lock(g_enumMutex);
-            g_pendingLoopbacks = std::move(loopbacks);
-            g_pendingCaptureDevices = std::move(captureDevices);
-            g_pendingApps = std::move(apps);
+    if (g_sourceRefreshInFlight.exchange(true, std::memory_order_acq_rel)) {
+        g_sourceRefreshPending.store(true, std::memory_order_release);
+        return;
+    }
+    const uint64_t seq = g_sourceRefreshSeq.fetch_add(1, std::memory_order_acq_rel) + 1ULL;
+    if (!StartSourceRefreshWorker(hwnd, seq)) {
+        if (refreshBtn) {
+            EnableWindow(refreshBtn, TRUE);
         }
-        if (!PostMessageW(hwnd, kMsgSourceRefreshDone, static_cast<WPARAM>(seq), 0)) {
-            const HWND currentHwnd = g_hwnd.load(std::memory_order_acquire);
-            if (currentHwnd != nullptr) {
-                LogWarn("settings_window refresh completion post failed");
-            }
-        }
-    });
-    {
-        std::lock_guard<std::mutex> lock(g_sourceRefreshThreadMutex);
-        g_sourceRefreshThread = std::move(worker);
+        SetStatusText(hwnd, L"Refresh failed to start");
     }
 }
 
@@ -815,10 +849,30 @@ void UpdateStatus(HWND hwnd) {
     UpdateMonitorButton(hwnd);
 }
 
-void ApplyLiveSettings(HWND hwnd, bool restartSource) {
+void FlushDebouncedSettingsSave(HWND hwnd) {
+    if (!hwnd) {
+        return;
+    }
+    KillTimer(hwnd, kTimerDebouncedSave);
+    if (!g_saveDebouncePending.exchange(false, std::memory_order_acq_rel) || g_loadingUi) {
+        return;
+    }
+    auto s = CollectSettings(hwnd);
+    MicMixApp::Instance().ApplySettings(s, false, true);
+}
+
+void ApplyLiveSettings(HWND hwnd, bool restartSource, bool saveImmediately = true) {
     if (g_loadingUi) return;
     auto s = CollectSettings(hwnd);
-    MicMixApp::Instance().ApplySettings(s, restartSource, true);
+    if (saveImmediately) {
+        KillTimer(hwnd, kTimerDebouncedSave);
+        g_saveDebouncePending.store(false, std::memory_order_release);
+        MicMixApp::Instance().ApplySettings(s, restartSource, true);
+    } else {
+        MicMixApp::Instance().ApplySettings(s, restartSource, false);
+        g_saveDebouncePending.store(true, std::memory_order_release);
+        SetTimer(hwnd, kTimerDebouncedSave, kDebouncedSaveMs, nullptr);
+    }
     UpdateStatus(hwnd);
 }
 
@@ -1083,14 +1137,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         LoadSettings(hwnd);
         RequestSourceRefresh(hwnd, true);
         UpdateMonitorButton(hwnd);
-        SetTimer(hwnd, 1, 80, nullptr);
+        SetTimer(hwnd, kTimerStatusUpdate, 80, nullptr);
         UpdateStatus(hwnd);
         return 0;
     }
     case WM_HSCROLL:
         if (reinterpret_cast<HWND>(lParam) == GetDlgItem(hwnd, IDC_GAIN)) {
             UpdateGainLabel(hwnd);
-            ApplyLiveSettings(hwnd, false);
+            ApplyLiveSettings(hwnd, false, false);
         }
         return 0;
     case WM_MEASUREITEM: {
@@ -1116,11 +1170,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return FALSE;
     }
     case kMsgSourceRefreshDone: {
-        const uint64_t seq = static_cast<uint64_t>(wParam);
-        const uint64_t latest = g_sourceRefreshSeq.load(std::memory_order_acquire);
-        if (seq < latest) {
-            return 0;
-        }
+        (void)wParam;
+        JoinSourceRefreshThread();
         {
             std::lock_guard<std::mutex> lock(g_enumMutex);
             g_loopbacks = g_pendingLoopbacks;
@@ -1128,9 +1179,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_apps = g_pendingApps;
         }
         PopulateCombos(hwnd);
-        if (g_sourceRefreshReloadSettings.exchange(false, std::memory_order_acq_rel)) {
+        if (g_sourceRefreshPendingReload.exchange(false, std::memory_order_acq_rel)) {
             LoadSettings(hwnd);
         }
+        g_sourceRefreshInFlight.store(false, std::memory_order_release);
+
+        if (g_sourceRefreshPending.exchange(false, std::memory_order_acq_rel)) {
+            const uint64_t nextSeq = g_sourceRefreshSeq.fetch_add(1, std::memory_order_acq_rel) + 1ULL;
+            g_sourceRefreshInFlight.store(true, std::memory_order_release);
+            SetStatusText(hwnd, L"Refreshing source list...");
+            if (!StartSourceRefreshWorker(hwnd, nextSeq)) {
+                g_sourceRefreshInFlight.store(false, std::memory_order_release);
+                HWND refreshBtn = GetDlgItem(hwnd, IDC_RESCAN);
+                if (refreshBtn) {
+                    EnableWindow(refreshBtn, TRUE);
+                }
+                SetStatusText(hwnd, L"Refresh failed to start");
+            }
+            return 0;
+        }
+
         HWND refreshBtn = GetDlgItem(hwnd, IDC_RESCAN);
         if (refreshBtn) {
             EnableWindow(refreshBtn, TRUE);
@@ -1139,10 +1207,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_TIMER:
-        if ((++g_hotkeyRefreshTick % 8) == 0) {
-            UpdateMuteHotkeyLabel(hwnd);
+        if (wParam == kTimerDebouncedSave) {
+            FlushDebouncedSettingsSave(hwnd);
+            return 0;
         }
-        UpdateStatus(hwnd);
+        if (wParam == kTimerStatusUpdate) {
+            if ((++g_hotkeyRefreshTick % 8) == 0) {
+                UpdateMuteHotkeyLabel(hwnd);
+            }
+            UpdateStatus(hwnd);
+            return 0;
+        }
         return 0;
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
@@ -1193,7 +1268,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             UpdateStatus(hwnd);
             return 0;
         case IDC_SAVE:
-            ApplyLiveSettings(hwnd, false);
+            ApplyLiveSettings(hwnd, false, true);
             MicMixApp::Instance().StopSource();
             MicMixApp::Instance().StartSource();
             UpdateStatus(hwnd);
@@ -1306,6 +1381,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_ERASEBKGND:
         return 1;
     case WM_CLOSE:
+        FlushDebouncedSettingsSave(hwnd);
         if (MicMixApp::Instance().IsMonitorEnabled()) {
             MicMixApp::Instance().SetMonitorEnabled(false);
         }
@@ -1316,8 +1392,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             MicMixApp::Instance().SetMonitorEnabled(false);
         }
         g_hwnd.store(nullptr, std::memory_order_release);
+        g_sourceRefreshInFlight.store(false, std::memory_order_release);
+        g_sourceRefreshPending.store(false, std::memory_order_release);
+        g_sourceRefreshPendingReload.store(false, std::memory_order_release);
+        g_saveDebouncePending.store(false, std::memory_order_release);
         g_lastStatusText.clear();
-        KillTimer(hwnd, 1);
+        KillTimer(hwnd, kTimerStatusUpdate);
+        KillTimer(hwnd, kTimerDebouncedSave);
         ReleaseUiResources();
         PostQuitMessage(0);
         return 0;

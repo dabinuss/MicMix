@@ -86,4 +86,6 @@ third_party/speexdsp/
 
 # Lokale Entwicklungsnotizen (nicht veroeffentlichen)
 LOCAL_DEV.md
+AGENTS.md
 .claude/settings.local.json
+scripts/deploy_ts3_plugin.ps1
