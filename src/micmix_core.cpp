@@ -48,6 +48,7 @@ constexpr uint64_t kVoiceTxReapplyMs = 12000ULL;
 constexpr uint64_t kCaptureWatchdogSilenceMs = 4500ULL;
 constexpr uint64_t kCaptureWatchdogCooldownMs = 12000ULL;
 constexpr uint64_t kMusicMetaUpdateMinIntervalMs = 2000ULL;
+constexpr uint64_t kClipIndicatorHoldMs = 2600ULL;
 constexpr uint32_t kMinSupportedSourceRate = 8000;
 constexpr uint32_t kMaxSupportedSourceRate = 384000;
 
@@ -842,10 +843,13 @@ void AudioEngine::SetMusicSourceRunning(bool running) {
         ring_.Reset();
         micTalkDetected_.store(false, std::memory_order_release);
         micRmsDbfs_.store(-120.0f, std::memory_order_release);
+        micPeakDbfs_.store(-120.0f, std::memory_order_release);
         externalMicLinear_.store(0.0f, std::memory_order_release);
         musicRmsDbfs_.store(-120.0f, std::memory_order_release);
         musicPeakDbfs_.store(-120.0f, std::memory_order_release);
         musicSendPeakDbfs_.store(-120.0f, std::memory_order_release);
+        lastSourceClipTickMs_.store(0, std::memory_order_release);
+        sourceClipState_.store(false, std::memory_order_release);
         micGateGain_.store(1.0f, std::memory_order_release);
         limiterGain_.store(1.0f, std::memory_order_release);
     }
@@ -880,12 +884,16 @@ void AudioEngine::PushMusicSamples(const float* samples, size_t count) {
     const float gain = musicGainLinear_.load(std::memory_order_relaxed);
     float sq = 0.0f;
     float peak = 0.0f;
+    bool sourceClipped = false;
     for (size_t i = 0; i < count; ++i) {
         const float v = muted ? 0.0f : (samples[i] * gain);
         sq += v * v;
         const float a = std::fabs(v);
         if (a > peak) {
             peak = a;
+        }
+        if (a >= 1.0f) {
+            sourceClipped = true;
         }
     }
     const float rms = std::sqrt(sq / static_cast<float>(count));
@@ -908,6 +916,12 @@ void AudioEngine::PushMusicSamples(const float* samples, size_t count) {
     // force-send windows when only near-silence is present.
     if (peakDb > -72.0f || rmsDb > -78.0f) {
         lastMusicSignalTickMs_.store(GetTickCount64(), std::memory_order_release);
+    }
+    const bool sourceWasClipped = sourceClipState_.exchange(sourceClipped, std::memory_order_acq_rel);
+    if (sourceClipped && !sourceWasClipped) {
+        const uint64_t nowMs = GetTickCount64();
+        sourceClipEvents_.fetch_add(1, std::memory_order_relaxed);
+        lastSourceClipTickMs_.store(nowMs, std::memory_order_release);
     }
 
     const uint64_t nowMs = GetTickCount64();
@@ -940,6 +954,8 @@ TelemetrySnapshot AudioEngine::SnapshotTelemetry() const {
     t.underruns = underruns_.load(std::memory_order_relaxed);
     t.overruns = overruns_.load(std::memory_order_relaxed);
     t.clippedSamples = clippedSamples_.load(std::memory_order_relaxed);
+    t.sourceClipEvents = sourceClipEvents_.load(std::memory_order_relaxed);
+    t.micClipEvents = micClipEvents_.load(std::memory_order_relaxed);
     t.reconnects = reconnectsMirror_.load(std::memory_order_relaxed);
     t.musicRmsDbfs = musicRmsDbfs_.load(std::memory_order_relaxed);
     t.musicPeakDbfs = musicPeakDbfs_.load(std::memory_order_relaxed);
@@ -947,8 +963,13 @@ TelemetrySnapshot AudioEngine::SnapshotTelemetry() const {
     t.talkStateActive = talkState_.load(std::memory_order_relaxed);
     t.micTalkDetected = micTalkDetected_.load(std::memory_order_relaxed);
     t.micRmsDbfs = micRmsDbfs_.load(std::memory_order_relaxed);
+    t.micPeakDbfs = micPeakDbfs_.load(std::memory_order_relaxed);
     const uint64_t lastSignalMs = lastMusicSignalTickMs_.load(std::memory_order_relaxed);
+    const uint64_t lastSourceClipMs = lastSourceClipTickMs_.load(std::memory_order_relaxed);
+    const uint64_t lastMicClipMs = lastMicClipTickMs_.load(std::memory_order_relaxed);
     t.musicActive = sourceRunning_.load(std::memory_order_relaxed) && (nowMs <= (lastSignalMs + 1200ULL));
+    t.sourceClipRecent = (lastSourceClipMs != 0ULL) && (nowMs <= (lastSourceClipMs + kClipIndicatorHoldMs));
+    t.micClipRecent = (lastMicClipMs != 0ULL) && (nowMs <= (lastMicClipMs + kClipIndicatorHoldMs));
     return t;
 }
 
@@ -1011,11 +1032,19 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
     const bool recentMusicSignal = sourceRunning && !muted && (nowMs <= (lastSignalMs + kForceTxMusicWindowMs));
 
     float micRmsAcc = 0.0f;
+    float micPeak = 0.0f;
+    bool micClipped = false;
     for (int i = 0; i < sampleCount; ++i) {
         float micMono = 0.0f;
         for (int ch = 0; ch < channels; ++ch) {
             const int idx = (i * channels) + ch;
-            micMono += static_cast<float>(samples[idx]) / 32768.0f;
+            const short inSample = samples[idx];
+            if (std::abs(static_cast<int>(inSample)) >= 32760) {
+                micClipped = true;
+            }
+            const float micLinear = static_cast<float>(inSample) / 32768.0f;
+            micMono += micLinear;
+            micPeak = std::max(micPeak, std::fabs(micLinear));
         }
         micMono /= static_cast<float>(channels);
         micRmsAcc += micMono * micMono;
@@ -1026,6 +1055,18 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
     const float micAlpha = (micRmsDb > prevMicRms) ? 0.25f : 0.10f;
     const float nextMicRms = std::clamp(prevMicRms + ((micRmsDb - prevMicRms) * micAlpha), -120.0f, 0.0f);
     micRmsDbfs_.store(nextMicRms, std::memory_order_release);
+    const float micPeakDb = 20.0f * std::log10(std::max(micPeak, 0.000001f));
+    const float prevMicPeakDb = micPeakDbfs_.load(std::memory_order_relaxed);
+    float nextMicPeakDb = micPeakDb;
+    if (micPeakDb < prevMicPeakDb) {
+        nextMicPeakDb = std::max(micPeakDb, prevMicPeakDb - 1.8f);
+    }
+    micPeakDbfs_.store(std::clamp(nextMicPeakDb, -120.0f, 0.0f), std::memory_order_release);
+    const bool micWasClipped = micClipState_.exchange(micClipped, std::memory_order_acq_rel);
+    if (micClipped && !micWasClipped) {
+        micClipEvents_.fetch_add(1, std::memory_order_relaxed);
+        lastMicClipTickMs_.store(nowMs, std::memory_order_release);
+    }
     micTalkDetected_.store(talkOpen, std::memory_order_release);
 
     if (!sourceRunning || muted || !hasQueuedMusic) {

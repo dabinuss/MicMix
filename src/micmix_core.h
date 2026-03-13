@@ -88,14 +88,19 @@ struct TelemetrySnapshot {
     uint64_t underruns = 0;
     uint64_t overruns = 0;
     uint64_t clippedSamples = 0;
+    uint64_t sourceClipEvents = 0;
+    uint64_t micClipEvents = 0;
     uint64_t reconnects = 0;
     float musicRmsDbfs = -120.0f;
     float musicPeakDbfs = -120.0f;
     float musicSendPeakDbfs = -120.0f;
     bool  musicActive = false;
+    bool  sourceClipRecent = false;
     bool  talkStateActive = false;
     bool  micTalkDetected = false;
+    bool  micClipRecent = false;
     float micRmsDbfs = -120.0f;
+    float micPeakDbfs = -120.0f;
 };
 
 extern TS3Functions g_ts3Functions;
@@ -250,6 +255,7 @@ private:
     std::atomic<bool>  talkState_{true};
     std::atomic<bool>  micTalkDetected_{false};
     std::atomic<float> micRmsDbfs_{-120.0f};
+    std::atomic<float> micPeakDbfs_{-120.0f};
     std::atomic<float> externalMicLinear_{0.0f};
     std::atomic<float> micGateGain_{1.0f};
     std::atomic<float> limiterGain_{1.0f};
@@ -258,10 +264,16 @@ private:
     std::atomic_uint64_t underruns_{0};
     std::atomic_uint64_t overruns_{0};
     std::atomic_uint64_t clippedSamples_{0};
+    std::atomic_uint64_t sourceClipEvents_{0};
+    std::atomic_uint64_t micClipEvents_{0};
     std::atomic_uint64_t reconnectsMirror_{0};
     std::atomic_uint64_t lastConsumeTickMs_{0};
     std::atomic_uint64_t lastMusicSignalTickMs_{0};
+    std::atomic_uint64_t lastSourceClipTickMs_{0};
+    std::atomic_uint64_t lastMicClipTickMs_{0};
     std::atomic_uint64_t lastMicTalkTickMs_{0};
+    std::atomic<bool> sourceClipState_{false};
+    std::atomic<bool> micClipState_{false};
     std::atomic<float> musicRmsDbfs_{-120.0f};
     std::atomic<float> musicPeakDbfs_{-120.0f};
     std::atomic<float> musicSendPeakDbfs_{-120.0f};
