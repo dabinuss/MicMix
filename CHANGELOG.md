@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.2.6] - 2026-03-13
+
+### Added
+
+- Added clip telemetry event counters and dedicated clip strip visuals in the settings UI for both source and microphone paths.
+- Added source entry icons with fallback behavior to improve source selection clarity.
+
+### Changed
+
+- Polished settings window layout, spacing, control styling, and interaction feedback (including cursor behavior for interactive controls).
+- Improved running-app source selection heuristics to prioritize more relevant app sessions.
+- Improved release metadata/version handling by deriving build version from tag workflow and keeping local version files in sync.
+
+### Fixed
+
+- Fixed plugin ID lifetime handling and settings window refresh/save flow regressions that could cause instability.
+- Hardened TeamSpeak lifecycle/shutdown paths to reduce teardown race risks (capture/meta/logging related paths).
+- Fixed a potential source-combo text buffer overflow by switching to length-aware dynamic retrieval.
+- Fixed a potential deadlock path when source thread startup fails.
+- Fixed a potential hotkey thread shutdown hang by using explicit stop signaling and non-blocking message wait behavior.
+- Fixed transient talk-gate dropouts on live settings apply by preserving runtime talk state.
+- Fixed muted-buffer stale audio backlog by clearing/skipping queued music while muted.
+
 ## [1.2.5] - 2026-03-12
 
 ### Fixed
