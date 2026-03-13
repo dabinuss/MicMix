@@ -164,6 +164,26 @@ bool IsOwnerCheckboxControlId(int id) {
     return id == IDC_AUTOSTART || id == IDC_FORCE_TX || id == IDC_MUTE;
 }
 
+bool IsHandCursorControlId(int id) {
+    switch (id) {
+    case IDC_REPO_LINK:
+    case IDC_SOURCE:
+    case IDC_MIC_DEVICE:
+    case IDC_RESCAN:
+    case IDC_START:
+    case IDC_STOP:
+    case IDC_SAVE:
+    case IDC_MONITOR:
+    case IDC_AUTOSTART:
+    case IDC_FORCE_TX:
+    case IDC_MUTE:
+    case IDC_MUTE_HOTKEY_SET:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool GetOwnerCheckboxValue(int id) {
     switch (id) {
     case IDC_AUTOSTART: return g_ownerAutostartChecked;
@@ -1314,7 +1334,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const int sourceW = contentRight - fieldX - controlGap - refreshButtonW;
         const int micComboW = contentRight - fieldX;
         const int statusTextX = fieldX + meterW + S(4);
-        const int statusTextW = (contentRight - statusTextX) + S(4);
+        const int statusTextW = contentRight - statusTextX;
         const int valueTextX = fieldX + gainSliderW;
         const int muteToggleX = fieldX + S(262);
         const int hintTopOffset = S(38);
@@ -1367,16 +1387,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, statusTextX, S(456), statusTextW, S(20), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_CLIP_EVENTS), nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Send music when mic is silent", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, fieldX, S(470), S(260), S(28), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX), nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Mute music", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, muteToggleX, S(470), S(120), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUTE), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Music keeps sending even when you are not speaking", WS_CHILD | WS_VISIBLE, fieldX, S(500), S(360), S(16), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX_HINT), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Mic Meter", WS_CHILD | WS_VISIBLE, labelX, S(518), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        g_rcMicMeter = { fieldX, S(516), fieldX + meterW, S(516) + S(20) };
-        g_rcMicClip = { fieldX, S(536), fieldX + meterW, S(536) + S(12) };
-        CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, statusTextX, S(518), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_TEXT), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, statusTextX, S(536), statusTextW, S(20), hwnd, reinterpret_cast<HMENU>(IDC_MIC_CLIP_EVENTS), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Only while connected", WS_CHILD | WS_VISIBLE, fieldX, S(554), S(180), S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_HINT), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"MicMix-Mute-Hotkey", WS_CHILD | WS_VISIBLE, labelX, S(572), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Set...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, fieldX, S(568), S(160), S(30), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_SET), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Current: Not set", WS_CHILD | WS_VISIBLE, fieldX + S(172), S(572), S(290), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_TEXT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Music keeps sending even when you are not speaking", WS_CHILD | WS_VISIBLE, fieldX, S(500), S(360), S(18), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX_HINT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Mic Meter", WS_CHILD | WS_VISIBLE, labelX, S(520), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
+        g_rcMicMeter = { fieldX, S(518), fieldX + meterW, S(518) + S(20) };
+        g_rcMicClip = { fieldX, S(538), fieldX + meterW, S(538) + S(12) };
+        CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, statusTextX, S(520), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_TEXT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, statusTextX, S(538), statusTextW, S(20), hwnd, reinterpret_cast<HMENU>(IDC_MIC_CLIP_EVENTS), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Only while connected", WS_CHILD | WS_VISIBLE, fieldX, S(556), S(180), S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_HINT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"MicMix-Mute-Hotkey", WS_CHILD | WS_VISIBLE, labelX, S(574), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Set...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, fieldX, S(570), S(160), S(30), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_SET), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Current: Not set", WS_CHILD | WS_VISIBLE, fieldX + S(172), S(574), S(290), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_TEXT), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"State: Stopped", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX, statusX, statusY, statusW, statusH, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), nullptr, nullptr);
 
         ApplyControlTheme(hwnd);
@@ -1615,12 +1635,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return reinterpret_cast<INT_PTR>(inCard ? g_brushCard : g_brushBg);
     }
-    case WM_SETCURSOR:
-        if (reinterpret_cast<HWND>(wParam) == GetDlgItem(hwnd, IDC_REPO_LINK)) {
-            SetCursor(LoadCursorW(nullptr, IDC_HAND));
-            return TRUE;
+    case WM_SETCURSOR: {
+        const HWND target = reinterpret_cast<HWND>(wParam);
+        const UINT hit = LOWORD(lParam);
+        if (target && hit == HTCLIENT) {
+            const int id = GetDlgCtrlID(target);
+            if (id == IDC_GAIN) {
+                SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                return TRUE;
+            }
+            if (IsHandCursorControlId(id)) {
+                SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                return TRUE;
+            }
         }
         return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
     case WM_PAINT: {
         PAINTSTRUCT ps{};
         HDC hdc = BeginPaint(hwnd, &ps);
