@@ -108,6 +108,9 @@ std::atomic<bool> g_saveDebouncePending{false};
 std::unordered_map<uint32_t, HICON> g_appIconsByPid;
 HICON g_loopbackFallbackIcon = nullptr;
 HICON g_appFallbackIcon = nullptr;
+bool g_ownerAutostartChecked = false;
+bool g_ownerForceTxChecked = false;
+bool g_ownerMuteChecked = false;
 
 constexpr INT_PTR kSourceItemHeader = -10;
 constexpr INT_PTR kSourceItemDivider = -11;
@@ -133,6 +136,7 @@ HFONT g_fontSmall = nullptr;
 HFONT g_fontHint = nullptr;
 HFONT g_fontTiny = nullptr;
 HFONT g_fontClipInfo = nullptr;
+HFONT g_fontControlLarge = nullptr;
 HFONT g_fontTitle = nullptr;
 HFONT g_fontMono = nullptr;
 HBRUSH g_brushBg = nullptr;
@@ -154,6 +158,28 @@ std::wstring g_lastStatusText;
 
 int S(int px) {
     return MulDiv(px, g_dpi, 96);
+}
+
+bool IsOwnerCheckboxControlId(int id) {
+    return id == IDC_AUTOSTART || id == IDC_FORCE_TX || id == IDC_MUTE;
+}
+
+bool GetOwnerCheckboxValue(int id) {
+    switch (id) {
+    case IDC_AUTOSTART: return g_ownerAutostartChecked;
+    case IDC_FORCE_TX: return g_ownerForceTxChecked;
+    case IDC_MUTE: return g_ownerMuteChecked;
+    default: return false;
+    }
+}
+
+void SetOwnerCheckboxValue(int id, bool value) {
+    switch (id) {
+    case IDC_AUTOSTART: g_ownerAutostartChecked = value; break;
+    case IDC_FORCE_TX: g_ownerForceTxChecked = value; break;
+    case IDC_MUTE: g_ownerMuteChecked = value; break;
+    default: break;
+    }
 }
 
 std::wstring Utf8ToWide(const std::string& text) {
@@ -314,6 +340,7 @@ void EnsureUiResources() {
     if (!g_fontTitle) g_fontTitle = CreateFontW(-S(24), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI Semibold");
     if (!g_fontTiny) g_fontTiny = CreateFontW(-S(10), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     if (!g_fontClipInfo) g_fontClipInfo = CreateFontW(-S(10), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    if (!g_fontControlLarge) g_fontControlLarge = CreateFontW(-S(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     if (!g_fontMono) g_fontMono = CreateFontW(-S(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
     EnsureFallbackIcons();
 }
@@ -327,6 +354,7 @@ void ReleaseUiResources() {
     if (g_fontHint) { DeleteObject(g_fontHint); g_fontHint = nullptr; }
     if (g_fontTiny) { DeleteObject(g_fontTiny); g_fontTiny = nullptr; }
     if (g_fontClipInfo) { DeleteObject(g_fontClipInfo); g_fontClipInfo = nullptr; }
+    if (g_fontControlLarge) { DeleteObject(g_fontControlLarge); g_fontControlLarge = nullptr; }
     if (g_fontTitle) { DeleteObject(g_fontTitle); g_fontTitle = nullptr; }
     if (g_fontMono) { DeleteObject(g_fontMono); g_fontMono = nullptr; }
     if (g_brushBg) { DeleteObject(g_brushBg); g_brushBg = nullptr; }
@@ -800,9 +828,12 @@ void LoadSettings(HWND hwnd) {
     }
 
     SendMessageW(GetDlgItem(hwnd, IDC_GAIN), TBM_SETPOS, TRUE, GainDbToSlider(s.musicGainDb));
-    SendMessageW(GetDlgItem(hwnd, IDC_FORCE_TX), BM_SETCHECK, s.forceTxEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(GetDlgItem(hwnd, IDC_MUTE), BM_SETCHECK, s.musicMuted ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(GetDlgItem(hwnd, IDC_AUTOSTART), BM_SETCHECK, s.autostartEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    SetOwnerCheckboxValue(IDC_FORCE_TX, s.forceTxEnabled);
+    SetOwnerCheckboxValue(IDC_MUTE, s.musicMuted);
+    SetOwnerCheckboxValue(IDC_AUTOSTART, s.autostartEnabled);
+    InvalidateRect(GetDlgItem(hwnd, IDC_FORCE_TX), nullptr, TRUE);
+    InvalidateRect(GetDlgItem(hwnd, IDC_MUTE), nullptr, TRUE);
+    InvalidateRect(GetDlgItem(hwnd, IDC_AUTOSTART), nullptr, TRUE);
     g_muteHotkeyModifiers = static_cast<UINT>(std::max(0, s.muteHotkeyModifiers));
     g_muteHotkeyVk = static_cast<UINT>(std::max(0, s.muteHotkeyVk));
     UpdateGainLabel(hwnd);
@@ -835,9 +866,9 @@ MicMixSettings CollectSettings(HWND hwnd) {
     }
 
     s.musicGainDb = SliderToGainDb(static_cast<int>(SendMessageW(GetDlgItem(hwnd, IDC_GAIN), TBM_GETPOS, 0, 0)));
-    s.forceTxEnabled = SendMessageW(GetDlgItem(hwnd, IDC_FORCE_TX), BM_GETCHECK, 0, 0) == BST_CHECKED;
-    s.musicMuted = SendMessageW(GetDlgItem(hwnd, IDC_MUTE), BM_GETCHECK, 0, 0) == BST_CHECKED;
-    s.autostartEnabled = SendMessageW(GetDlgItem(hwnd, IDC_AUTOSTART), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    s.forceTxEnabled = GetOwnerCheckboxValue(IDC_FORCE_TX);
+    s.musicMuted = GetOwnerCheckboxValue(IDC_MUTE);
+    s.autostartEnabled = GetOwnerCheckboxValue(IDC_AUTOSTART);
     s.muteHotkeyModifiers = static_cast<int>(g_muteHotkeyModifiers);
     s.muteHotkeyVk = static_cast<int>(g_muteHotkeyVk);
     return s;
@@ -848,15 +879,9 @@ void UpdateStatus(HWND hwnd) {
     const MicMixSettings s = app.GetSettings();
     const SourceStatus st = app.GetSourceStatus();
     const TelemetrySnapshot t = app.GetTelemetry();
-    HWND muteCtl = GetDlgItem(hwnd, IDC_MUTE);
-    if (muteCtl) {
-        const LRESULT current = SendMessageW(muteCtl, BM_GETCHECK, 0, 0);
-        const LRESULT want = s.musicMuted ? BST_CHECKED : BST_UNCHECKED;
-        if (current != want) {
-            g_loadingUi = true;
-            SendMessageW(muteCtl, BM_SETCHECK, static_cast<WPARAM>(want), 0);
-            g_loadingUi = false;
-        }
+    if (GetOwnerCheckboxValue(IDC_MUTE) != s.musicMuted) {
+        SetOwnerCheckboxValue(IDC_MUTE, s.musicMuted);
+        InvalidateRect(GetDlgItem(hwnd, IDC_MUTE), nullptr, TRUE);
     }
     g_lastTelemetry = t;
     {
@@ -920,12 +945,33 @@ void ApplyControlTheme(HWND hwnd) {
     EnumChildWindows(hwnd, [](HWND child, LPARAM) -> BOOL {
         wchar_t className[32]{};
         GetClassNameW(child, className, static_cast<int>(std::size(className)));
-        if (_wcsicmp(className, WC_COMBOBOXW) == 0 ||
-            _wcsicmp(className, WC_BUTTONW) == 0 ||
-            _wcsicmp(className, TRACKBAR_CLASSW) == 0) {
-            // Keep controls on native Windows visual style (no Explorer override)
-            // to stay closer to TS3's neutral UI widgets.
-            SetWindowTheme(child, nullptr, nullptr);
+        if (_wcsicmp(className, WC_COMBOBOXW) == 0) {
+            // Use modern native common-control rendering while staying in Win32.
+            // This is a low-risk visual refresh without changing control behavior.
+            SetWindowTheme(child, L"Explorer", nullptr);
+        }
+        if (_wcsicmp(className, TRACKBAR_CLASSW) == 0) {
+            // Keep custom slider visuals without native focus frame around the control.
+            SetWindowTheme(child, L"", L"");
+        }
+        if (_wcsicmp(className, WC_BUTTONW) == 0) {
+            const LONG_PTR style = GetWindowLongPtrW(child, GWL_STYLE);
+            const LONG_PTR type = (style & BS_TYPEMASK);
+            if (type == BS_PUSHBUTTON || type == BS_DEFPUSHBUTTON ||
+                type == BS_CHECKBOX || type == BS_AUTOCHECKBOX) {
+                SetWindowLongPtrW(child, GWL_STYLE, style | BS_FLAT);
+            }
+            const int childId = static_cast<int>(GetDlgCtrlID(child));
+            const bool ownerCheckbox = (type == BS_OWNERDRAW) && IsOwnerCheckboxControlId(childId);
+            if (type == BS_CHECKBOX || type == BS_AUTOCHECKBOX) {
+                // Force classic checkbox glyph rendering for a clear thin dark/light border.
+                SetWindowTheme(child, L"", L"");
+            } else if (ownerCheckbox) {
+                // Owner-drawn checkboxes should not get themed focus/hot borders.
+                SetWindowTheme(child, L"", L"");
+            } else {
+                SetWindowTheme(child, L"Explorer", nullptr);
+            }
         }
         return TRUE;
     }, 0);
@@ -944,6 +990,9 @@ void ApplyFonts(HWND hwnd) {
     SetControlFont(hwnd, IDC_MIC_METER_TEXT, g_fontSmall);
     SetControlFont(hwnd, IDC_MUSIC_CLIP_EVENTS, g_fontClipInfo ? g_fontClipInfo : (g_fontHint ? g_fontHint : g_fontSmall));
     SetControlFont(hwnd, IDC_MIC_CLIP_EVENTS, g_fontClipInfo ? g_fontClipInfo : (g_fontHint ? g_fontHint : g_fontSmall));
+    SetControlFont(hwnd, IDC_AUTOSTART, g_fontControlLarge ? g_fontControlLarge : g_fontBody);
+    SetControlFont(hwnd, IDC_FORCE_TX, g_fontControlLarge ? g_fontControlLarge : g_fontBody);
+    SetControlFont(hwnd, IDC_MUTE, g_fontControlLarge ? g_fontControlLarge : g_fontBody);
     SetControlFont(hwnd, IDC_MONITOR_HINT, g_fontHint ? g_fontHint : g_fontSmall);
     SetControlFont(hwnd, IDC_MIC_METER_HINT, g_fontHint ? g_fontHint : g_fontSmall);
     SetControlFont(hwnd, IDC_GAIN_HINT, g_fontHint ? g_fontHint : g_fontSmall);
@@ -1022,6 +1071,43 @@ void DrawLevelMeter(HDC hdc, const RECT& meterRect, bool active, float visualDb,
     SelectObject(hdc, oldBrush);
     SelectObject(hdc, oldPen);
     DeleteObject(border);
+}
+
+LRESULT DrawGainSliderCustom(const NMCUSTOMDRAW* cd) {
+    if (!cd) {
+        return CDRF_DODEFAULT;
+    }
+    if (cd->dwDrawStage == CDDS_PREPAINT) {
+        return CDRF_NOTIFYITEMDRAW;
+    }
+    if (cd->dwDrawStage != CDDS_ITEMPREPAINT) {
+        return CDRF_DODEFAULT;
+    }
+
+    const DWORD item = static_cast<DWORD>(cd->dwItemSpec);
+    const RECT rc = cd->rc;
+    if (item == TBCD_CHANNEL) {
+        RECT line = rc;
+        const int centerY = (rc.top + rc.bottom) / 2;
+        line.top = centerY;
+        line.bottom = centerY + 1;
+        FillSolidRect(cd->hdc, line, RGB(204, 212, 223));
+        return CDRF_SKIPDEFAULT;
+    }
+    if (item == TBCD_THUMB) {
+        RECT thumb = rc;
+        FillSolidRect(cd->hdc, thumb, RGB(245, 248, 252));
+        const COLORREF borderColor = GetSysColor(COLOR_BTNSHADOW);
+        HPEN border = CreatePen(PS_SOLID, 1, borderColor);
+        HGDIOBJ oldPen = SelectObject(cd->hdc, border);
+        HGDIOBJ oldBrush = SelectObject(cd->hdc, GetStockObject(HOLLOW_BRUSH));
+        Rectangle(cd->hdc, thumb.left, thumb.top, thumb.right, thumb.bottom);
+        SelectObject(cd->hdc, oldBrush);
+        SelectObject(cd->hdc, oldPen);
+        DeleteObject(border);
+        return CDRF_SKIPDEFAULT;
+    }
+    return CDRF_DODEFAULT;
 }
 
 void DrawClipStrip(HDC hdc, const RECT& rcStrip, float dangerUnit, bool clipRecent) {
@@ -1154,6 +1240,59 @@ void DrawSourceComboItem(const DRAWITEMSTRUCT* dis) {
     }
 }
 
+void DrawOwnerCheckbox(const DRAWITEMSTRUCT* dis) {
+    if (!dis) {
+        return;
+    }
+    RECT rc = dis->rcItem;
+    FillSolidRect(dis->hDC, rc, g_theme.card);
+
+    const bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+    const bool checked = GetOwnerCheckboxValue(dis->CtlID);
+
+    const int boxSize = S(15);
+    RECT box{
+        rc.left + S(2),
+        rc.top + ((rc.bottom - rc.top - boxSize) / 2),
+        rc.left + S(2) + boxSize,
+        rc.top + ((rc.bottom - rc.top - boxSize) / 2) + boxSize
+    };
+
+    FillSolidRect(dis->hDC, box, RGB(252, 253, 255));
+
+    // Uniform thin 1px border.
+    const COLORREF borderColor = disabled ? GetSysColor(COLOR_GRAYTEXT) : GetSysColor(COLOR_BTNSHADOW);
+    HPEN border = CreatePen(PS_SOLID, 1, borderColor);
+    HGDIOBJ oldPen = SelectObject(dis->hDC, border);
+    HGDIOBJ oldBrush = SelectObject(dis->hDC, GetStockObject(HOLLOW_BRUSH));
+    Rectangle(dis->hDC, box.left, box.top, box.right, box.bottom);
+    SelectObject(dis->hDC, oldBrush);
+    SelectObject(dis->hDC, oldPen);
+    DeleteObject(border);
+
+    if (checked) {
+        HPEN markPen = CreatePen(PS_SOLID, std::max(1, S(2)), disabled ? RGB(130, 136, 148) : RGB(54, 68, 92));
+        HGDIOBJ oldMarkPen = SelectObject(dis->hDC, markPen);
+        const int pad = S(3);
+        MoveToEx(dis->hDC, box.left + pad, box.top + pad, nullptr);
+        LineTo(dis->hDC, box.right - pad - 1, box.bottom - pad - 1);
+        MoveToEx(dis->hDC, box.right - pad - 1, box.top + pad, nullptr);
+        LineTo(dis->hDC, box.left + pad, box.bottom - pad - 1);
+        SelectObject(dis->hDC, oldMarkPen);
+        DeleteObject(markPen);
+    }
+
+    wchar_t text[256]{};
+    GetWindowTextW(dis->hwndItem, text, static_cast<int>(std::size(text)));
+    RECT textRc = rc;
+    textRc.left = box.right + S(8);
+    SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, disabled ? RGB(144, 150, 162) : g_theme.text);
+    SelectObject(dis->hDC, g_fontControlLarge ? g_fontControlLarge : g_fontBody);
+    DrawTextW(dis->hDC, text, -1, &textRc, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
@@ -1196,37 +1335,39 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         CreateWindowW(L"BUTTON", L"Restart Source", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, contentLeft + (actionButtonW + controlGap) * 2, S(108), actionButtonW, S(34), hwnd, reinterpret_cast<HMENU>(IDC_SAVE), nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Monitor Mix: Off", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, contentLeft + (actionButtonW + controlGap) * 3, S(108), monitorButtonW, S(34), hwnd, reinterpret_cast<HMENU>(IDC_MONITOR), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Only while connected", WS_CHILD | WS_VISIBLE, contentLeft + (actionButtonW + controlGap) * 3, S(108) + hintTopOffset, S(162), S(18), hwnd, reinterpret_cast<HMENU>(IDC_MONITOR_HINT), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Auto-enable when TeamSpeak starts", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, contentLeft, S(170), S(320), S(24), hwnd, reinterpret_cast<HMENU>(IDC_AUTOSTART), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Auto-enable when TeamSpeak starts", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, contentLeft, S(170), S(320), S(28), hwnd, reinterpret_cast<HMENU>(IDC_AUTOSTART), nullptr, nullptr);
 
         CreateWindowW(L"STATIC", L"Audio Source", WS_CHILD | WS_VISIBLE, labelX, S(252), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        HWND source = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS, fieldX, S(248), sourceW, S(360), hwnd, reinterpret_cast<HMENU>(IDC_SOURCE), nullptr, nullptr);
+        HWND source = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS, fieldX, S(248), sourceW, S(360), hwnd, reinterpret_cast<HMENU>(IDC_SOURCE), nullptr, nullptr);
         SendMessageW(source, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), S(24));
         SendMessageW(source, CB_SETITEMHEIGHT, 0, S(22));
         SendMessageW(source, CB_SETMINVISIBLE, 18, 0);
         CreateWindowW(L"BUTTON", L"Refresh", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, fieldX + sourceW + controlGap, S(248), refreshButtonW, S(30), hwnd, reinterpret_cast<HMENU>(IDC_RESCAN), nullptr, nullptr);
 
         CreateWindowW(L"STATIC", L"Audio Output (Mic)", WS_CHILD | WS_VISIBLE, labelX, S(296), S(140), S(24), hwnd, nullptr, nullptr, nullptr);
-        HWND mic = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | CBS_DROPDOWNLIST, fieldX, S(292), micComboW, S(240), hwnd, reinterpret_cast<HMENU>(IDC_MIC_DEVICE), nullptr, nullptr);
+        HWND mic = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | CBS_DROPDOWNLIST, fieldX, S(292), micComboW, S(240), hwnd, reinterpret_cast<HMENU>(IDC_MIC_DEVICE), nullptr, nullptr);
         SendMessageW(mic, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), S(24));
         SendMessageW(mic, CB_SETITEMHEIGHT, 0, S(22));
         SendMessageW(mic, CB_SETMINVISIBLE, 12, 0);
 
         CreateWindowW(L"STATIC", L"Music Volume", WS_CHILD | WS_VISIBLE, labelX, S(388), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        HWND gain = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS, fieldX, S(384), gainSliderW, S(34), hwnd, reinterpret_cast<HMENU>(IDC_GAIN), nullptr, nullptr);
+        HWND gain = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TBS_AUTOTICKS, fieldX, S(384), gainSliderW, S(30), hwnd, reinterpret_cast<HMENU>(IDC_GAIN), nullptr, nullptr);
         SendMessageW(gain, TBM_SETRANGE, TRUE, MAKELONG(0, kMusicGainSliderMax));
         SendMessageW(gain, TBM_SETTICFREQ, 20, 0);
         SendMessageW(gain, TBM_SETPAGESIZE, 0, 10);
         SendMessageW(gain, TBM_SETLINESIZE, 0, 1);
+        SendMessageW(gain, TBM_SETTHUMBLENGTH, static_cast<WPARAM>(S(18)), 0);
+        SendMessageW(gain, WM_CHANGEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS), 0);
         CreateWindowW(L"STATIC", L"-15.0 dB", WS_CHILD | WS_VISIBLE, valueTextX, S(388), S(102), S(24), hwnd, reinterpret_cast<HMENU>(IDC_GAIN_VALUE), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Max is -2 dB to reduce clipping risk", WS_CHILD | WS_VISIBLE, fieldX, S(412), S(330), S(18), hwnd, reinterpret_cast<HMENU>(IDC_GAIN_HINT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Max is -2 dB to reduce clipping risk", WS_CHILD | WS_VISIBLE, fieldX, S(414), S(330), S(20), hwnd, reinterpret_cast<HMENU>(IDC_GAIN_HINT), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Music Meter", WS_CHILD | WS_VISIBLE, labelX, S(438), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
         g_rcMeter = { fieldX, S(436), fieldX + meterW, S(436) + S(20) };
         g_rcMusicClip = { fieldX, S(456), fieldX + meterW, S(456) + S(12) };
         CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, statusTextX, S(438), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_METER_TEXT), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, statusTextX, S(456), statusTextW, S(20), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_CLIP_EVENTS), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Send music when mic is silent", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, fieldX, S(478), S(260), S(24), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Mute music", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, muteToggleX, S(478), S(120), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MUTE), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Music keeps sending even when you are not speaking", WS_CHILD | WS_VISIBLE, fieldX, S(498), S(360), S(18), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX_HINT), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Send music when mic is silent", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, fieldX, S(470), S(260), S(28), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Mute music", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, muteToggleX, S(470), S(120), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUTE), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Music keeps sending even when you are not speaking", WS_CHILD | WS_VISIBLE, fieldX, S(500), S(360), S(16), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX_HINT), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Mic Meter", WS_CHILD | WS_VISIBLE, labelX, S(518), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
         g_rcMicMeter = { fieldX, S(516), fieldX + meterW, S(516) + S(20) };
         g_rcMicClip = { fieldX, S(536), fieldX + meterW, S(536) + S(12) };
@@ -1244,13 +1385,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         LoadSettings(hwnd);
         RequestSourceRefresh(hwnd, true);
         UpdateMonitorButton(hwnd);
+        SendMessageW(hwnd, WM_CHANGEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS), 0);
         SetTimer(hwnd, kTimerStatusUpdate, 80, nullptr);
         UpdateStatus(hwnd);
         return 0;
     }
     case WM_HSCROLL:
         if (reinterpret_cast<HWND>(lParam) == GetDlgItem(hwnd, IDC_GAIN)) {
+            SendMessageW(GetDlgItem(hwnd, IDC_GAIN), WM_CHANGEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS), 0);
             UpdateGainLabel(hwnd);
+            InvalidateRect(GetDlgItem(hwnd, IDC_GAIN_HINT), nullptr, TRUE);
             ApplyLiveSettings(hwnd, false, false);
         }
         return 0;
@@ -1274,7 +1418,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             DrawSourceComboItem(dis);
             return TRUE;
         }
+        if (dis->CtlID == IDC_AUTOSTART || dis->CtlID == IDC_FORCE_TX || dis->CtlID == IDC_MUTE) {
+            DrawOwnerCheckbox(dis);
+            return TRUE;
+        }
         return FALSE;
+    }
+    case WM_NOTIFY: {
+        auto* hdr = reinterpret_cast<NMHDR*>(lParam);
+        if (!hdr) {
+            return 0;
+        }
+        if (hdr->idFrom == IDC_GAIN && hdr->code == NM_CUSTOMDRAW) {
+            return DrawGainSliderCustom(reinterpret_cast<NMCUSTOMDRAW*>(lParam));
+        }
+        return 0;
     }
     case kMsgSourceRefreshDone: {
         (void)wParam;
@@ -1418,6 +1576,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_MUTE:
         case IDC_AUTOSTART:
             if (HIWORD(wParam) == BN_CLICKED) {
+                const int id = LOWORD(wParam);
+                if (IsOwnerCheckboxControlId(id)) {
+                    SetOwnerCheckboxValue(id, !GetOwnerCheckboxValue(id));
+                    InvalidateRect(GetDlgItem(hwnd, id), nullptr, TRUE);
+                }
                 ApplyLiveSettings(hwnd, false);
                 return 0;
             }
