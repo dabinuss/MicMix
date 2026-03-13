@@ -1,6 +1,7 @@
 #include <Windows.h>
 
 #include <cassert>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -21,15 +22,25 @@ constexpr char MENU_ICON_FILE[] = "t.png";
 constexpr char SETTINGS_ICON_FILE[] = "1.png";
 
 char* g_pluginIdRaw = nullptr;
+std::atomic<bool> g_pluginShuttingDown{false};
+
+bool IsPluginOperational() {
+    return !g_pluginShuttingDown.load(std::memory_order_acquire) &&
+           MicMixApp::Instance().IsInitialized();
+}
 
 template <typename Fn>
 void RunGuarded(const char* where, Fn&& fn) {
     try {
         fn();
     } catch (const std::exception& ex) {
-        LogError(std::string(where) + " exception: " + ex.what());
+        if (!g_pluginShuttingDown.load(std::memory_order_acquire)) {
+            LogError(std::string(where) + " exception: " + ex.what());
+        }
     } catch (...) {
-        LogError(std::string(where) + " exception: unknown");
+        if (!g_pluginShuttingDown.load(std::memory_order_acquire)) {
+            LogError(std::string(where) + " exception: unknown");
+        }
     }
 }
 
@@ -80,11 +91,13 @@ const char* ts3plugin_description() {
 }
 
 void ts3plugin_setFunctionPointers(const struct TS3Functions funcs) {
+    g_pluginShuttingDown.store(false, std::memory_order_release);
     g_ts3Functions = funcs;
 }
 
 int ts3plugin_init() {
     try {
+        g_pluginShuttingDown.store(false, std::memory_order_release);
         if (!g_ts3Functions.getConfigPath) {
             return 1;
         }
@@ -102,9 +115,13 @@ int ts3plugin_init() {
 }
 
 void ts3plugin_shutdown() {
+    g_pluginShuttingDown.store(true, std::memory_order_release);
+    // Disable TS-side logging immediately to avoid late teardown calls into TS.
+    g_ts3Functions.logMessage = nullptr;
     RunGuarded("ts3plugin_shutdown", [] {
         MicMixApp::Instance().Shutdown();
     });
+    g_ts3Functions = {};
     if (g_pluginIdRaw) {
         std::free(g_pluginIdRaw);
         g_pluginIdRaw = nullptr;
@@ -207,6 +224,9 @@ void ts3plugin_initHotkeys(struct PluginHotkey*** hotkeys) {
 }
 
 void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenuType type, int menuItemID, uint64 selectedItemID) {
+    if (!IsPluginOperational()) {
+        return;
+    }
     RunGuarded("ts3plugin_onMenuItemEvent", [&] {
         (void)serverConnectionHandlerID;
         (void)selectedItemID;
@@ -217,6 +237,9 @@ void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenu
 }
 
 void ts3plugin_onHotkeyEvent(const char* keyword) {
+    if (!IsPluginOperational()) {
+        return;
+    }
     RunGuarded("ts3plugin_onHotkeyEvent", [&] {
         if (!keyword) return;
         if (std::strcmp(keyword, "music_toggle_mute") == 0) {
@@ -238,12 +261,18 @@ void ts3plugin_onHotkeyEvent(const char* keyword) {
 }
 
 void ts3plugin_currentServerConnectionChanged(uint64 serverConnectionHandlerID) {
+    if (!IsPluginOperational()) {
+        return;
+    }
     RunGuarded("ts3plugin_currentServerConnectionChanged", [&] {
         MicMixApp::Instance().SetActiveServer(serverConnectionHandlerID);
     });
 }
 
 void ts3plugin_onTalkStatusChangeEvent(uint64 serverConnectionHandlerID, int status, int isReceivedWhisper, anyID clientID) {
+    if (!IsPluginOperational()) {
+        return;
+    }
     RunGuarded("ts3plugin_onTalkStatusChangeEvent", [&] {
         (void)isReceivedWhisper;
         MicMixApp::Instance().SetTalkStateForOwnClient(serverConnectionHandlerID, clientID, status);
@@ -251,12 +280,18 @@ void ts3plugin_onTalkStatusChangeEvent(uint64 serverConnectionHandlerID, int sta
 }
 
 void ts3plugin_onConnectStatusChangeEvent(uint64 serverConnectionHandlerID, int newStatus, unsigned int errorNumber) {
+    if (!IsPluginOperational()) {
+        return;
+    }
     RunGuarded("ts3plugin_onConnectStatusChangeEvent", [&] {
         MicMixApp::Instance().OnConnectStatusChange(serverConnectionHandlerID, newStatus, errorNumber);
     });
 }
 
 void ts3plugin_onEditCapturedVoiceDataEvent(uint64 serverConnectionHandlerID, short* samples, int sampleCount, int channels, int* edited) {
+    if (!IsPluginOperational()) {
+        return;
+    }
     RunGuarded("ts3plugin_onEditCapturedVoiceDataEvent", [&] {
         MicMixApp::Instance().EditCapturedVoice(serverConnectionHandlerID, samples, sampleCount, channels, edited);
     });

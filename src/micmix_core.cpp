@@ -34,7 +34,7 @@
 using Microsoft::WRL::ComPtr;
 
 TS3Functions g_ts3Functions = {};
-std::string  g_pluginId;
+std::string& g_pluginId = *new std::string();
 
 namespace {
 

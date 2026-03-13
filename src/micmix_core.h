@@ -99,7 +99,7 @@ struct TelemetrySnapshot {
 };
 
 extern TS3Functions g_ts3Functions;
-extern std::string  g_pluginId;
+extern std::string& g_pluginId;
 
 void LogInfo(const std::string& text, uint64 schid = 0);
 void LogWarn(const std::string& text, uint64 schid = 0);
