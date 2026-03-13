@@ -93,6 +93,7 @@ const char* ts3plugin_description() {
 void ts3plugin_setFunctionPointers(const struct TS3Functions funcs) {
     g_pluginShuttingDown.store(false, std::memory_order_release);
     g_ts3Functions = funcs;
+    SetTsLoggingEnabled(true);
 }
 
 int ts3plugin_init() {
@@ -116,12 +117,10 @@ int ts3plugin_init() {
 
 void ts3plugin_shutdown() {
     g_pluginShuttingDown.store(true, std::memory_order_release);
-    // Disable TS-side logging immediately to avoid late teardown calls into TS.
-    g_ts3Functions.logMessage = nullptr;
+    SetTsLoggingEnabled(false);
     RunGuarded("ts3plugin_shutdown", [] {
         MicMixApp::Instance().Shutdown();
     });
-    g_ts3Functions = {};
     if (g_pluginIdRaw) {
         std::free(g_pluginIdRaw);
         g_pluginIdRaw = nullptr;

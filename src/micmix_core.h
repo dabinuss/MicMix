@@ -101,6 +101,7 @@ struct TelemetrySnapshot {
 extern TS3Functions g_ts3Functions;
 extern std::string g_pluginId;
 
+void SetTsLoggingEnabled(bool enabled);
 void LogInfo(const std::string& text, uint64 schid = 0);
 void LogWarn(const std::string& text, uint64 schid = 0);
 void LogError(const std::string& text, uint64 schid = 0);
@@ -112,10 +113,12 @@ public:
     bool Load(MicMixSettings& outSettings, std::string& warning);
     bool Save(const MicMixSettings& settings, std::string& error);
     const std::string& ConfigPath() const { return configPath_; }
+    const std::string& ConfigDir() const { return configDir_; }
     const std::string& LogPath() const { return logPath_; }
 
 private:
     std::string basePath_;
+    std::string configDir_;
     std::string configPath_;
     std::string legacyConfigPath_;
     std::string tmpPath_;

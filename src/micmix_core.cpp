@@ -86,6 +86,7 @@ std::string g_lastLogPayload;
 const char* g_lastLogLevel = nullptr;
 uint32_t g_suppressedLogCount = 0;
 uint32_t g_logWriteCount = 0;
+std::atomic<bool> g_tsLogEnabled{true};
 
 std::wstring Utf8ToWide(const std::string& text) {
     if (text.empty()) {
@@ -581,24 +582,28 @@ private:
 } // namespace
 
 void LogInfo(const std::string& text, uint64 schid) {
-    if (g_ts3Functions.logMessage) {
+    if (g_tsLogEnabled.load(std::memory_order_acquire) && g_ts3Functions.logMessage) {
         g_ts3Functions.logMessage(text.c_str(), LogLevel_INFO, kLogChannel, schid);
     }
     AppendLogLine("INFO", text);
 }
 
 void LogWarn(const std::string& text, uint64 schid) {
-    if (g_ts3Functions.logMessage) {
+    if (g_tsLogEnabled.load(std::memory_order_acquire) && g_ts3Functions.logMessage) {
         g_ts3Functions.logMessage(text.c_str(), LogLevel_WARNING, kLogChannel, schid);
     }
     AppendLogLine("WARN", text);
 }
 
 void LogError(const std::string& text, uint64 schid) {
-    if (g_ts3Functions.logMessage) {
+    if (g_tsLogEnabled.load(std::memory_order_acquire) && g_ts3Functions.logMessage) {
         g_ts3Functions.logMessage(text.c_str(), LogLevel_ERROR, kLogChannel, schid);
     }
     AppendLogLine("ERROR", text);
+}
+
+void SetTsLoggingEnabled(bool enabled) {
+    g_tsLogEnabled.store(enabled, std::memory_order_release);
 }
 
 ConfigStore::ConfigStore(std::string basePath)
@@ -616,6 +621,7 @@ ConfigStore::ConfigStore(std::string basePath)
             LogWarn("Config directory create failed: " + WideToUtf8(dir.wstring()) + " (" + ec.message() + ")", 0);
         }
     }
+    configDir_ = WideToUtf8(dir.wstring());
     configPath_ = WideToUtf8((dir / L"config.ini").wstring());
     legacyConfigPath_ = WideToUtf8((dir / L"config.json").wstring());
     tmpPath_ = WideToUtf8((dir / L"config.tmp").wstring());
@@ -2348,18 +2354,24 @@ public:
             return;
         }
         const size_t frames = static_cast<size_t>(sampleCount);
-        thread_local std::vector<short> stereo;
-        stereo.resize(frames * 2);
-        for (size_t i = 0; i < frames; ++i) {
-            const size_t base = i * static_cast<size_t>(channels);
-            const short l = samples[base];
-            const short r = (channels >= 2) ? samples[base + 1] : l;
-            stereo[(i * 2) + 0] = l;
-            stereo[(i * 2) + 1] = r;
-        }
-        const size_t written = ring_.Write(stereo.data(), stereo.size());
-        if (written < stereo.size()) {
-            droppedSamples_.fetch_add(static_cast<uint64_t>(stereo.size() - written), std::memory_order_relaxed);
+        constexpr size_t kChunkFrames = 512;
+        thread_local std::array<short, kChunkFrames * 2> stereoChunk{};
+        size_t offset = 0;
+        while (offset < frames) {
+            const size_t chunkFrames = std::min(kChunkFrames, frames - offset);
+            for (size_t i = 0; i < chunkFrames; ++i) {
+                const size_t base = (offset + i) * static_cast<size_t>(channels);
+                const short l = samples[base];
+                const short r = (channels >= 2) ? samples[base + 1] : l;
+                stereoChunk[(i * 2) + 0] = l;
+                stereoChunk[(i * 2) + 1] = r;
+            }
+            const size_t chunkSamples = chunkFrames * 2;
+            const size_t written = ring_.Write(stereoChunk.data(), chunkSamples);
+            if (written < chunkSamples) {
+                droppedSamples_.fetch_add(static_cast<uint64_t>(chunkSamples - written), std::memory_order_relaxed);
+            }
+            offset += chunkFrames;
         }
     }
 
@@ -3837,7 +3849,7 @@ TelemetrySnapshot MicMixApp::GetTelemetry() const {
     }
     return t;
 }
-std::string MicMixApp::GetConfigDir() const { return configStore_ ? configStore_->ConfigPath() : std::string{}; }
+std::string MicMixApp::GetConfigDir() const { return configStore_ ? configStore_->ConfigDir() : std::string{}; }
 std::string MicMixApp::GetPreferredTsCaptureDeviceName() const {
     uint64 schid = activeSchid_.load(std::memory_order_acquire);
     if (schid == 0 && g_ts3Functions.getServerConnectionHandlerList) {
