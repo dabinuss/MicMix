@@ -106,3 +106,53 @@ target_link_libraries(micmix PRIVATE
 set_target_properties(micmix PROPERTIES
   OUTPUT_NAME "micmix"
 )
+
+option(MICMIX_BUILD_TESTS "Build MicMix automated tests" ON)
+if(MICMIX_BUILD_TESTS)
+  enable_testing()
+
+  add_executable(micmix_config_store_tests
+    tests/config_store_tests.cpp
+    src/micmix_core.cpp
+    src/settings_window.cpp
+  )
+
+  target_include_directories(micmix_config_store_tests PRIVATE
+    src
+    ${CMAKE_BINARY_DIR}/generated
+    ${TS3_SDK_DIR}/include
+    ${TS3_SDK_DIR}/src
+    ${SPEEXDSP_DIR}/include
+  )
+
+  target_compile_definitions(micmix_config_store_tests PRIVATE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+    _CRT_SECURE_NO_WARNINGS
+    UNICODE
+    _UNICODE
+  )
+
+  if(MSVC)
+    target_compile_options(micmix_config_store_tests PRIVATE
+      /W4
+      /permissive-
+    )
+  endif()
+
+  target_link_libraries(micmix_config_store_tests PRIVATE
+    speexdsp_resampler
+    ole32
+    uuid
+    avrt
+    winmm
+    mmdevapi
+    propsys
+    comctl32
+    shlwapi
+    shell32
+    uxtheme
+  )
+
+  add_test(NAME micmix_config_store_tests COMMAND micmix_config_store_tests)
+endif()

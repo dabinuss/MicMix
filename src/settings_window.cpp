@@ -1,5 +1,9 @@
 #include "settings_window.h"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <Windows.h>
 #include <CommCtrl.h>
 #include <shellapi.h>
@@ -101,6 +105,7 @@ std::vector<LoopbackDeviceInfo> g_pendingLoopbacks;
 std::vector<CaptureDeviceInfo> g_pendingCaptureDevices;
 std::vector<AppProcessInfo> g_pendingApps;
 std::atomic_uint64_t g_sourceRefreshSeq{0};
+std::atomic_uint64_t g_sourceRefreshActiveSeq{0};
 std::atomic<bool> g_sourceRefreshInFlight{false};
 std::atomic<bool> g_sourceRefreshPending{false};
 std::atomic<bool> g_sourceRefreshPendingReload{false};
@@ -649,6 +654,7 @@ bool StartSourceRefreshWorker(HWND hwnd, uint64_t seq) {
             }
             if (!PostMessageW(hwnd, kMsgSourceRefreshDone, static_cast<WPARAM>(seq), 0)) {
                 g_sourceRefreshInFlight.store(false, std::memory_order_release);
+                g_sourceRefreshActiveSeq.store(0, std::memory_order_release);
                 const HWND currentHwnd = g_hwnd.load(std::memory_order_acquire);
                 if (currentHwnd != nullptr) {
                     LogWarn("settings_window refresh completion post failed");
@@ -662,9 +668,11 @@ bool StartSourceRefreshWorker(HWND hwnd, uint64_t seq) {
         return true;
     } catch (const std::exception& ex) {
         g_sourceRefreshInFlight.store(false, std::memory_order_release);
+        g_sourceRefreshActiveSeq.store(0, std::memory_order_release);
         LogError(std::string("settings_window refresh thread start failed: ") + ex.what());
     } catch (...) {
         g_sourceRefreshInFlight.store(false, std::memory_order_release);
+        g_sourceRefreshActiveSeq.store(0, std::memory_order_release);
         LogError("settings_window refresh thread start failed: unknown");
     }
     return false;
@@ -688,7 +696,10 @@ void RequestSourceRefresh(HWND hwnd, bool reloadSettings) {
         return;
     }
     const uint64_t seq = g_sourceRefreshSeq.fetch_add(1, std::memory_order_acq_rel) + 1ULL;
+    g_sourceRefreshActiveSeq.store(seq, std::memory_order_release);
     if (!StartSourceRefreshWorker(hwnd, seq)) {
+        g_sourceRefreshInFlight.store(false, std::memory_order_release);
+        g_sourceRefreshActiveSeq.store(0, std::memory_order_release);
         if (refreshBtn) {
             EnableWindow(refreshBtn, TRUE);
         }
@@ -1468,7 +1479,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case kMsgSourceRefreshDone: {
-        (void)wParam;
+        const uint64_t completedSeq = static_cast<uint64_t>(wParam);
+        const uint64_t activeSeq = g_sourceRefreshActiveSeq.load(std::memory_order_acquire);
+        if (completedSeq != 0 && activeSeq != 0 && completedSeq != activeSeq) {
+            return 0;
+        }
         JoinSourceRefreshThread();
         {
             std::lock_guard<std::mutex> lock(g_enumMutex);
@@ -1481,13 +1496,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             LoadSettings(hwnd);
         }
         g_sourceRefreshInFlight.store(false, std::memory_order_release);
+        g_sourceRefreshActiveSeq.store(0, std::memory_order_release);
 
         if (g_sourceRefreshPending.exchange(false, std::memory_order_acq_rel)) {
             const uint64_t nextSeq = g_sourceRefreshSeq.fetch_add(1, std::memory_order_acq_rel) + 1ULL;
             g_sourceRefreshInFlight.store(true, std::memory_order_release);
+            g_sourceRefreshActiveSeq.store(nextSeq, std::memory_order_release);
             SetStatusText(hwnd, L"Refreshing source list...");
             if (!StartSourceRefreshWorker(hwnd, nextSeq)) {
                 g_sourceRefreshInFlight.store(false, std::memory_order_release);
+                g_sourceRefreshActiveSeq.store(0, std::memory_order_release);
                 HWND refreshBtn = GetDlgItem(hwnd, IDC_RESCAN);
                 if (refreshBtn) {
                     EnableWindow(refreshBtn, TRUE);
@@ -1714,6 +1732,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         g_hwnd.store(nullptr, std::memory_order_release);
         g_sourceRefreshInFlight.store(false, std::memory_order_release);
+        g_sourceRefreshActiveSeq.store(0, std::memory_order_release);
         g_sourceRefreshPending.store(false, std::memory_order_release);
         g_sourceRefreshPendingReload.store(false, std::memory_order_release);
         g_saveDebouncePending.store(false, std::memory_order_release);

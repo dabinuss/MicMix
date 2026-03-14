@@ -209,6 +209,296 @@ bool ParseBool(const std::string& value, bool fallback) {
     return fallback;
 }
 
+bool HasNonWhitespace(const std::string& text) {
+    for (char ch : text) {
+        if (std::isspace(static_cast<unsigned char>(ch)) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t FirstPayloadContentOffset(const std::string& payload) {
+    size_t pos = 0;
+    if (payload.size() >= 3) {
+        const unsigned char b0 = static_cast<unsigned char>(payload[0]);
+        const unsigned char b1 = static_cast<unsigned char>(payload[1]);
+        const unsigned char b2 = static_cast<unsigned char>(payload[2]);
+        if (b0 == 0xEFU && b1 == 0xBBU && b2 == 0xBFU) {
+            pos = 3;
+        }
+    }
+    while (pos < payload.size() && std::isspace(static_cast<unsigned char>(payload[pos])) != 0) {
+        ++pos;
+    }
+    return pos;
+}
+
+bool LooksLikeJsonObjectPayload(const std::string& payload) {
+    const size_t pos = FirstPayloadContentOffset(payload);
+    return pos < payload.size() && payload[pos] == '{';
+}
+
+bool ParseIniLikeConfigPayload(const std::string& payload, std::unordered_map<std::string, std::string>& kv) {
+    bool parsedAny = false;
+    std::istringstream in(payload);
+    std::string line;
+    while (std::getline(in, line)) {
+        line = Trim(line);
+        if (line.empty() || line[0] == '#' || line[0] == ';') {
+            continue;
+        }
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        kv[Trim(line.substr(0, eq))] = Trim(line.substr(eq + 1));
+        parsedAny = true;
+    }
+    return parsedAny;
+}
+
+size_t SkipJsonWs(const std::string& payload, size_t pos) {
+    while (pos < payload.size() && std::isspace(static_cast<unsigned char>(payload[pos])) != 0) {
+        ++pos;
+    }
+    return pos;
+}
+
+bool ParseJsonStringToken(const std::string& payload, size_t& pos, std::string& out) {
+    out.clear();
+    if (pos >= payload.size() || payload[pos] != '"') {
+        return false;
+    }
+    ++pos;
+    while (pos < payload.size()) {
+        const char ch = payload[pos++];
+        if (ch == '"') {
+            return true;
+        }
+        if (ch == '\\') {
+            if (pos >= payload.size()) {
+                return false;
+            }
+            const char esc = payload[pos++];
+            switch (esc) {
+            case '"':
+            case '\\':
+            case '/':
+                out.push_back(esc);
+                break;
+            case 'b':
+                out.push_back('\b');
+                break;
+            case 'f':
+                out.push_back('\f');
+                break;
+            case 'n':
+                out.push_back('\n');
+                break;
+            case 'r':
+                out.push_back('\r');
+                break;
+            case 't':
+                out.push_back('\t');
+                break;
+            case 'u':
+                if ((pos + 4) > payload.size()) {
+                    return false;
+                }
+                for (size_t i = 0; i < 4; ++i) {
+                    if (std::isxdigit(static_cast<unsigned char>(payload[pos + i])) == 0) {
+                        return false;
+                    }
+                }
+                pos += 4;
+                out.push_back('?');
+                break;
+            default:
+                return false;
+            }
+            continue;
+        }
+        if (static_cast<unsigned char>(ch) < 0x20U) {
+            return false;
+        }
+        out.push_back(ch);
+    }
+    return false;
+}
+
+bool ConsumeJsonLiteral(const std::string& payload, size_t& pos, const char* literal) {
+    const size_t n = std::strlen(literal);
+    if ((pos + n) > payload.size()) {
+        return false;
+    }
+    if (payload.compare(pos, n, literal) != 0) {
+        return false;
+    }
+    pos += n;
+    return true;
+}
+
+bool ParseJsonNumberToken(const std::string& payload, size_t& pos, std::string& out) {
+    const size_t begin = pos;
+    if (pos < payload.size() && payload[pos] == '-') {
+        ++pos;
+    }
+    const size_t intBegin = pos;
+    while (pos < payload.size() && std::isdigit(static_cast<unsigned char>(payload[pos])) != 0) {
+        ++pos;
+    }
+    if (pos == intBegin) {
+        return false;
+    }
+    if (pos < payload.size() && payload[pos] == '.') {
+        ++pos;
+        const size_t fracBegin = pos;
+        while (pos < payload.size() && std::isdigit(static_cast<unsigned char>(payload[pos])) != 0) {
+            ++pos;
+        }
+        if (pos == fracBegin) {
+            return false;
+        }
+    }
+    if (pos < payload.size() && (payload[pos] == 'e' || payload[pos] == 'E')) {
+        ++pos;
+        if (pos < payload.size() && (payload[pos] == '+' || payload[pos] == '-')) {
+            ++pos;
+        }
+        const size_t expBegin = pos;
+        while (pos < payload.size() && std::isdigit(static_cast<unsigned char>(payload[pos])) != 0) {
+            ++pos;
+        }
+        if (pos == expBegin) {
+            return false;
+        }
+    }
+    out.assign(payload.substr(begin, pos - begin));
+    return true;
+}
+
+bool SkipJsonComposite(const std::string& payload, size_t& pos, char openCh, char closeCh) {
+    if (pos >= payload.size() || payload[pos] != openCh) {
+        return false;
+    }
+    int depth = 0;
+    while (pos < payload.size()) {
+        const char ch = payload[pos];
+        if (ch == '"') {
+            std::string ignored;
+            if (!ParseJsonStringToken(payload, pos, ignored)) {
+                return false;
+            }
+            continue;
+        }
+        ++pos;
+        if (ch == openCh) {
+            ++depth;
+            continue;
+        }
+        if (ch == closeCh) {
+            --depth;
+            if (depth == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool ParseJsonValueToken(const std::string& payload, size_t& pos, std::string& out) {
+    out.clear();
+    pos = SkipJsonWs(payload, pos);
+    if (pos >= payload.size()) {
+        return false;
+    }
+    const char ch = payload[pos];
+    if (ch == '"') {
+        return ParseJsonStringToken(payload, pos, out);
+    }
+    if (ch == '{') {
+        return SkipJsonComposite(payload, pos, '{', '}');
+    }
+    if (ch == '[') {
+        return SkipJsonComposite(payload, pos, '[', ']');
+    }
+    if (ch == 't') {
+        if (!ConsumeJsonLiteral(payload, pos, "true")) {
+            return false;
+        }
+        out = "true";
+        return true;
+    }
+    if (ch == 'f') {
+        if (!ConsumeJsonLiteral(payload, pos, "false")) {
+            return false;
+        }
+        out = "false";
+        return true;
+    }
+    if (ch == 'n') {
+        if (!ConsumeJsonLiteral(payload, pos, "null")) {
+            return false;
+        }
+        out.clear();
+        return true;
+    }
+    return ParseJsonNumberToken(payload, pos, out);
+}
+
+bool ParseJsonObjectConfigPayload(const std::string& payload, std::unordered_map<std::string, std::string>& kv) {
+    std::unordered_map<std::string, std::string> parsedKv;
+    size_t pos = SkipJsonWs(payload, 0);
+    if (pos >= payload.size() || payload[pos] != '{') {
+        return false;
+    }
+    ++pos;
+    for (;;) {
+        pos = SkipJsonWs(payload, pos);
+        if (pos >= payload.size()) {
+            return false;
+        }
+        if (payload[pos] == '}') {
+            ++pos;
+            break;
+        }
+        std::string key;
+        if (!ParseJsonStringToken(payload, pos, key)) {
+            return false;
+        }
+        pos = SkipJsonWs(payload, pos);
+        if (pos >= payload.size() || payload[pos] != ':') {
+            return false;
+        }
+        ++pos;
+        std::string value;
+        if (!ParseJsonValueToken(payload, pos, value)) {
+            return false;
+        }
+        parsedKv[Trim(key)] = Trim(value);
+        pos = SkipJsonWs(payload, pos);
+        if (pos >= payload.size()) {
+            return false;
+        }
+        if (payload[pos] == ',') {
+            ++pos;
+            continue;
+        }
+        if (payload[pos] == '}') {
+            ++pos;
+            break;
+        }
+        return false;
+    }
+    pos = SkipJsonWs(payload, pos);
+    if (pos != payload.size()) {
+        return false;
+    }
+    kv = std::move(parsedKv);
+    return true;
+}
+
 std::string HrToHex(HRESULT hr) {
     std::ostringstream ss;
     ss << "0x" << std::hex << std::uppercase << static_cast<uint32_t>(hr);
@@ -685,20 +975,25 @@ bool ConfigStore::Load(MicMixSettings& outSettings, std::string& warning) {
     }
 
     std::unordered_map<std::string, std::string> kv;
-    std::string line;
-    while (std::getline(in, line)) {
-        line = Trim(line);
-        if (line.empty() || line[0] == '#') {
-            continue;
-        }
-        const size_t eq = line.find('=');
-        if (eq == std::string::npos) {
-            continue;
-        }
-        kv[Trim(line.substr(0, eq))] = Trim(line.substr(eq + 1));
-    }
-
+    const std::string payload((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     bool parseIssue = false;
+    bool parsed = false;
+    if (LooksLikeJsonObjectPayload(payload)) {
+        // Prefer strict JSON parsing for JSON-shaped payloads so values that
+        // contain '=' are not accidentally interpreted as INI pairs.
+        parsed = ParseJsonObjectConfigPayload(payload, kv);
+        if (!parsed && HasNonWhitespace(payload)) {
+            parseIssue = true;
+        }
+    } else {
+        parsed = ParseIniLikeConfigPayload(payload, kv);
+        if (!parsed) {
+            parsed = ParseJsonObjectConfigPayload(payload, kv);
+        }
+        if (!parsed && HasNonWhitespace(payload)) {
+            parseIssue = true;
+        }
+    }
     auto parseInt = [&](const char* key, int& outValue) {
         if (auto it = kv.find(key); it != kv.end()) {
             try {
@@ -2641,6 +2936,9 @@ std::unique_ptr<IAudioSource> AudioSourceManager::CreateSourceLocked() {
             status_.detail = d;
             if (st == SourceState::Reacquiring) {
                 status_.reconnectCount += 1;
+            }
+            if (st == SourceState::Stopped) {
+                running_ = false;
             }
             callback = statusFn_;
         }

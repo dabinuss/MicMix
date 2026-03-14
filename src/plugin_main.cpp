@@ -203,10 +203,12 @@ void ts3plugin_initHotkeys(struct PluginHotkey*** hotkeys) {
     if (!keys) {
         return;
     }
-    auto releaseKeys = [keys]() {
-        for (size_t i = 0; keys[i] != nullptr; ++i) {
-            std::free(keys[i]);
-            keys[i] = nullptr;
+    auto releaseKeys = [keys, sz]() {
+        for (size_t i = 0; i < sz; ++i) {
+            if (keys[i]) {
+                std::free(keys[i]);
+                keys[i] = nullptr;
+            }
         }
         std::free(keys);
     };
