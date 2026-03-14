@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.21)
 
-set(MICMIX_VERSION_OVERRIDE "" CACHE STRING "Explicit MicMix version override (e.g. 1.2.6)")
+set(MICMIX_VERSION_OVERRIDE "" CACHE STRING "Explicit MicMix version override (e.g. 1.2.7)")
 
-set(MICMIX_VERSION "1.2.6")
+set(MICMIX_VERSION "1.2.7")
 if(MICMIX_VERSION_OVERRIDE)
   set(MICMIX_VERSION "${MICMIX_VERSION_OVERRIDE}")
 elseif(EXISTS "${CMAKE_SOURCE_DIR}/VERSION")

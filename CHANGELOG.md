@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.2.7] - 2026-03-14
+
+### Added
+
+- Added calibrated dB scale markers to the main music and microphone meters.
+- Added runtime `tag.micmix_active=<0|1>` visibility in the bottom status log.
+
+### Changed
+
+- Improved meter responsiveness tuning while keeping UI overhead low.
+- Refined settings UI status visibility and interaction polish, including slider thumb-only resize cursor behavior and gain slider alignment.
+- Reduced UI flicker by introducing buffered rendering and repaint-on-change behavior for meter/clip visuals and status log rendering.
+- Updated README wording in selected sections for clarity.
+
+### Fixed
+
+- Hardened hotkey handling against local thread-queue message injection attempts.
+- Hardened plugin input validation and config parsing/loading behavior, with additional regression test coverage.
+
 ## [1.2.6] - 2026-03-13
 
 ### Added
