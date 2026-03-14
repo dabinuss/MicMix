@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cwctype>
 #include <exception>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -123,6 +124,9 @@ constexpr INT_PTR kSourceItemPlaceholder = -12;
 constexpr UINT kMsgSourceRefreshDone = WM_APP + 0x31;
 constexpr UINT kTimerStatusUpdate = 1;
 constexpr UINT kTimerDebouncedSave = 2;
+constexpr UINT kStatusTimerIntervalMs = 40;
+constexpr int kStatusDetailsEveryTicks = 3;
+constexpr int kHotkeyLabelRefreshEveryTicks = 6;
 constexpr UINT kDebouncedSaveMs = 300;
 constexpr float kMusicGainMinDb = -30.0f;
 constexpr float kMusicGainMaxDb = -2.0f;
@@ -159,6 +163,8 @@ float g_meterHoldDb = -60.0f;
 float g_micMeterVisualDb = -60.0f;
 float g_micMeterHoldDb = -60.0f;
 TelemetrySnapshot g_lastTelemetry{};
+uint64_t g_lastMusicClipEvents = std::numeric_limits<uint64_t>::max();
+uint64_t g_lastMicClipEvents = std::numeric_limits<uint64_t>::max();
 std::wstring g_lastStatusText;
 
 int S(int px) {
@@ -447,16 +453,16 @@ void UpdateMusicMeter(HWND hwnd) {
         targetDb = std::clamp(shownPeakDb, -60.0f, 0.0f);
     }
     if (targetDb > g_meterVisualDb) {
-        g_meterVisualDb += (targetDb - g_meterVisualDb) * 0.55f;
+        g_meterVisualDb += (targetDb - g_meterVisualDb) * 0.70f;
     } else {
-        g_meterVisualDb += (targetDb - g_meterVisualDb) * 0.22f;
+        g_meterVisualDb += (targetDb - g_meterVisualDb) * 0.30f;
     }
     g_meterVisualDb = std::clamp(g_meterVisualDb, -60.0f, 0.0f);
 
     if (targetDb >= g_meterHoldDb) {
         g_meterHoldDb = targetDb;
     } else {
-        g_meterHoldDb = std::max(-60.0f, g_meterHoldDb - 1.2f);
+        g_meterHoldDb = std::max(-60.0f, g_meterHoldDb - 0.6f);
     }
 
     if (!meterActive) {
@@ -490,16 +496,16 @@ void UpdateMicMeter(HWND hwnd) {
         targetDb = std::clamp(t.micRmsDbfs, -60.0f, 0.0f);
     }
     if (targetDb > g_micMeterVisualDb) {
-        g_micMeterVisualDb += (targetDb - g_micMeterVisualDb) * 0.52f;
+        g_micMeterVisualDb += (targetDb - g_micMeterVisualDb) * 0.68f;
     } else {
-        g_micMeterVisualDb += (targetDb - g_micMeterVisualDb) * 0.20f;
+        g_micMeterVisualDb += (targetDb - g_micMeterVisualDb) * 0.28f;
     }
     g_micMeterVisualDb = std::clamp(g_micMeterVisualDb, -60.0f, 0.0f);
 
     if (targetDb >= g_micMeterHoldDb) {
         g_micMeterHoldDb = targetDb;
     } else {
-        g_micMeterHoldDb = std::max(-60.0f, g_micMeterHoldDb - 1.4f);
+        g_micMeterHoldDb = std::max(-60.0f, g_micMeterHoldDb - 0.7f);
     }
 
     if (t.micRmsDbfs <= -119.0f) {
@@ -905,23 +911,35 @@ MicMixSettings CollectSettings(HWND hwnd) {
     return s;
 }
 
-void UpdateStatus(HWND hwnd) {
+void UpdateStatus(HWND hwnd, bool includeDetails = true) {
     auto& app = MicMixApp::Instance();
-    const MicMixSettings s = app.GetSettings();
-    const SourceStatus st = app.GetSourceStatus();
     const TelemetrySnapshot t = app.GetTelemetry();
-    if (GetOwnerCheckboxValue(IDC_MUTE) != s.musicMuted) {
-        SetOwnerCheckboxValue(IDC_MUTE, s.musicMuted);
-        InvalidateRect(GetDlgItem(hwnd, IDC_MUTE), nullptr, TRUE);
-    }
     g_lastTelemetry = t;
-    {
+
+    if (t.sourceClipEvents != g_lastMusicClipEvents) {
         wchar_t clipMusic[64]{};
         swprintf_s(clipMusic, L"CLIP Events: %llu", static_cast<unsigned long long>(t.sourceClipEvents));
         SetWindowTextW(GetDlgItem(hwnd, IDC_MUSIC_CLIP_EVENTS), clipMusic);
+        g_lastMusicClipEvents = t.sourceClipEvents;
+    }
+    if (t.micClipEvents != g_lastMicClipEvents) {
         wchar_t clipMic[64]{};
         swprintf_s(clipMic, L"CLIP Events: %llu", static_cast<unsigned long long>(t.micClipEvents));
         SetWindowTextW(GetDlgItem(hwnd, IDC_MIC_CLIP_EVENTS), clipMic);
+        g_lastMicClipEvents = t.micClipEvents;
+    }
+
+    UpdateMusicMeter(hwnd);
+    UpdateMicMeter(hwnd);
+    if (!includeDetails) {
+        return;
+    }
+
+    const MicMixSettings s = app.GetSettings();
+    const SourceStatus st = app.GetSourceStatus();
+    if (GetOwnerCheckboxValue(IDC_MUTE) != s.musicMuted) {
+        SetOwnerCheckboxValue(IDC_MUTE, s.musicMuted);
+        InvalidateRect(GetDlgItem(hwnd, IDC_MUTE), nullptr, TRUE);
     }
     std::string line1 = "State: " + SourceStateToString(st.state) + "  |  " + (st.message.empty() ? "idle" : st.message);
     if (!st.detail.empty()) {
@@ -940,8 +958,6 @@ void UpdateStatus(HWND hwnd) {
         "  " + micBuf +
         "  " + sendBuf;
     SetStatusText(hwnd, Utf8ToWide(line1 + "\r\n" + line2));
-    UpdateMusicMeter(hwnd);
-    UpdateMicMeter(hwnd);
     UpdateMonitorButton(hwnd);
 }
 
@@ -1343,6 +1359,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_dpi = GetDpiForWindow(hwnd);
         EnsureUiResources();
         ComputeLayout();
+        g_hotkeyRefreshTick = 0;
+        g_lastMusicClipEvents = std::numeric_limits<uint64_t>::max();
+        g_lastMicClipEvents = std::numeric_limits<uint64_t>::max();
         const std::wstring versionText = Utf8ToWide(std::string("v") + MICMIX_VERSION + "  by dabinuss");
 
         const int contentLeft = S(kCardMarginPx + kCardInnerPaddingPx);
@@ -1430,7 +1449,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         RequestSourceRefresh(hwnd, true);
         UpdateMonitorButton(hwnd);
         SendMessageW(hwnd, WM_CHANGEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS), 0);
-        SetTimer(hwnd, kTimerStatusUpdate, 80, nullptr);
+        SetTimer(hwnd, kTimerStatusUpdate, kStatusTimerIntervalMs, nullptr);
         UpdateStatus(hwnd);
         return 0;
     }
@@ -1528,10 +1547,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         if (wParam == kTimerStatusUpdate) {
-            if ((++g_hotkeyRefreshTick % 8) == 0) {
+            const int tick = ++g_hotkeyRefreshTick;
+            if ((tick % kHotkeyLabelRefreshEveryTicks) == 0) {
                 UpdateMuteHotkeyLabel(hwnd);
             }
-            UpdateStatus(hwnd);
+            UpdateStatus(hwnd, (tick % kStatusDetailsEveryTicks) == 0);
             return 0;
         }
         return 0;
@@ -1736,6 +1756,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_sourceRefreshPending.store(false, std::memory_order_release);
         g_sourceRefreshPendingReload.store(false, std::memory_order_release);
         g_saveDebouncePending.store(false, std::memory_order_release);
+        g_hotkeyRefreshTick = 0;
+        g_lastMusicClipEvents = std::numeric_limits<uint64_t>::max();
+        g_lastMicClipEvents = std::numeric_limits<uint64_t>::max();
         g_lastStatusText.clear();
         KillTimer(hwnd, kTimerStatusUpdate);
         KillTimer(hwnd, kTimerDebouncedSave);
