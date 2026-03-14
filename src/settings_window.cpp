@@ -67,6 +67,13 @@ enum class SourceChoiceType {
     App,
 };
 
+enum class HeaderStatusBadgeState {
+    Active,
+    Muted,
+    Off,
+    Error,
+};
+
 struct SourceChoice {
     SourceChoiceType type = SourceChoiceType::Loopback;
     std::string id;
@@ -117,6 +124,9 @@ HICON g_appFallbackIcon = nullptr;
 bool g_ownerAutostartChecked = false;
 bool g_ownerForceTxChecked = false;
 bool g_ownerMuteChecked = false;
+HeaderStatusBadgeState g_headerStatusBadgeState = HeaderStatusBadgeState::Off;
+bool g_windowTitleActive = false;
+bool g_windowTitleStateValid = false;
 
 constexpr INT_PTR kSourceItemHeader = -10;
 constexpr INT_PTR kSourceItemDivider = -11;
@@ -134,7 +144,7 @@ constexpr int kMusicGainStepPerDb = 10;
 constexpr int kMusicGainSliderMax = static_cast<int>((kMusicGainMaxDb - kMusicGainMinDb) * static_cast<float>(kMusicGainStepPerDb));
 constexpr int kSourceIconSizePx = 16;
 constexpr int kClientWidthPx = 680;
-constexpr int kClientHeightPx = 690;
+constexpr int kClientHeightPx = 710;
 constexpr int kCardMarginPx = 16;
 constexpr int kCardGapPx = 12;
 constexpr int kCardInnerPaddingPx = 20;
@@ -154,6 +164,7 @@ HBRUSH g_brushCard = nullptr;
 RECT g_rcSource{};
 RECT g_rcMix{};
 RECT g_rcSession{};
+RECT g_rcHeaderBadge{};
 RECT g_rcMeter{};
 RECT g_rcMicMeter{};
 RECT g_rcMusicClip{};
@@ -403,6 +414,71 @@ void SetStatusText(HWND hwnd, const std::wstring& text) {
     }
     g_lastStatusText = text;
     SetWindowTextW(GetDlgItem(hwnd, IDC_STATUS), text.c_str());
+}
+
+bool IsSourceUp(SourceState state) {
+    return state == SourceState::Running ||
+           state == SourceState::Starting ||
+           state == SourceState::Reacquiring;
+}
+
+HeaderStatusBadgeState ResolveHeaderStatusBadgeState(const MicMixSettings& settings, const SourceStatus& status) {
+    if (status.state == SourceState::Error) {
+        return HeaderStatusBadgeState::Error;
+    }
+    if (!IsSourceUp(status.state)) {
+        return HeaderStatusBadgeState::Off;
+    }
+    if (settings.musicMuted) {
+        return HeaderStatusBadgeState::Muted;
+    }
+    return HeaderStatusBadgeState::Active;
+}
+
+struct HeaderBadgeVisual {
+    const wchar_t* label = L"OFF";
+    COLORREF bg = RGB(134, 150, 173);
+    COLORREF border = RGB(102, 118, 141);
+    COLORREF text = RGB(255, 255, 255);
+    COLORREF dot = RGB(246, 249, 255);
+};
+
+HeaderBadgeVisual GetHeaderBadgeVisual(HeaderStatusBadgeState state) {
+    switch (state) {
+    case HeaderStatusBadgeState::Active:
+        return { L"ACTIVE", RGB(21, 171, 88), RGB(9, 133, 63), RGB(255, 255, 255), RGB(224, 255, 234) };
+    case HeaderStatusBadgeState::Muted:
+        return { L"MUTED", RGB(227, 149, 19), RGB(181, 113, 6), RGB(255, 255, 255), RGB(255, 240, 213) };
+    case HeaderStatusBadgeState::Error:
+        return { L"ERROR", RGB(214, 61, 53), RGB(166, 36, 29), RGB(255, 255, 255), RGB(255, 226, 223) };
+    default:
+        return {};
+    }
+}
+
+void UpdateWindowTitleState(HWND hwnd, bool active) {
+    if (!hwnd) {
+        return;
+    }
+    if (g_windowTitleStateValid && g_windowTitleActive == active) {
+        return;
+    }
+    g_windowTitleStateValid = true;
+    g_windowTitleActive = active;
+    SetWindowTextW(hwnd, active ? L"MicMix Settings - ACTIVE" : L"MicMix Settings - OFF");
+}
+
+void UpdateHeaderStatusBadgeState(HWND hwnd, const MicMixSettings& settings, const SourceStatus& status) {
+    const HeaderStatusBadgeState nextBadge = ResolveHeaderStatusBadgeState(settings, status);
+    if (nextBadge != g_headerStatusBadgeState) {
+        g_headerStatusBadgeState = nextBadge;
+        if (g_rcHeaderBadge.right > g_rcHeaderBadge.left) {
+            InvalidateRect(hwnd, &g_rcHeaderBadge, FALSE);
+        } else {
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+    }
+    UpdateWindowTitleState(hwnd, IsSourceUp(status.state) && status.state != SourceState::Error);
 }
 
 int GainDbToSlider(float db) {
@@ -937,6 +1013,7 @@ void UpdateStatus(HWND hwnd, bool includeDetails = true) {
 
     const MicMixSettings s = app.GetSettings();
     const SourceStatus st = app.GetSourceStatus();
+    UpdateHeaderStatusBadgeState(hwnd, s, st);
     if (GetOwnerCheckboxValue(IDC_MUTE) != s.musicMuted) {
         SetOwnerCheckboxValue(IDC_MUTE, s.musicMuted);
         InvalidateRect(GetDlgItem(hwnd, IDC_MUTE), nullptr, TRUE);
@@ -1071,6 +1148,48 @@ void FillSolidRect(HDC hdc, const RECT& rc, COLORREF color) {
     HBRUSH b = CreateSolidBrush(color);
     FillRect(hdc, &rc, b);
     DeleteObject(b);
+}
+
+void DrawHeaderStatusBadge(HDC hdc) {
+    if (g_rcHeaderBadge.right <= g_rcHeaderBadge.left || g_rcHeaderBadge.bottom <= g_rcHeaderBadge.top) {
+        return;
+    }
+    const HeaderBadgeVisual visual = GetHeaderBadgeVisual(g_headerStatusBadgeState);
+    HPEN pen = CreatePen(PS_SOLID, 1, visual.border);
+    HBRUSH brush = CreateSolidBrush(visual.bg);
+    HGDIOBJ oldPen = SelectObject(hdc, pen);
+    HGDIOBJ oldBrush = SelectObject(hdc, brush);
+    RoundRect(hdc, g_rcHeaderBadge.left, g_rcHeaderBadge.top, g_rcHeaderBadge.right, g_rcHeaderBadge.bottom, S(10), S(10));
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    DeleteObject(brush);
+    DeleteObject(pen);
+
+    const int dotSize = S(6);
+    const int dotInsetX = S(8);
+    const int dotY = g_rcHeaderBadge.top + ((g_rcHeaderBadge.bottom - g_rcHeaderBadge.top - dotSize) / 2);
+    RECT dotRc{
+        g_rcHeaderBadge.left + dotInsetX,
+        dotY,
+        g_rcHeaderBadge.left + dotInsetX + dotSize,
+        dotY + dotSize
+    };
+    HPEN dotPen = CreatePen(PS_SOLID, 1, visual.dot);
+    HBRUSH dotBrush = CreateSolidBrush(visual.dot);
+    HGDIOBJ oldDotPen = SelectObject(hdc, dotPen);
+    HGDIOBJ oldDotBrush = SelectObject(hdc, dotBrush);
+    Ellipse(hdc, dotRc.left, dotRc.top, dotRc.right, dotRc.bottom);
+    SelectObject(hdc, oldDotBrush);
+    SelectObject(hdc, oldDotPen);
+    DeleteObject(dotBrush);
+    DeleteObject(dotPen);
+
+    RECT textRc = g_rcHeaderBadge;
+    textRc.left += S(12);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, visual.text);
+    SelectObject(hdc, g_fontSmall ? g_fontSmall : g_fontBody);
+    DrawTextW(hdc, visual.label, -1, &textRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
 void DrawLevelMeter(HDC hdc, const RECT& meterRect, bool active, float visualDb, float holdDb) {
@@ -1362,6 +1481,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_hotkeyRefreshTick = 0;
         g_lastMusicClipEvents = std::numeric_limits<uint64_t>::max();
         g_lastMicClipEvents = std::numeric_limits<uint64_t>::max();
+        g_headerStatusBadgeState = HeaderStatusBadgeState::Off;
+        g_windowTitleActive = false;
+        g_windowTitleStateValid = false;
         const std::wstring versionText = Utf8ToWide(std::string("v") + MICMIX_VERSION + "  by dabinuss");
 
         const int contentLeft = S(kCardMarginPx + kCardInnerPaddingPx);
@@ -1383,12 +1505,36 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const int hintTopOffset = S(38);
         const int headerMetaW = S(300);
         const int headerMetaX = contentRight - headerMetaW;
+        const int headerBadgeH = S(22);
+        const int titleX = contentLeft;
+        const int titleY = S(14);
+        const int titleH = S(36);
+        int titleW = S(112);
+        int headerBadgeW = S(74);
+        HDC measureDc = GetDC(hwnd);
+        if (measureDc) {
+            HGDIOBJ oldFont = SelectObject(measureDc, g_fontTitle ? g_fontTitle : g_fontBody);
+            SIZE titleTextSize{};
+            if (GetTextExtentPoint32W(measureDc, L"MicMix", 6, &titleTextSize) != 0) {
+                titleW = titleTextSize.cx + S(2);
+            }
+            SelectObject(measureDc, g_fontSmall ? g_fontSmall : g_fontBody);
+            SIZE badgeTextSize{};
+            if (GetTextExtentPoint32W(measureDc, L"ACTIVE", 6, &badgeTextSize) != 0) {
+                headerBadgeW = std::clamp(static_cast<int>(badgeTextSize.cx) + S(28), S(78), S(108));
+            }
+            SelectObject(measureDc, oldFont);
+            ReleaseDC(hwnd, measureDc);
+        }
+        const int headerBadgeX = titleX + titleW + S(2);
+        const int headerBadgeY = titleY + ((titleH - headerBadgeH) / 2) - S(1);
         const int statusX = contentLeft;
-        const int statusY = S(624);
+        const int statusY = S(634);
         const int statusW = contentRight - statusX;
         const int statusH = S(44);
+        g_rcHeaderBadge = { headerBadgeX, headerBadgeY, headerBadgeX + headerBadgeW, headerBadgeY + headerBadgeH };
 
-        CreateWindowW(L"STATIC", L"MicMix", WS_CHILD | WS_VISIBLE, contentLeft, S(14), S(220), S(36), hwnd, reinterpret_cast<HMENU>(IDC_TITLE), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"MicMix", WS_CHILD | WS_VISIBLE, titleX, titleY, titleW, titleH, hwnd, reinterpret_cast<HMENU>(IDC_TITLE), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Configure MicMix and route one audio source to your mic output", WS_CHILD | WS_VISIBLE, contentLeft, S(43), headerMetaX - contentLeft - S(8), S(24), hwnd, reinterpret_cast<HMENU>(IDC_SUBTITLE), nullptr, nullptr);
         CreateWindowW(L"STATIC", versionText.c_str(), WS_CHILD | WS_VISIBLE | SS_RIGHT, headerMetaX, S(18), headerMetaW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_VERSION), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"github.com/dabinuss/MicMix", WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_NOTIFY, headerMetaX, S(36), headerMetaW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_REPO_LINK), nullptr, nullptr);
@@ -1424,22 +1570,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         CreateWindowW(L"STATIC", L"-15.0 dB", WS_CHILD | WS_VISIBLE, valueTextX, S(388), S(102), S(24), hwnd, reinterpret_cast<HMENU>(IDC_GAIN_VALUE), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Max is -2 dB to reduce clipping risk", WS_CHILD | WS_VISIBLE, fieldX, S(414), S(330), S(20), hwnd, reinterpret_cast<HMENU>(IDC_GAIN_HINT), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Music Meter", WS_CHILD | WS_VISIBLE, labelX, S(438), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        g_rcMeter = { fieldX, S(436), fieldX + meterW, S(436) + S(20) };
-        g_rcMusicClip = { fieldX, S(456), fieldX + meterW, S(456) + S(12) };
+        g_rcMeter = { fieldX, S(436), fieldX + meterW, S(436) + S(24) };
+        g_rcMusicClip = { fieldX, S(462), fieldX + meterW, S(462) + S(12) };
         CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, statusTextX, S(438), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_METER_TEXT), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, statusTextX, S(456), statusTextW, S(20), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_CLIP_EVENTS), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Send music when mic is silent", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, fieldX, S(470), S(260), S(28), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Mute music", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, muteToggleX, S(470), S(120), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUTE), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Music keeps sending even when you are not speaking", WS_CHILD | WS_VISIBLE, fieldX, S(500), S(360), S(18), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX_HINT), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Mic Meter", WS_CHILD | WS_VISIBLE, labelX, S(520), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        g_rcMicMeter = { fieldX, S(518), fieldX + meterW, S(518) + S(20) };
-        g_rcMicClip = { fieldX, S(538), fieldX + meterW, S(538) + S(12) };
-        CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, statusTextX, S(520), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_TEXT), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, statusTextX, S(538), statusTextW, S(20), hwnd, reinterpret_cast<HMENU>(IDC_MIC_CLIP_EVENTS), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Only while connected", WS_CHILD | WS_VISIBLE, fieldX, S(556), S(180), S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_HINT), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"MicMix-Mute-Hotkey", WS_CHILD | WS_VISIBLE, labelX, S(574), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Set...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, fieldX, S(570), S(160), S(30), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_SET), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Current: Not set", WS_CHILD | WS_VISIBLE, fieldX + S(172), S(574), S(290), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_TEXT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, statusTextX, S(462), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_CLIP_EVENTS), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Send music when mic is silent", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, fieldX, S(480), S(260), S(28), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Mute music", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, muteToggleX, S(480), S(120), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUTE), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Music keeps sending even when you are not speaking", WS_CHILD | WS_VISIBLE, fieldX, S(510), S(360), S(18), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX_HINT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Mic Meter", WS_CHILD | WS_VISIBLE, labelX, S(534), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
+        g_rcMicMeter = { fieldX, S(532), fieldX + meterW, S(532) + S(24) };
+        g_rcMicClip = { fieldX, S(558), fieldX + meterW, S(558) + S(12) };
+        CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, statusTextX, S(534), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_TEXT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, statusTextX, S(558), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_CLIP_EVENTS), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Only while connected", WS_CHILD | WS_VISIBLE, fieldX, S(576), S(180), S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_HINT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"MicMix-Mute-Hotkey", WS_CHILD | WS_VISIBLE, labelX, S(596), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Set...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, fieldX, S(592), S(160), S(30), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_SET), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Current: Not set", WS_CHILD | WS_VISIBLE, fieldX + S(172), S(596), S(290), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_TEXT), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"State: Stopped", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX, statusX, statusY, statusW, statusH, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), nullptr, nullptr);
 
         ApplyControlTheme(hwnd);
@@ -1711,6 +1857,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         HBRUSH accentBrush = CreateSolidBrush(g_theme.accent);
         FillRect(hdc, &accent, accentBrush);
         DeleteObject(accentBrush);
+        DrawHeaderStatusBadge(hdc);
 
         DrawCard(hdc, g_rcSource);
         DrawCard(hdc, g_rcMix);
@@ -1759,6 +1906,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_hotkeyRefreshTick = 0;
         g_lastMusicClipEvents = std::numeric_limits<uint64_t>::max();
         g_lastMicClipEvents = std::numeric_limits<uint64_t>::max();
+        g_headerStatusBadgeState = HeaderStatusBadgeState::Off;
+        g_windowTitleActive = false;
+        g_windowTitleStateValid = false;
         g_lastStatusText.clear();
         KillTimer(hwnd, kTimerStatusUpdate);
         KillTimer(hwnd, kTimerDebouncedSave);
