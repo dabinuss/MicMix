@@ -1106,7 +1106,8 @@ void UpdateStatus(HWND hwnd, bool includeDetails = true) {
         "  clip=" + std::to_string(t.clippedSamples) +
         "  resampler=" + resamplerText +
         "  " + micBuf +
-        "  " + sendBuf;
+        "  " + sendBuf +
+        "  tag.micmix_active=" + std::to_string(t.musicActive ? 1 : 0);
     SetStatusText(hwnd, Utf8ToWide(line1 + "\r\n" + line2));
     UpdateMonitorButton(hwnd);
 }
