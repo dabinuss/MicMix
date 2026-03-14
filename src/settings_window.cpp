@@ -169,10 +169,23 @@ RECT g_rcMeter{};
 RECT g_rcMicMeter{};
 RECT g_rcMusicClip{};
 RECT g_rcMicClip{};
+RECT g_rcStatus{};
 float g_meterVisualDb = -60.0f;
 float g_meterHoldDb = -60.0f;
 float g_micMeterVisualDb = -60.0f;
 float g_micMeterHoldDb = -60.0f;
+int g_lastMusicMeterLevelPx = -1;
+int g_lastMusicMeterHoldPx = -1;
+bool g_lastMusicMeterActive = false;
+int g_lastMicMeterLevelPx = -1;
+int g_lastMicMeterHoldPx = -1;
+bool g_lastMicMeterActive = false;
+int g_lastMusicClipLitSegments = -1;
+bool g_lastMusicClipRecent = false;
+int g_lastMicClipLitSegments = -1;
+bool g_lastMicClipRecent = false;
+std::wstring g_lastMusicMeterText;
+std::wstring g_lastMicMeterText;
 TelemetrySnapshot g_lastTelemetry{};
 uint64_t g_lastMusicClipEvents = std::numeric_limits<uint64_t>::max();
 uint64_t g_lastMicClipEvents = std::numeric_limits<uint64_t>::max();
@@ -413,7 +426,9 @@ void SetStatusText(HWND hwnd, const std::wstring& text) {
         return;
     }
     g_lastStatusText = text;
-    SetWindowTextW(GetDlgItem(hwnd, IDC_STATUS), text.c_str());
+    if (hwnd && g_rcStatus.right > g_rcStatus.left && g_rcStatus.bottom > g_rcStatus.top) {
+        InvalidateRect(hwnd, &g_rcStatus, FALSE);
+    }
 }
 
 bool IsSourceUp(SourceState state) {
@@ -509,6 +524,20 @@ float ClipDangerUnitFromDb(float dbfs) {
     return (clamped + 18.0f) / 18.0f;
 }
 
+int ClipLitSegmentsFromDb(float dbfs) {
+    constexpr int kClipSegments = 18;
+    const float dangerUnit = ClipDangerUnitFromDb(dbfs);
+    return std::clamp(static_cast<int>((dangerUnit * static_cast<float>(kClipSegments)) + 0.5f), 0, kClipSegments);
+}
+
+void SetStaticTextIfChanged(HWND ctl, std::wstring& cache, const std::wstring& nextText) {
+    if (!ctl || cache == nextText) {
+        return;
+    }
+    cache = nextText;
+    SetWindowTextW(ctl, cache.c_str());
+}
+
 bool IsMusicMeterActive(const TelemetrySnapshot& t) {
     const float shownPeakDb = (t.musicSendPeakDbfs > -119.0f) ? t.musicSendPeakDbfs : t.musicPeakDbfs;
     const bool levelSuggestsSignal = (shownPeakDb > -96.0f) || (t.musicRmsDbfs > -100.0f);
@@ -542,7 +571,7 @@ void UpdateMusicMeter(HWND hwnd) {
     }
 
     if (!meterActive) {
-        SetWindowTextW(txt, L"No signal");
+        SetStaticTextIfChanged(txt, g_lastMusicMeterText, L"No signal");
     } else {
         const wchar_t* grade = L"OK";
         if (shownPeakDb > -8.0f) {
@@ -554,11 +583,32 @@ void UpdateMusicMeter(HWND hwnd) {
         }
         wchar_t meter[96];
         swprintf_s(meter, L"%.1f dBFS  |  %s", shownPeakDb, grade);
-        SetWindowTextW(txt, meter);
+        SetStaticTextIfChanged(txt, g_lastMusicMeterText, meter);
     }
 
-    InvalidateRect(hwnd, &g_rcMeter, FALSE);
-    InvalidateRect(hwnd, &g_rcMusicClip, FALSE);
+    const int meterWidth = std::max(1, static_cast<int>(g_rcMeter.right - g_rcMeter.left));
+    const int levelPx = std::clamp(MeterDbToPixels(g_meterVisualDb, meterWidth), 0, meterWidth);
+    const int holdPx = std::clamp(MeterDbToPixels(g_meterHoldDb, meterWidth), 0, meterWidth - 1);
+    const bool meterChanged =
+        (levelPx != g_lastMusicMeterLevelPx) ||
+        (holdPx != g_lastMusicMeterHoldPx) ||
+        (meterActive != g_lastMusicMeterActive);
+    g_lastMusicMeterLevelPx = levelPx;
+    g_lastMusicMeterHoldPx = holdPx;
+    g_lastMusicMeterActive = meterActive;
+    if (meterChanged) {
+        InvalidateRect(hwnd, &g_rcMeter, FALSE);
+    }
+
+    const int clipLitSegments = ClipLitSegmentsFromDb(shownPeakDb);
+    const bool clipChanged =
+        (clipLitSegments != g_lastMusicClipLitSegments) ||
+        (t.sourceClipRecent != g_lastMusicClipRecent);
+    g_lastMusicClipLitSegments = clipLitSegments;
+    g_lastMusicClipRecent = t.sourceClipRecent;
+    if (clipChanged) {
+        InvalidateRect(hwnd, &g_rcMusicClip, FALSE);
+    }
 }
 
 void UpdateMicMeter(HWND hwnd) {
@@ -585,7 +635,7 @@ void UpdateMicMeter(HWND hwnd) {
     }
 
     if (t.micRmsDbfs <= -119.0f) {
-        SetWindowTextW(txt, L"No signal");
+        SetStaticTextIfChanged(txt, g_lastMicMeterText, L"No signal");
     } else {
         const wchar_t* grade = L"OK";
         if (t.micPeakDbfs > -8.0f) {
@@ -597,10 +647,33 @@ void UpdateMicMeter(HWND hwnd) {
         }
         wchar_t meter[96];
         swprintf_s(meter, L"%.1f dBFS  |  %s", t.micRmsDbfs, grade);
-        SetWindowTextW(txt, meter);
+        SetStaticTextIfChanged(txt, g_lastMicMeterText, meter);
     }
-    InvalidateRect(hwnd, &g_rcMicMeter, FALSE);
-    InvalidateRect(hwnd, &g_rcMicClip, FALSE);
+
+    const int meterWidth = std::max(1, static_cast<int>(g_rcMicMeter.right - g_rcMicMeter.left));
+    const int levelPx = std::clamp(MeterDbToPixels(g_micMeterVisualDb, meterWidth), 0, meterWidth);
+    const int holdPx = std::clamp(MeterDbToPixels(g_micMeterHoldDb, meterWidth), 0, meterWidth - 1);
+    const bool meterActive = t.micRmsDbfs > -119.0f;
+    const bool meterChanged =
+        (levelPx != g_lastMicMeterLevelPx) ||
+        (holdPx != g_lastMicMeterHoldPx) ||
+        (meterActive != g_lastMicMeterActive);
+    g_lastMicMeterLevelPx = levelPx;
+    g_lastMicMeterHoldPx = holdPx;
+    g_lastMicMeterActive = meterActive;
+    if (meterChanged) {
+        InvalidateRect(hwnd, &g_rcMicMeter, FALSE);
+    }
+
+    const int clipLitSegments = ClipLitSegmentsFromDb(t.micPeakDbfs);
+    const bool clipChanged =
+        (clipLitSegments != g_lastMicClipLitSegments) ||
+        (t.micClipRecent != g_lastMicClipRecent);
+    g_lastMicClipLitSegments = clipLitSegments;
+    g_lastMicClipRecent = t.micClipRecent;
+    if (clipChanged) {
+        InvalidateRect(hwnd, &g_rcMicClip, FALSE);
+    }
 }
 
 void UpdateMonitorButton(HWND hwnd) {
@@ -1121,7 +1194,6 @@ void ApplyFonts(HWND hwnd) {
     SetControlFont(hwnd, IDC_MIC_METER_HINT, g_fontHint ? g_fontHint : g_fontSmall);
     SetControlFont(hwnd, IDC_GAIN_HINT, g_fontHint ? g_fontHint : g_fontSmall);
     SetControlFont(hwnd, IDC_FORCE_TX_HINT, g_fontHint ? g_fontHint : g_fontSmall);
-    SetControlFont(hwnd, IDC_STATUS, g_fontMono);
 }
 
 void ComputeLayout() {
@@ -1196,12 +1268,40 @@ void DrawLevelMeter(HDC hdc, const RECT& meterRect, bool active, float visualDb,
     if (meterRect.right <= meterRect.left || meterRect.bottom <= meterRect.top) {
         return;
     }
-    RECT rc = meterRect;
+    const int targetWidth = static_cast<int>(meterRect.right - meterRect.left);
+    const int targetHeight = static_cast<int>(meterRect.bottom - meterRect.top);
+    if (targetWidth <= 2 || targetHeight <= 2) {
+        return;
+    }
+
+    HDC drawDc = hdc;
+    HDC memDc = CreateCompatibleDC(hdc);
+    HBITMAP memBmp = nullptr;
+    HGDIOBJ oldBmp = nullptr;
+    bool buffered = false;
+    if (memDc) {
+        memBmp = CreateCompatibleBitmap(hdc, targetWidth, targetHeight);
+        if (memBmp) {
+            oldBmp = SelectObject(memDc, memBmp);
+            drawDc = memDc;
+            buffered = true;
+        } else {
+            DeleteDC(memDc);
+            memDc = nullptr;
+        }
+    }
+
+    RECT rc = buffered ? RECT{ 0, 0, targetWidth, targetHeight } : meterRect;
     const int left = static_cast<int>(rc.left);
     const int right = static_cast<int>(rc.right);
     const int width = right - left;
     const int height = static_cast<int>(rc.bottom - rc.top);
     if (width <= 2 || height <= 2) {
+        if (buffered) {
+            SelectObject(memDc, oldBmp);
+            DeleteObject(memBmp);
+            DeleteDC(memDc);
+        }
         return;
     }
 
@@ -1213,13 +1313,13 @@ void DrawLevelMeter(HDC hdc, const RECT& meterRect, bool active, float visualDb,
     RECT barRc = rc;
     barRc.top = std::min(rc.bottom - 1, scaleRc.bottom);
 
-    FillSolidRect(hdc, scaleRc, RGB(244, 247, 252));
-    FillSolidRect(hdc, barRc, RGB(235, 240, 246));
+    FillSolidRect(drawDc, scaleRc, RGB(244, 247, 252));
+    FillSolidRect(drawDc, barRc, RGB(235, 240, 246));
 
     const std::array<int, 7> tickDb = { -60, -36, -24, -18, -12, -6, 0 };
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, RGB(96, 107, 122));
-    HGDIOBJ oldFont = SelectObject(hdc, g_fontTiny ? g_fontTiny : (g_fontHint ? g_fontHint : g_fontSmall));
+    SetBkMode(drawDc, TRANSPARENT);
+    SetTextColor(drawDc, RGB(96, 107, 122));
+    HGDIOBJ oldFont = SelectObject(drawDc, g_fontTiny ? g_fontTiny : (g_fontHint ? g_fontHint : g_fontSmall));
     for (size_t i = 0; i < tickDb.size(); ++i) {
         const int db = tickDb[i];
         int x = left + MeterDbToPixels(static_cast<float>(db), width);
@@ -1231,19 +1331,19 @@ void DrawLevelMeter(HDC hdc, const RECT& meterRect, bool active, float visualDb,
                 ? RGB(198, 130, 124)
                 : RGB(206, 214, 225);
         HPEN guidePen = CreatePen(PS_SOLID, 1, guideColor);
-        HGDIOBJ oldGuidePen = SelectObject(hdc, guidePen);
-        MoveToEx(hdc, x, barRc.top, nullptr);
-        LineTo(hdc, x, barRc.bottom);
-        SelectObject(hdc, oldGuidePen);
+        HGDIOBJ oldGuidePen = SelectObject(drawDc, guidePen);
+        MoveToEx(drawDc, x, barRc.top, nullptr);
+        LineTo(drawDc, x, barRc.bottom);
+        SelectObject(drawDc, oldGuidePen);
         DeleteObject(guidePen);
 
         RECT tickRc{ x, scaleRc.bottom - S(3), x + 1, scaleRc.bottom };
-        FillSolidRect(hdc, tickRc, RGB(162, 171, 184));
+        FillSolidRect(drawDc, tickRc, RGB(162, 171, 184));
 
         wchar_t label[8]{};
         swprintf_s(label, L"%d", db);
         SIZE textSize{};
-        if (GetTextExtentPoint32W(hdc, label, lstrlenW(label), &textSize) != 0) {
+        if (GetTextExtentPoint32W(drawDc, label, lstrlenW(label), &textSize) != 0) {
             int textLeft = x - (textSize.cx / 2);
             if (i == 0) {
                 textLeft = left + S(2);
@@ -1254,10 +1354,10 @@ void DrawLevelMeter(HDC hdc, const RECT& meterRect, bool active, float visualDb,
                 const int labelMaxX = right - static_cast<int>(textSize.cx) - S(2);
                 textLeft = std::clamp(textLeft, labelMinX, labelMaxX);
             }
-            TextOutW(hdc, textLeft, scaleRc.top, label, lstrlenW(label));
+            TextOutW(drawDc, textLeft, scaleRc.top, label, lstrlenW(label));
         }
     }
-    SelectObject(hdc, oldFont);
+    SelectObject(drawDc, oldFont);
 
     const int barWidth = std::max(1, static_cast<int>(barRc.right - barRc.left));
     const int levelPx = std::clamp(MeterDbToPixels(visualDb, width), 0, width);
@@ -1268,34 +1368,50 @@ void DrawLevelMeter(HDC hdc, const RECT& meterRect, bool active, float visualDb,
     if (active && levelPx > 0) {
         RECT seg = barRc;
         seg.right = barRc.left + std::min(levelPx, greenEnd);
-        if (seg.right > seg.left) FillSolidRect(hdc, seg, RGB(54, 181, 78));
+        if (seg.right > seg.left) FillSolidRect(drawDc, seg, RGB(54, 181, 78));
 
         if (levelPx > greenEnd) {
             seg.left = barRc.left + greenEnd;
             seg.right = barRc.left + std::min(levelPx, yellowEnd);
-            if (seg.right > seg.left) FillSolidRect(hdc, seg, RGB(232, 191, 58));
+            if (seg.right > seg.left) FillSolidRect(drawDc, seg, RGB(232, 191, 58));
         }
         if (levelPx > yellowEnd) {
             seg.left = barRc.left + yellowEnd;
             seg.right = barRc.left + levelPx;
-            if (seg.right > seg.left) FillSolidRect(hdc, seg, RGB(214, 75, 63));
+            if (seg.right > seg.left) FillSolidRect(drawDc, seg, RGB(214, 75, 63));
         }
 
         HPEN holdPen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
-        HGDIOBJ oldPen = SelectObject(hdc, holdPen);
-        MoveToEx(hdc, barRc.left + holdPx, barRc.top, nullptr);
-        LineTo(hdc, barRc.left + holdPx, barRc.bottom);
-        SelectObject(hdc, oldPen);
+        HGDIOBJ oldPen = SelectObject(drawDc, holdPen);
+        MoveToEx(drawDc, barRc.left + holdPx, barRc.top, nullptr);
+        LineTo(drawDc, barRc.left + holdPx, barRc.bottom);
+        SelectObject(drawDc, oldPen);
         DeleteObject(holdPen);
     }
 
     HPEN border = CreatePen(PS_SOLID, 1, RGB(184, 193, 207));
-    HGDIOBJ oldPen = SelectObject(hdc, border);
-    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-    Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
-    SelectObject(hdc, oldBrush);
-    SelectObject(hdc, oldPen);
+    HGDIOBJ oldPen = SelectObject(drawDc, border);
+    HGDIOBJ oldBrush = SelectObject(drawDc, GetStockObject(HOLLOW_BRUSH));
+    Rectangle(drawDc, rc.left, rc.top, rc.right, rc.bottom);
+    SelectObject(drawDc, oldBrush);
+    SelectObject(drawDc, oldPen);
     DeleteObject(border);
+
+    if (buffered) {
+        BitBlt(
+            hdc,
+            meterRect.left,
+            meterRect.top,
+            targetWidth,
+            targetHeight,
+            memDc,
+            0,
+            0,
+            SRCCOPY);
+        SelectObject(memDc, oldBmp);
+        DeleteObject(memBmp);
+        DeleteDC(memDc);
+    }
 }
 
 LRESULT DrawGainSliderCustom(const NMCUSTOMDRAW* cd) {
@@ -1339,8 +1455,31 @@ void DrawClipStrip(HDC hdc, const RECT& rcStrip, float dangerUnit, bool clipRece
     if (rcStrip.right <= rcStrip.left || rcStrip.bottom <= rcStrip.top) {
         return;
     }
-    RECT rc = rcStrip;
-    FillSolidRect(hdc, rc, RGB(246, 249, 252));
+    const int targetWidth = static_cast<int>(rcStrip.right - rcStrip.left);
+    const int targetHeight = static_cast<int>(rcStrip.bottom - rcStrip.top);
+    if (targetWidth <= 2 || targetHeight <= 2) {
+        return;
+    }
+
+    HDC drawDc = hdc;
+    HDC memDc = CreateCompatibleDC(hdc);
+    HBITMAP memBmp = nullptr;
+    HGDIOBJ oldBmp = nullptr;
+    bool buffered = false;
+    if (memDc) {
+        memBmp = CreateCompatibleBitmap(hdc, targetWidth, targetHeight);
+        if (memBmp) {
+            oldBmp = SelectObject(memDc, memBmp);
+            drawDc = memDc;
+            buffered = true;
+        } else {
+            DeleteDC(memDc);
+            memDc = nullptr;
+        }
+    }
+
+    RECT rc = buffered ? RECT{ 0, 0, targetWidth, targetHeight } : rcStrip;
+    FillSolidRect(drawDc, rc, RGB(246, 249, 252));
 
     const int width = rc.right - rc.left;
     constexpr int kSegments = 18;
@@ -1363,36 +1502,52 @@ void DrawClipStrip(HDC hdc, const RECT& rcStrip, float dangerUnit, bool clipRece
             static_cast<BYTE>(176 - (126.0f * t)),
             static_cast<BYTE>(86 - (40.0f * t)));
         COLORREF color = (i < litSegments) ? onColor : offColor;
-        FillSolidRect(hdc, seg, color);
+        FillSolidRect(drawDc, seg, color);
     }
 
     HPEN border = CreatePen(PS_SOLID, 1, clipRecent ? RGB(208, 72, 60) : RGB(188, 197, 210));
-    HGDIOBJ oldPen = SelectObject(hdc, border);
-    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-    Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
-    SelectObject(hdc, oldBrush);
-    SelectObject(hdc, oldPen);
+    HGDIOBJ oldPen = SelectObject(drawDc, border);
+    HGDIOBJ oldBrush = SelectObject(drawDc, GetStockObject(HOLLOW_BRUSH));
+    Rectangle(drawDc, rc.left, rc.top, rc.right, rc.bottom);
+    SelectObject(drawDc, oldBrush);
+    SelectObject(drawDc, oldPen);
     DeleteObject(border);
 
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, clipRecent ? RGB(132, 24, 24) : RGB(112, 120, 132));
-    SelectObject(hdc, g_fontTiny ? g_fontTiny : (g_fontHint ? g_fontHint : g_fontSmall));
+    SetBkMode(drawDc, TRANSPARENT);
+    SetTextColor(drawDc, clipRecent ? RGB(132, 24, 24) : RGB(112, 120, 132));
+    SelectObject(drawDc, g_fontTiny ? g_fontTiny : (g_fontHint ? g_fontHint : g_fontSmall));
     RECT labelRc{ rc.left + S(5), rc.top, rc.right - S(52), rc.bottom };
-    DrawTextW(hdc, L"Clip Meter", -1, &labelRc, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    DrawTextW(drawDc, L"Clip Meter", -1, &labelRc, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
     RECT inner{ rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1 };
     RECT pulse{};
     const int pulseWidth = S(44);
     if (clipRecent) {
         pulse = { std::max(inner.left, inner.right - pulseWidth), inner.top, inner.right, inner.bottom };
-        FillSolidRect(hdc, pulse, clipColor);
+        FillSolidRect(drawDc, pulse, clipColor);
     }
 
     if (clipRecent) {
-        SetTextColor(hdc, RGB(255, 255, 255));
-        SelectObject(hdc, g_fontTiny ? g_fontTiny : (g_fontHint ? g_fontHint : g_fontSmall));
+        SetTextColor(drawDc, RGB(255, 255, 255));
+        SelectObject(drawDc, g_fontTiny ? g_fontTiny : (g_fontHint ? g_fontHint : g_fontSmall));
         const wchar_t* tag = L"CLIP";
-        DrawTextW(hdc, tag, -1, &pulse, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+        DrawTextW(drawDc, tag, -1, &pulse, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+    }
+
+    if (buffered) {
+        BitBlt(
+            hdc,
+            rcStrip.left,
+            rcStrip.top,
+            targetWidth,
+            targetHeight,
+            memDc,
+            0,
+            0,
+            SRCCOPY);
+        SelectObject(memDc, oldBmp);
+        DeleteObject(memBmp);
+        DeleteDC(memDc);
     }
 }
 
@@ -1540,6 +1695,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_hotkeyRefreshTick = 0;
         g_lastMusicClipEvents = std::numeric_limits<uint64_t>::max();
         g_lastMicClipEvents = std::numeric_limits<uint64_t>::max();
+        g_lastMusicMeterLevelPx = -1;
+        g_lastMusicMeterHoldPx = -1;
+        g_lastMusicMeterActive = false;
+        g_lastMicMeterLevelPx = -1;
+        g_lastMicMeterHoldPx = -1;
+        g_lastMicMeterActive = false;
+        g_lastMusicClipLitSegments = -1;
+        g_lastMusicClipRecent = false;
+        g_lastMicClipLitSegments = -1;
+        g_lastMicClipRecent = false;
+        g_lastMusicMeterText.clear();
+        g_lastMicMeterText.clear();
         g_headerStatusBadgeState = HeaderStatusBadgeState::Off;
         g_windowTitleActive = false;
         g_windowTitleStateValid = false;
@@ -1592,6 +1759,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const int statusW = contentRight - statusX;
         const int statusH = S(44);
         g_rcHeaderBadge = { headerBadgeX, headerBadgeY, headerBadgeX + headerBadgeW, headerBadgeY + headerBadgeH };
+        g_rcStatus = { statusX, statusY, statusX + statusW, statusY + statusH };
 
         CreateWindowW(L"STATIC", L"MicMix", WS_CHILD | WS_VISIBLE, titleX, titleY, titleW, titleH, hwnd, reinterpret_cast<HMENU>(IDC_TITLE), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Configure MicMix and route one audio source to your mic output", WS_CHILD | WS_VISIBLE, contentLeft, S(43), headerMetaX - contentLeft - S(8), S(24), hwnd, reinterpret_cast<HMENU>(IDC_SUBTITLE), nullptr, nullptr);
@@ -1645,7 +1813,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         CreateWindowW(L"STATIC", L"MicMix-Mute-Hotkey", WS_CHILD | WS_VISIBLE, labelX, S(596), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Set...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, fieldX, S(592), S(160), S(30), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_SET), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Current: Not set", WS_CHILD | WS_VISIBLE, fieldX + S(172), S(596), S(290), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_TEXT), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"State: Stopped", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX, statusX, statusY, statusW, statusH, hwnd, reinterpret_cast<HMENU>(IDC_STATUS), nullptr, nullptr);
 
         ApplyControlTheme(hwnd);
         ApplyFonts(hwnd);
@@ -1884,8 +2051,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         } else if (id == IDC_MONITOR_HINT || id == IDC_MIC_METER_HINT || id == IDC_GAIN_HINT || id == IDC_FORCE_TX_HINT ||
                    id == IDC_MUSIC_CLIP_EVENTS || id == IDC_MIC_CLIP_EVENTS) {
             SetTextColor(hdc, g_theme.muted);
-        } else if (id == IDC_STATUS) {
-            SetTextColor(hdc, RGB(40, 48, 61));
         } else {
             SetTextColor(hdc, g_theme.text);
         }
@@ -1910,36 +2075,85 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_PAINT: {
         PAINTSTRUCT ps{};
         HDC hdc = BeginPaint(hwnd, &ps);
-        FillRect(hdc, &ps.rcPaint, g_brushBg);
+        RECT clientRc{};
+        GetClientRect(hwnd, &clientRc);
+
+        HDC paintDc = hdc;
+        HDC memDc = nullptr;
+        HBITMAP memBmp = nullptr;
+        HGDIOBJ oldBmp = nullptr;
+        bool bufferedPaint = false;
+        const int clientW = std::max(0, static_cast<int>(clientRc.right - clientRc.left));
+        const int clientH = std::max(0, static_cast<int>(clientRc.bottom - clientRc.top));
+        if (clientW > 0 && clientH > 0) {
+            memDc = CreateCompatibleDC(hdc);
+            if (memDc) {
+                memBmp = CreateCompatibleBitmap(hdc, clientW, clientH);
+                if (memBmp) {
+                    oldBmp = SelectObject(memDc, memBmp);
+                    paintDc = memDc;
+                    bufferedPaint = true;
+                } else {
+                    DeleteDC(memDc);
+                    memDc = nullptr;
+                }
+            }
+        }
+
+        const RECT bgFillRc = bufferedPaint ? clientRc : ps.rcPaint;
+        FillRect(paintDc, &bgFillRc, g_brushBg);
 
         RECT accent{ S(0), S(0), S(kClientWidthPx), S(4) };
         HBRUSH accentBrush = CreateSolidBrush(g_theme.accent);
-        FillRect(hdc, &accent, accentBrush);
+        FillRect(paintDc, &accent, accentBrush);
         DeleteObject(accentBrush);
-        DrawHeaderStatusBadge(hdc);
+        DrawHeaderStatusBadge(paintDc);
 
-        DrawCard(hdc, g_rcSource);
-        DrawCard(hdc, g_rcMix);
-        DrawCard(hdc, g_rcSession);
-        DrawLevelMeter(hdc, g_rcMeter, IsMusicMeterActive(g_lastTelemetry), g_meterVisualDb, g_meterHoldDb);
-        DrawLevelMeter(hdc, g_rcMicMeter, g_lastTelemetry.micRmsDbfs > -119.0f, g_micMeterVisualDb, g_micMeterHoldDb);
+        DrawCard(paintDc, g_rcSource);
+        DrawCard(paintDc, g_rcMix);
+        DrawCard(paintDc, g_rcSession);
+        DrawLevelMeter(paintDc, g_rcMeter, IsMusicMeterActive(g_lastTelemetry), g_meterVisualDb, g_meterHoldDb);
+        DrawLevelMeter(paintDc, g_rcMicMeter, g_lastTelemetry.micRmsDbfs > -119.0f, g_micMeterVisualDb, g_micMeterHoldDb);
         const float shownMusicPeak = (g_lastTelemetry.musicSendPeakDbfs > -119.0f) ? g_lastTelemetry.musicSendPeakDbfs : g_lastTelemetry.musicPeakDbfs;
         DrawClipStrip(
-            hdc, g_rcMusicClip, ClipDangerUnitFromDb(shownMusicPeak),
+            paintDc, g_rcMusicClip, ClipDangerUnitFromDb(shownMusicPeak),
             g_lastTelemetry.sourceClipRecent);
         DrawClipStrip(
-            hdc, g_rcMicClip, ClipDangerUnitFromDb(g_lastTelemetry.micPeakDbfs),
+            paintDc, g_rcMicClip, ClipDangerUnitFromDb(g_lastTelemetry.micPeakDbfs),
             g_lastTelemetry.micClipRecent);
 
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, g_theme.muted);
-        SelectObject(hdc, g_fontSmall);
+        SetBkMode(paintDc, TRANSPARENT);
+        SetTextColor(paintDc, g_theme.muted);
+        SelectObject(paintDc, g_fontSmall);
         const wchar_t* h1 = L"MICMIX SETTINGS";
         const wchar_t* h2 = L"AUDIO ROUTING";
         const wchar_t* h3 = L"MIX BEHAVIOR";
-        TextOutW(hdc, S(36), S(86), h1, lstrlenW(h1));
-        TextOutW(hdc, S(36), S(226), h2, lstrlenW(h2));
-        TextOutW(hdc, S(36), S(358), h3, lstrlenW(h3));
+        TextOutW(paintDc, S(36), S(86), h1, lstrlenW(h1));
+        TextOutW(paintDc, S(36), S(226), h2, lstrlenW(h2));
+        TextOutW(paintDc, S(36), S(358), h3, lstrlenW(h3));
+
+        SetBkMode(paintDc, TRANSPARENT);
+        SetTextColor(paintDc, RGB(40, 48, 61));
+        HGDIOBJ oldStatusFont = SelectObject(paintDc, g_fontMono ? g_fontMono : (g_fontBody ? g_fontBody : GetStockObject(DEFAULT_GUI_FONT)));
+        RECT statusRc = g_rcStatus;
+        DrawTextW(
+            paintDc,
+            g_lastStatusText.empty() ? L"State: Stopped" : g_lastStatusText.c_str(),
+            -1,
+            &statusRc,
+            DT_LEFT | DT_TOP | DT_NOPREFIX | DT_WORDBREAK);
+        SelectObject(paintDc, oldStatusFont);
+
+        if (bufferedPaint) {
+            const int copyW = std::max(0, static_cast<int>(ps.rcPaint.right - ps.rcPaint.left));
+            const int copyH = std::max(0, static_cast<int>(ps.rcPaint.bottom - ps.rcPaint.top));
+            if (copyW > 0 && copyH > 0) {
+                BitBlt(hdc, ps.rcPaint.left, ps.rcPaint.top, copyW, copyH, memDc, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
+            }
+            SelectObject(memDc, oldBmp);
+            DeleteObject(memBmp);
+            DeleteDC(memDc);
+        }
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -1965,6 +2179,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_hotkeyRefreshTick = 0;
         g_lastMusicClipEvents = std::numeric_limits<uint64_t>::max();
         g_lastMicClipEvents = std::numeric_limits<uint64_t>::max();
+        g_lastMusicMeterLevelPx = -1;
+        g_lastMusicMeterHoldPx = -1;
+        g_lastMusicMeterActive = false;
+        g_lastMicMeterLevelPx = -1;
+        g_lastMicMeterHoldPx = -1;
+        g_lastMicMeterActive = false;
+        g_lastMusicClipLitSegments = -1;
+        g_lastMusicClipRecent = false;
+        g_lastMicClipLitSegments = -1;
+        g_lastMicClipRecent = false;
+        g_lastMusicMeterText.clear();
+        g_lastMicMeterText.clear();
         g_headerStatusBadgeState = HeaderStatusBadgeState::Off;
         g_windowTitleActive = false;
         g_windowTitleStateValid = false;
