@@ -219,6 +219,19 @@ bool IsHandCursorControlId(int id) {
     }
 }
 
+bool IsPointOverGainThumb(HWND gainHwnd, const POINT& screenPt) {
+    if (!gainHwnd) {
+        return false;
+    }
+    RECT thumbRc{};
+    SendMessageW(gainHwnd, TBM_GETTHUMBRECT, 0, reinterpret_cast<LPARAM>(&thumbRc));
+    POINT clientPt = screenPt;
+    if (!ScreenToClient(gainHwnd, &clientPt)) {
+        return false;
+    }
+    return PtInRect(&thumbRc, clientPt) != FALSE;
+}
+
 bool GetOwnerCheckboxValue(int id) {
     switch (id) {
     case IDC_AUTOSTART: return g_ownerAutostartChecked;
@@ -1722,6 +1735,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const int monitorButtonW = S(122);
         const int refreshButtonW = S(130);
         const int gainSliderW = S(360);
+        const int gainSliderLeftNudge = S(6);
         const int meterW = S(340);
         const int sourceW = contentRight - fieldX - controlGap - refreshButtonW;
         const int micComboW = contentRight - fieldX;
@@ -1788,7 +1802,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         SendMessageW(mic, CB_SETMINVISIBLE, 12, 0);
 
         CreateWindowW(L"STATIC", L"Music Volume", WS_CHILD | WS_VISIBLE, labelX, S(388), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        HWND gain = CreateWindowW(TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TBS_AUTOTICKS, fieldX, S(384), gainSliderW, S(30), hwnd, reinterpret_cast<HMENU>(IDC_GAIN), nullptr, nullptr);
+        HWND gain = CreateWindowW(
+            TRACKBAR_CLASSW,
+            L"",
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TBS_AUTOTICKS,
+            fieldX - gainSliderLeftNudge,
+            S(384),
+            gainSliderW + gainSliderLeftNudge,
+            S(30),
+            hwnd,
+            reinterpret_cast<HMENU>(IDC_GAIN),
+            nullptr,
+            nullptr);
         SendMessageW(gain, TBM_SETRANGE, TRUE, MAKELONG(0, kMusicGainSliderMax));
         SendMessageW(gain, TBM_SETTICFREQ, 20, 0);
         SendMessageW(gain, TBM_SETPAGESIZE, 0, 10);
@@ -2063,8 +2088,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (target && hit == HTCLIENT) {
             const int id = GetDlgCtrlID(target);
             if (id == IDC_GAIN) {
-                SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
-                return TRUE;
+                POINT cursorPt{};
+                GetCursorPos(&cursorPt);
+                const bool overThumb = IsPointOverGainThumb(target, cursorPt);
+                const bool draggingThumb = (GetCapture() == target) && ((GetKeyState(VK_LBUTTON) & 0x8000) != 0);
+                if (overThumb || draggingThumb) {
+                    SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                    return TRUE;
+                }
             }
             if (IsHandCursorControlId(id)) {
                 SetCursor(LoadCursorW(nullptr, IDC_HAND));
