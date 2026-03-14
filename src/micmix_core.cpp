@@ -2236,13 +2236,17 @@ public:
             return;
         }
         stopRequested_.store(false, std::memory_order_release);
+        controlToken_.store(GenerateControlToken(this), std::memory_order_release);
         threadReady_ = false;
+        lastRejectedHotkeyLogTick_ = 0;
         try {
             thread_ = std::thread([this]() { ThreadMain(); });
         } catch (const std::exception& ex) {
+            controlToken_.store(0, std::memory_order_release);
             LogError(std::string("mute_hotkey thread start failed: ") + ex.what());
             return;
         } catch (...) {
+            controlToken_.store(0, std::memory_order_release);
             LogError("mute_hotkey thread start failed: unknown");
             return;
         }
@@ -2253,18 +2257,24 @@ public:
 
     void Stop() {
         stopRequested_.store(true, std::memory_order_release);
+        const uint64_t token = controlToken_.load(std::memory_order_acquire);
         DWORD threadId = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             threadId = threadId_;
         }
-        if (threadId != 0) {
-            PostThreadMessageW(threadId, WM_APP + 0x12, 0, 0);
+        if (threadId != 0 && token != 0) {
+            PostThreadMessageW(
+                threadId,
+                kMsgStopThread,
+                kMsgStopTag,
+                static_cast<LPARAM>(static_cast<UINT_PTR>(token)));
         }
         if (thread_.joinable()) {
             thread_.join();
         }
         stopRequested_.store(false, std::memory_order_release);
+        controlToken_.store(0, std::memory_order_release);
     }
 
     void ApplySettings(const MicMixSettings& settings) {
@@ -2280,18 +2290,28 @@ public:
         if (!changed) {
             return;
         }
+        const uint64_t token = controlToken_.load(std::memory_order_acquire);
         DWORD threadId = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             threadId = threadId_;
         }
-        if (threadId != 0) {
-            PostThreadMessageW(threadId, WM_APP + 0x11, 0, 0);
+        if (threadId != 0 && token != 0) {
+            PostThreadMessageW(
+                threadId,
+                kMsgApplySettings,
+                kMsgApplyTag,
+                static_cast<LPARAM>(static_cast<UINT_PTR>(token)));
         }
     }
 
 private:
     static constexpr int kHotkeyId = 0x4D4D;
+    static constexpr UINT kMsgApplySettings = WM_APP + 0x11;
+    static constexpr UINT kMsgStopThread = WM_APP + 0x12;
+    static constexpr WPARAM kMsgApplyTag = static_cast<WPARAM>(0x0A11C0DEu);
+    static constexpr WPARAM kMsgStopTag = static_cast<WPARAM>(0x05E0C0DEu);
+    static constexpr uint64_t kRejectedHotkeyLogIntervalMs = 5000ULL;
     std::function<void()> onHotkey_;
     std::thread thread_;
     std::mutex mutex_;
@@ -2303,7 +2323,77 @@ private:
     UINT registeredMods_ = 0;
     UINT registeredVk_ = 0;
     bool registeredValid_ = false;
+    std::atomic<uint64_t> controlToken_{0};
+    uint64_t lastRejectedHotkeyLogTick_ = 0;
     std::atomic<bool> stopRequested_{false};
+
+    static uint64_t GenerateControlToken(const GlobalHotkeyManager* self) {
+        static std::atomic<uint64_t> sequence{0};
+        uint64_t seed = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(self));
+        LARGE_INTEGER qpc{};
+        QueryPerformanceCounter(&qpc);
+        seed ^= static_cast<uint64_t>(qpc.QuadPart);
+        seed ^= static_cast<uint64_t>(GetTickCount64());
+        seed ^= static_cast<uint64_t>(GetCurrentProcessId()) << 32;
+        seed ^= static_cast<uint64_t>(sequence.fetch_add(1, std::memory_order_relaxed) + 1);
+
+        // splitmix64 finalizer for good bit diffusion.
+        seed ^= seed >> 30;
+        seed *= 0xBF58476D1CE4E5B9ULL;
+        seed ^= seed >> 27;
+        seed *= 0x94D049BB133111EBULL;
+        seed ^= seed >> 31;
+        if (seed == 0) {
+            seed = 0x7B23D4E1A9135C4FULL;
+        }
+        return seed;
+    }
+
+    static bool IsVirtualKeyDown(UINT vk) {
+        return (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
+    }
+
+    static bool IsRequiredModifiersDown(UINT mods) {
+        if ((mods & MOD_SHIFT) && !IsVirtualKeyDown(VK_SHIFT) && !IsVirtualKeyDown(VK_LSHIFT) && !IsVirtualKeyDown(VK_RSHIFT)) {
+            return false;
+        }
+        if ((mods & MOD_CONTROL) && !IsVirtualKeyDown(VK_CONTROL) && !IsVirtualKeyDown(VK_LCONTROL) && !IsVirtualKeyDown(VK_RCONTROL)) {
+            return false;
+        }
+        if ((mods & MOD_ALT) && !IsVirtualKeyDown(VK_MENU) && !IsVirtualKeyDown(VK_LMENU) && !IsVirtualKeyDown(VK_RMENU)) {
+            return false;
+        }
+        if ((mods & MOD_WIN) && !IsVirtualKeyDown(VK_LWIN) && !IsVirtualKeyDown(VK_RWIN)) {
+            return false;
+        }
+        return true;
+    }
+
+    bool IsAuthorizedControlMessage(const MSG& msg, UINT expectedMsg, WPARAM expectedTag) const {
+        if (msg.message != expectedMsg || msg.wParam != expectedTag) {
+            return false;
+        }
+        const uint64_t token = controlToken_.load(std::memory_order_acquire);
+        if (token == 0) {
+            return false;
+        }
+        return static_cast<uint64_t>(static_cast<UINT_PTR>(msg.lParam)) == token;
+    }
+
+    bool ShouldAcceptHotkeyEvent() {
+        if (!registeredValid_ || registeredVk_ == 0) {
+            return false;
+        }
+        if (!IsRequiredModifiersDown(registeredMods_) || !IsVirtualKeyDown(registeredVk_)) {
+            const uint64_t now = static_cast<uint64_t>(GetTickCount64());
+            if (now - lastRejectedHotkeyLogTick_ >= kRejectedHotkeyLogIntervalMs) {
+                lastRejectedHotkeyLogTick_ = now;
+                LogWarn("mute_hotkey ignored event: physical key state mismatch");
+            }
+            return false;
+        }
+        return true;
+    }
 
     void ApplyRegistration() {
         UINT mods = 0;
@@ -2355,15 +2445,28 @@ private:
 
         while (!stopRequested_.load(std::memory_order_acquire)) {
             while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-                if (msg.message == WM_APP + 0x11) {
+                if (msg.message == kMsgApplySettings) {
+                    if (!IsAuthorizedControlMessage(msg, kMsgApplySettings, kMsgApplyTag)) {
+                        continue;
+                    }
                     ApplyRegistration();
                     continue;
                 }
-                if (msg.message == WM_APP + 0x12 || msg.message == WM_QUIT) {
+                if (msg.message == kMsgStopThread) {
+                    if (!IsAuthorizedControlMessage(msg, kMsgStopThread, kMsgStopTag)) {
+                        continue;
+                    }
+                    stopRequested_.store(true, std::memory_order_release);
+                    break;
+                }
+                if (msg.message == WM_QUIT) {
                     stopRequested_.store(true, std::memory_order_release);
                     break;
                 }
                 if (msg.message == WM_HOTKEY && static_cast<int>(msg.wParam) == kHotkeyId) {
+                    if (!ShouldAcceptHotkeyEvent()) {
+                        continue;
+                    }
                     if (onHotkey_) {
                         try {
                             onHotkey_();
