@@ -1197,35 +1197,94 @@ void DrawLevelMeter(HDC hdc, const RECT& meterRect, bool active, float visualDb,
         return;
     }
     RECT rc = meterRect;
-    FillSolidRect(hdc, rc, RGB(235, 240, 246));
+    const int left = static_cast<int>(rc.left);
+    const int right = static_cast<int>(rc.right);
+    const int width = right - left;
+    const int height = static_cast<int>(rc.bottom - rc.top);
+    if (width <= 2 || height <= 2) {
+        return;
+    }
 
-    const int width = rc.right - rc.left;
+    constexpr float kYellowStartDb = -24.0f;
+    constexpr float kRedStartDb = -12.0f;
+    const int scaleBandH = std::clamp(S(10), 7, std::max(7, height - S(8)));
+    RECT scaleRc = rc;
+    scaleRc.bottom = std::min(rc.bottom, rc.top + scaleBandH);
+    RECT barRc = rc;
+    barRc.top = std::min(rc.bottom - 1, scaleRc.bottom);
+
+    FillSolidRect(hdc, scaleRc, RGB(244, 247, 252));
+    FillSolidRect(hdc, barRc, RGB(235, 240, 246));
+
+    const std::array<int, 7> tickDb = { -60, -36, -24, -18, -12, -6, 0 };
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(96, 107, 122));
+    HGDIOBJ oldFont = SelectObject(hdc, g_fontTiny ? g_fontTiny : (g_fontHint ? g_fontHint : g_fontSmall));
+    for (size_t i = 0; i < tickDb.size(); ++i) {
+        const int db = tickDb[i];
+        int x = left + MeterDbToPixels(static_cast<float>(db), width);
+        x = std::clamp(x, left, right - 1);
+
+        const COLORREF guideColor = (db == -24)
+            ? RGB(198, 176, 104)
+            : (db == -12 || db == 0)
+                ? RGB(198, 130, 124)
+                : RGB(206, 214, 225);
+        HPEN guidePen = CreatePen(PS_SOLID, 1, guideColor);
+        HGDIOBJ oldGuidePen = SelectObject(hdc, guidePen);
+        MoveToEx(hdc, x, barRc.top, nullptr);
+        LineTo(hdc, x, barRc.bottom);
+        SelectObject(hdc, oldGuidePen);
+        DeleteObject(guidePen);
+
+        RECT tickRc{ x, scaleRc.bottom - S(3), x + 1, scaleRc.bottom };
+        FillSolidRect(hdc, tickRc, RGB(162, 171, 184));
+
+        wchar_t label[8]{};
+        swprintf_s(label, L"%d", db);
+        SIZE textSize{};
+        if (GetTextExtentPoint32W(hdc, label, lstrlenW(label), &textSize) != 0) {
+            int textLeft = x - (textSize.cx / 2);
+            if (i == 0) {
+                textLeft = left + S(2);
+            } else if (i == (tickDb.size() - 1)) {
+                textLeft = right - textSize.cx - S(2);
+            } else {
+                const int labelMinX = left + S(2);
+                const int labelMaxX = right - static_cast<int>(textSize.cx) - S(2);
+                textLeft = std::clamp(textLeft, labelMinX, labelMaxX);
+            }
+            TextOutW(hdc, textLeft, scaleRc.top, label, lstrlenW(label));
+        }
+    }
+    SelectObject(hdc, oldFont);
+
+    const int barWidth = std::max(1, static_cast<int>(barRc.right - barRc.left));
     const int levelPx = std::clamp(MeterDbToPixels(visualDb, width), 0, width);
     const int holdPx = std::clamp(MeterDbToPixels(holdDb, width), 0, width - 1);
-    // Intentionally stricter: show warning zones earlier to encourage lower music levels.
-    const int greenEnd = static_cast<int>(width * 0.55f);
-    const int yellowEnd = static_cast<int>(width * 0.78f);
+    const int greenEnd = std::clamp(MeterDbToPixels(kYellowStartDb, barWidth), 0, barWidth);
+    const int yellowEnd = std::clamp(MeterDbToPixels(kRedStartDb, barWidth), 0, barWidth);
 
     if (active && levelPx > 0) {
-        RECT seg = rc;
-        seg.right = rc.left + std::min(levelPx, greenEnd);
+        RECT seg = barRc;
+        seg.right = barRc.left + std::min(levelPx, greenEnd);
         if (seg.right > seg.left) FillSolidRect(hdc, seg, RGB(54, 181, 78));
 
         if (levelPx > greenEnd) {
-            seg.left = rc.left + greenEnd;
-            seg.right = rc.left + std::min(levelPx, yellowEnd);
+            seg.left = barRc.left + greenEnd;
+            seg.right = barRc.left + std::min(levelPx, yellowEnd);
             if (seg.right > seg.left) FillSolidRect(hdc, seg, RGB(232, 191, 58));
         }
         if (levelPx > yellowEnd) {
-            seg.left = rc.left + yellowEnd;
-            seg.right = rc.left + levelPx;
+            seg.left = barRc.left + yellowEnd;
+            seg.right = barRc.left + levelPx;
             if (seg.right > seg.left) FillSolidRect(hdc, seg, RGB(214, 75, 63));
         }
 
         HPEN holdPen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
         HGDIOBJ oldPen = SelectObject(hdc, holdPen);
-        MoveToEx(hdc, rc.left + holdPx, rc.top, nullptr);
-        LineTo(hdc, rc.left + holdPx, rc.bottom);
+        MoveToEx(hdc, barRc.left + holdPx, barRc.top, nullptr);
+        LineTo(hdc, barRc.left + holdPx, barRc.bottom);
         SelectObject(hdc, oldPen);
         DeleteObject(holdPen);
     }
@@ -1570,18 +1629,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         CreateWindowW(L"STATIC", L"-15.0 dB", WS_CHILD | WS_VISIBLE, valueTextX, S(388), S(102), S(24), hwnd, reinterpret_cast<HMENU>(IDC_GAIN_VALUE), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Max is -2 dB to reduce clipping risk", WS_CHILD | WS_VISIBLE, fieldX, S(414), S(330), S(20), hwnd, reinterpret_cast<HMENU>(IDC_GAIN_HINT), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Music Meter", WS_CHILD | WS_VISIBLE, labelX, S(438), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        g_rcMeter = { fieldX, S(436), fieldX + meterW, S(436) + S(24) };
-        g_rcMusicClip = { fieldX, S(462), fieldX + meterW, S(462) + S(12) };
+        g_rcMeter = { fieldX, S(436), fieldX + meterW, S(436) + S(28) };
+        g_rcMusicClip = { fieldX, S(466), fieldX + meterW, S(466) + S(12) };
         CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, statusTextX, S(438), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_METER_TEXT), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, statusTextX, S(462), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_CLIP_EVENTS), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, statusTextX, S(466), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_CLIP_EVENTS), nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Send music when mic is silent", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, fieldX, S(480), S(260), S(28), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX), nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Mute music", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, muteToggleX, S(480), S(120), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUTE), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Music keeps sending even when you are not speaking", WS_CHILD | WS_VISIBLE, fieldX, S(510), S(360), S(18), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX_HINT), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Mic Meter", WS_CHILD | WS_VISIBLE, labelX, S(534), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        g_rcMicMeter = { fieldX, S(532), fieldX + meterW, S(532) + S(24) };
-        g_rcMicClip = { fieldX, S(558), fieldX + meterW, S(558) + S(12) };
+        g_rcMicMeter = { fieldX, S(532), fieldX + meterW, S(532) + S(28) };
+        g_rcMicClip = { fieldX, S(562), fieldX + meterW, S(562) + S(12) };
         CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, statusTextX, S(534), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_TEXT), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, statusTextX, S(558), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_CLIP_EVENTS), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, statusTextX, S(562), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_CLIP_EVENTS), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Only while connected", WS_CHILD | WS_VISIBLE, fieldX, S(576), S(180), S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_HINT), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"MicMix-Mute-Hotkey", WS_CHILD | WS_VISIBLE, labelX, S(596), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Set...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, fieldX, S(592), S(160), S(30), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_SET), nullptr, nullptr);
