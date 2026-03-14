@@ -104,6 +104,10 @@ int ts3plugin_init() {
         }
         char configPath[1024]{};
         g_ts3Functions.getConfigPath(configPath, sizeof(configPath));
+        configPath[sizeof(configPath) - 1] = '\0';
+        if (configPath[0] == '\0') {
+            return 1;
+        }
         const bool ok = MicMixApp::Instance().Initialize(configPath);
         return ok ? 0 : 1;
     } catch (const std::exception& ex) {
@@ -132,11 +136,16 @@ void ts3plugin_registerPluginID(const char* id) {
     if (!id || id[0] == '\0') {
         return;
     }
+    constexpr size_t kMaxPluginIdLen = 1024;
+    const size_t idLen = strnlen_s(id, kMaxPluginIdLen + 1);
+    if (idLen == 0 || idLen > kMaxPluginIdLen) {
+        return;
+    }
     if (g_pluginIdRaw) {
         std::free(g_pluginIdRaw);
         g_pluginIdRaw = nullptr;
     }
-    const size_t len = std::strlen(id) + 1;
+    const size_t len = idLen + 1;
     g_pluginIdRaw = static_cast<char*>(std::malloc(len));
     if (!g_pluginIdRaw) {
         return;

@@ -51,6 +51,7 @@ constexpr uint64_t kMusicMetaUpdateMinIntervalMs = 2000ULL;
 constexpr uint64_t kClipIndicatorHoldMs = 2600ULL;
 constexpr uint32_t kMinSupportedSourceRate = 8000;
 constexpr uint32_t kMaxSupportedSourceRate = 384000;
+constexpr uintmax_t kMaxConfigBytes = 1024U * 1024U;
 
 bool IsSupportedSourceRate(uint32_t sampleRate) {
     return sampleRate >= kMinSupportedSourceRate && sampleRate <= kMaxSupportedSourceRate;
@@ -962,16 +963,25 @@ bool ConfigStore::Load(MicMixSettings& outSettings, std::string& warning) {
         warning += msg;
     };
 
-    std::ifstream in(std::filesystem::path(Utf8ToWide(configPath_)));
+    std::filesystem::path loadPath = std::filesystem::path(Utf8ToWide(configPath_));
+    std::ifstream in(loadPath);
     bool usedLegacyConfig = false;
     if (!in.is_open()) {
         in.clear();
-        in.open(std::filesystem::path(Utf8ToWide(legacyConfigPath_)));
+        loadPath = std::filesystem::path(Utf8ToWide(legacyConfigPath_));
+        in.open(loadPath);
         usedLegacyConfig = in.is_open();
         if (!usedLegacyConfig) {
             return true;
         }
         appendWarning("Loaded legacy config.json file; settings will migrate to config.ini on next save.");
+    }
+
+    std::error_code sizeEc;
+    const uintmax_t sizeBytes = std::filesystem::file_size(loadPath, sizeEc);
+    if (!sizeEc && sizeBytes > kMaxConfigBytes) {
+        appendWarning("Config too large; file ignored.");
+        return true;
     }
 
     std::unordered_map<std::string, std::string> kv;
@@ -1288,6 +1298,10 @@ void AudioEngine::NoteReconnect() {
 
 void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channels, int* edited) {
     if (!samples || sampleCount <= 0 || channels <= 0 || !edited) {
+        return;
+    }
+    // Defensive bounds against malformed callback metadata.
+    if (channels > 8 || sampleCount > kTargetRate) {
         return;
     }
     const int upstreamFlags = *edited;

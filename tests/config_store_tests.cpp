@@ -128,6 +128,29 @@ bool TestInvalidJsonReportsParseWarning() {
     return pass;
 }
 
+bool TestOversizedConfigIgnored() {
+    const fs::path base = MakeUniqueBaseDir("oversized_config");
+    ConfigStore store(base.string());
+    std::string payload(1024 * 1024 + 64, 'a');
+    payload += "\nsource.mode=app_session\n";
+    if (!WriteFile(store.ConfigPath(), payload)) {
+        std::cerr << "FAIL: could not write config file for oversized_config" << std::endl;
+        return false;
+    }
+
+    MicMixSettings settings{};
+    settings.sourceMode = SourceMode::Loopback;
+
+    std::string warning;
+    const bool ok = store.Load(settings, warning);
+    bool pass = true;
+    pass &= Expect(ok, "Load(oversized_config) should return true with warning");
+    pass &= Expect(settings.sourceMode == SourceMode::Loopback, "Oversized config should be ignored");
+    pass &= Expect(warning.find("Config too large; file ignored.") != std::string::npos,
+                   "Oversized config should emit size warning");
+    return pass;
+}
+
 } // namespace
 
 int main() {
@@ -139,6 +162,9 @@ int main() {
         ++failed;
     }
     if (!TestInvalidJsonReportsParseWarning()) {
+        ++failed;
+    }
+    if (!TestOversizedConfigIgnored()) {
         ++failed;
     }
 
