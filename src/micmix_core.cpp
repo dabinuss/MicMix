@@ -538,6 +538,8 @@ void SanitizeSettings(MicMixSettings& s) {
     s.micGateThresholdDbfs = std::clamp(s.micGateThresholdDbfs, -90.0f, 0.0f);
     s.muteHotkeyModifiers &= (MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN);
     s.muteHotkeyVk = std::clamp(s.muteHotkeyVk, 0, 255);
+    s.micInputMuteHotkeyModifiers &= (MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN);
+    s.micInputMuteHotkeyVk = std::clamp(s.micInputMuteHotkeyVk, 0, 255);
     s.uiLastOpenTab = std::max(0, s.uiLastOpenTab);
     if (s.micGateMode != MicGateMode::AutoTs && s.micGateMode != MicGateMode::Custom) {
         s.micGateMode = MicGateMode::AutoTs;
@@ -569,10 +571,13 @@ bool IsSameSettings(const MicMixSettings& a, const MicMixSettings& b) {
            a.forceTxEnabled == b.forceTxEnabled &&
            a.bufferTargetMs == b.bufferTargetMs &&
            a.musicMuted == b.musicMuted &&
+           a.micInputMuted == b.micInputMuted &&
            a.uiLastOpenTab == b.uiLastOpenTab &&
            a.autoSwitchToLoopback == b.autoSwitchToLoopback &&
            a.muteHotkeyModifiers == b.muteHotkeyModifiers &&
            a.muteHotkeyVk == b.muteHotkeyVk &&
+           a.micInputMuteHotkeyModifiers == b.micInputMuteHotkeyModifiers &&
+           a.micInputMuteHotkeyVk == b.micInputMuteHotkeyVk &&
            a.captureDeviceId == b.captureDeviceId &&
            a.micGateMode == b.micGateMode &&
            NearlyEqual(a.micGateThresholdDbfs, b.micGateThresholdDbfs) &&
@@ -1043,8 +1048,11 @@ bool ConfigStore::Load(MicMixSettings& outSettings, std::string& warning) {
     if (auto it = kv.find("mix.force_tx_enabled"); it != kv.end()) outSettings.forceTxEnabled = ::ParseBool(it->second, outSettings.forceTxEnabled);
     parseInt("mix.buffer_target_ms", outSettings.bufferTargetMs);
     if (auto it = kv.find("mix.music_muted"); it != kv.end()) outSettings.musicMuted = ::ParseBool(it->second, outSettings.musicMuted);
+    if (auto it = kv.find("mic.input_muted"); it != kv.end()) outSettings.micInputMuted = ::ParseBool(it->second, outSettings.micInputMuted);
     parseInt("hotkey.mute.modifiers", outSettings.muteHotkeyModifiers);
     parseInt("hotkey.mute.vk", outSettings.muteHotkeyVk);
+    parseInt("hotkey.mic_input_mute.modifiers", outSettings.micInputMuteHotkeyModifiers);
+    parseInt("hotkey.mic_input_mute.vk", outSettings.micInputMuteHotkeyVk);
     if (auto it = kv.find("capture.device_id"); it != kv.end()) outSettings.captureDeviceId = it->second;
     if (auto it = kv.find("mic.gate.mode"); it != kv.end()) outSettings.micGateMode = MicGateModeFromString(it->second);
     parseFloat("mic.gate.threshold_dbfs", outSettings.micGateThresholdDbfs);
@@ -1076,8 +1084,11 @@ bool ConfigStore::Save(const MicMixSettings& settings, std::string& error) {
     ss << "mix.force_tx_enabled=" << BoolToString(safe.forceTxEnabled) << "\n";
     ss << "mix.buffer_target_ms=" << safe.bufferTargetMs << "\n";
     ss << "mix.music_muted=" << BoolToString(safe.musicMuted) << "\n";
+    ss << "mic.input_muted=" << BoolToString(safe.micInputMuted) << "\n";
     ss << "hotkey.mute.modifiers=" << safe.muteHotkeyModifiers << "\n";
     ss << "hotkey.mute.vk=" << safe.muteHotkeyVk << "\n";
+    ss << "hotkey.mic_input_mute.modifiers=" << safe.micInputMuteHotkeyModifiers << "\n";
+    ss << "hotkey.mic_input_mute.vk=" << safe.micInputMuteHotkeyVk << "\n";
     ss << "capture.device_id=" << safe.captureDeviceId << "\n";
     ss << "mic.gate.mode=" << MicGateModeToString(safe.micGateMode) << "\n";
     ss << "mic.gate.threshold_dbfs=" << safe.micGateThresholdDbfs << "\n";
@@ -1135,6 +1146,7 @@ void AudioEngine::ApplySettings(const MicMixSettings& settings) {
     if (settings.musicMuted && !wasMuted) {
         ring_.Reset();
     }
+    micInputMuted_.store(settings.micInputMuted, std::memory_order_release);
     forceTxEnabled_.store(settings.forceTxEnabled, std::memory_order_release);
     musicGainLinear_.store(DbToLinear(gainDb), std::memory_order_release);
     bufferTargetMs_.store(bufferMs, std::memory_order_release);
@@ -1186,6 +1198,18 @@ void AudioEngine::ToggleMute() {
         ring_.Reset();
     }
 }
+
+void AudioEngine::SetMicInputMuted(bool muted) {
+    micInputMuted_.store(muted, std::memory_order_release);
+}
+
+void AudioEngine::ToggleMicInputMute() {
+    bool expected = micInputMuted_.load(std::memory_order_relaxed);
+    while (!micInputMuted_.compare_exchange_weak(
+        expected, !expected, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+    }
+}
+
 void AudioEngine::ClearMusicBuffer() {
     ring_.Reset();
 }
@@ -1308,6 +1332,7 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
     const uint64_t nowMs = GetTickCount64();
     lastConsumeTickMs_.store(nowMs, std::memory_order_release);
     const bool muted = musicMuted_.load(std::memory_order_relaxed);
+    const bool micInputMuted = micInputMuted_.load(std::memory_order_relaxed);
     const bool sourceRunning = sourceRunning_.load(std::memory_order_relaxed);
     const bool forceTx = forceTxEnabled_.load(std::memory_order_relaxed);
     const bool talkOpen = talkState_.load(std::memory_order_relaxed);
@@ -1351,6 +1376,7 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
         limiterGain = std::clamp(limiterGain, 0.1f, 1.0f);
     };
     const bool hasQueuedMusic = ring_.Size() > 0;
+    const bool applyMicInputMute = micInputMuted && sourceRunning && !muted;
     const uint64_t lastSignalMs = lastMusicSignalTickMs_.load(std::memory_order_relaxed);
     const bool recentMusicSignal = sourceRunning && !muted && (nowMs <= (lastSignalMs + kForceTxMusicWindowMs));
 
@@ -1403,12 +1429,13 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
         // bit 1 (value 1): audio buffer modified
         // bit 2 (value 2): packet should be sent
         // Keep upstream flags untouched when we did not mix anything.
-        if (gateGain < 0.9999f || targetGateGain < 0.9999f) {
+        if (applyMicInputMute || gateGain < 0.9999f || targetGateGain < 0.9999f) {
             for (int i = 0; i < sampleCount; ++i) {
                 advanceGate();
                 for (int ch = 0; ch < channels; ++ch) {
                     const int idx = (i * channels) + ch;
-                    const float dry = (static_cast<float>(samples[idx]) / 32768.0f) * gateGain;
+                    const float dryInput = applyMicInputMute ? 0.0f : (static_cast<float>(samples[idx]) / 32768.0f);
+                    const float dry = dryInput * gateGain;
                     const float clipped = std::clamp(dry, -1.0f, 1.0f);
                     const short next = static_cast<short>(std::lrintf(clipped * 32767.0f));
                     if (next != samples[idx]) {
@@ -1426,7 +1453,7 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
         micGateGain_.store(gateGain, std::memory_order_relaxed);
         limiterGain_.store(limiterGain, std::memory_order_relaxed);
         int outFlags = upstreamFlags;
-        if (gateTouched || !talkOpen) {
+        if (gateTouched) {
             outFlags |= 1;
         }
         if (forceTx && recentMusicSignal) {
@@ -1464,7 +1491,8 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
             float framePrePeak = 0.0f;
             for (int ch = 0; ch < channels; ++ch) {
                 const int idx = ((offset + i) * channels) + ch;
-                const float dry = (static_cast<float>(samples[idx]) / 32768.0f) * gateGain;
+                const float dryInput = applyMicInputMute ? 0.0f : (static_cast<float>(samples[idx]) / 32768.0f);
+                const float dry = dryInput * gateGain;
                 const float pre = dry + m;
                 framePrePeak = std::max(framePrePeak, std::fabs(pre));
             }
@@ -1472,7 +1500,8 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
             for (int ch = 0; ch < channels; ++ch) {
                 const int idx = ((offset + i) * channels) + ch;
                 const short prevSample = samples[idx];
-                const float dry = (static_cast<float>(samples[idx]) / 32768.0f) * gateGain;
+                const float dryInput = applyMicInputMute ? 0.0f : (static_cast<float>(samples[idx]) / 32768.0f);
+                const float dry = dryInput * gateGain;
                 float out = dry + m;
                 out *= limiterGain;
                 const float absOut = std::fabs(out);
@@ -2223,8 +2252,13 @@ private:
 
 class GlobalHotkeyManager {
 public:
-    explicit GlobalHotkeyManager(std::function<void()> onHotkey)
-        : onHotkey_(std::move(onHotkey)) {}
+    using HotkeyExtractor = std::function<void(const MicMixSettings&, UINT&, UINT&)>;
+
+    GlobalHotkeyManager(std::function<void()> onHotkey, HotkeyExtractor extractor, int hotkeyId, std::string logTag)
+        : onHotkey_(std::move(onHotkey)),
+          extractor_(std::move(extractor)),
+          hotkeyId_(hotkeyId),
+          logTag_(std::move(logTag)) {}
 
     ~GlobalHotkeyManager() {
         Stop();
@@ -2243,15 +2277,15 @@ public:
             thread_ = std::thread([this]() { ThreadMain(); });
         } catch (const std::exception& ex) {
             controlToken_.store(0, std::memory_order_release);
-            LogError(std::string("mute_hotkey thread start failed: ") + ex.what());
+            LogError(logTag_ + " thread start failed: " + ex.what());
             return;
         } catch (...) {
             controlToken_.store(0, std::memory_order_release);
-            LogError("mute_hotkey thread start failed: unknown");
+            LogError(logTag_ + " thread start failed: unknown");
             return;
         }
         if (!startedCv_.wait_for(lock, std::chrono::seconds(2), [this]() { return threadReady_; })) {
-            LogWarn("mute_hotkey thread ready timeout");
+            LogWarn(logTag_ + " thread ready timeout");
         }
     }
 
@@ -2278,8 +2312,11 @@ public:
     }
 
     void ApplySettings(const MicMixSettings& settings) {
-        const UINT newMods = static_cast<UINT>(std::max(0, settings.muteHotkeyModifiers));
-        const UINT newVk = static_cast<UINT>(std::max(0, settings.muteHotkeyVk));
+        UINT newMods = 0;
+        UINT newVk = 0;
+        if (extractor_) {
+            extractor_(settings, newMods, newVk);
+        }
         bool changed = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -2306,13 +2343,15 @@ public:
     }
 
 private:
-    static constexpr int kHotkeyId = 0x4D4D;
     static constexpr UINT kMsgApplySettings = WM_APP + 0x11;
     static constexpr UINT kMsgStopThread = WM_APP + 0x12;
     static constexpr WPARAM kMsgApplyTag = static_cast<WPARAM>(0x0A11C0DEu);
     static constexpr WPARAM kMsgStopTag = static_cast<WPARAM>(0x05E0C0DEu);
     static constexpr uint64_t kRejectedHotkeyLogIntervalMs = 5000ULL;
     std::function<void()> onHotkey_;
+    HotkeyExtractor extractor_;
+    int hotkeyId_ = 0;
+    std::string logTag_;
     std::thread thread_;
     std::mutex mutex_;
     std::condition_variable startedCv_;
@@ -2388,7 +2427,7 @@ private:
             const uint64_t now = static_cast<uint64_t>(GetTickCount64());
             if (now - lastRejectedHotkeyLogTick_ >= kRejectedHotkeyLogIntervalMs) {
                 lastRejectedHotkeyLogTick_ = now;
-                LogWarn("mute_hotkey ignored event: physical key state mismatch");
+                LogWarn(logTag_ + " ignored event: physical key state mismatch");
             }
             return false;
         }
@@ -2404,7 +2443,9 @@ private:
             vk = vk_;
         }
 
-        UnregisterHotKey(nullptr, kHotkeyId);
+        if (hotkeyId_ != 0) {
+            UnregisterHotKey(nullptr, hotkeyId_);
+        }
         if (vk == 0) {
             registeredValid_ = false;
             return;
@@ -2414,15 +2455,15 @@ private:
 #ifdef MOD_NOREPEAT
         regMods |= MOD_NOREPEAT;
 #endif
-        if (!RegisterHotKey(nullptr, kHotkeyId, regMods, vk)) {
+        if (hotkeyId_ == 0 || !RegisterHotKey(nullptr, hotkeyId_, regMods, vk)) {
             registeredValid_ = false;
-            LogWarn("mute_hotkey register failed vk=" + std::to_string(vk) +
+            LogWarn(logTag_ + " register failed vk=" + std::to_string(vk) +
                     " mods=" + std::to_string(mods) +
                     " err=" + std::to_string(GetLastError()));
         } else {
             const bool changed = (!registeredValid_) || (registeredMods_ != mods) || (registeredVk_ != vk);
             if (changed) {
-                LogInfo("mute_hotkey registered vk=" + std::to_string(vk) +
+                LogInfo(logTag_ + " registered vk=" + std::to_string(vk) +
                         " mods=" + std::to_string(mods));
             }
             registeredMods_ = mods;
@@ -2463,7 +2504,7 @@ private:
                     stopRequested_.store(true, std::memory_order_release);
                     break;
                 }
-                if (msg.message == WM_HOTKEY && static_cast<int>(msg.wParam) == kHotkeyId) {
+                if (msg.message == WM_HOTKEY && static_cast<int>(msg.wParam) == hotkeyId_) {
                     if (!ShouldAcceptHotkeyEvent()) {
                         continue;
                     }
@@ -2471,9 +2512,9 @@ private:
                         try {
                             onHotkey_();
                         } catch (const std::exception& ex) {
-                            LogError(std::string("mute_hotkey callback exception: ") + ex.what());
+                            LogError(logTag_ + " callback exception: " + ex.what());
                         } catch (...) {
-                            LogError("mute_hotkey callback exception: unknown");
+                            LogError(logTag_ + " callback exception: unknown");
                         }
                     }
                 }
@@ -2484,7 +2525,9 @@ private:
             MsgWaitForMultipleObjectsEx(0, nullptr, 200, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         }
 
-        UnregisterHotKey(nullptr, kHotkeyId);
+        if (hotkeyId_ != 0) {
+            UnregisterHotKey(nullptr, hotkeyId_);
+        }
         {
             std::lock_guard<std::mutex> lock(mutex_);
             threadId_ = 0;
@@ -4070,11 +4113,26 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
         // some driver/device combinations and TS microphone preview.
         // Mic activity is derived from TS3 capture callback path.
         micLevelMonitor_.reset();
-        hotkeyManager_ = std::make_unique<GlobalHotkeyManager>([this]() {
-            this->ToggleMute();
-        });
-        hotkeyManager_->Start();
-        hotkeyManager_->ApplySettings(settings_);
+        musicMuteHotkeyManager_ = std::make_unique<GlobalHotkeyManager>(
+            [this]() { this->ToggleMute(); },
+            [](const MicMixSettings& s, UINT& mods, UINT& vk) {
+                mods = static_cast<UINT>(std::max(0, s.muteHotkeyModifiers));
+                vk = static_cast<UINT>(std::max(0, s.muteHotkeyVk));
+            },
+            0x4D4D,
+            "music_mute_hotkey");
+        micInputMuteHotkeyManager_ = std::make_unique<GlobalHotkeyManager>(
+            [this]() { this->ToggleMicInputMute(); },
+            [](const MicMixSettings& s, UINT& mods, UINT& vk) {
+                mods = static_cast<UINT>(std::max(0, s.micInputMuteHotkeyModifiers));
+                vk = static_cast<UINT>(std::max(0, s.micInputMuteHotkeyVk));
+            },
+            0x4D4E,
+            "mic_input_hotkey");
+        musicMuteHotkeyManager_->Start();
+        micInputMuteHotkeyManager_->Start();
+        musicMuteHotkeyManager_->ApplySettings(settings_);
+        micInputMuteHotkeyManager_->ApplySettings(settings_);
         auto sourceManager = std::make_shared<AudioSourceManager>(
             [this](const float* data, size_t count) { engine_.PushMusicSamples(data, count); },
             [this](SourceState st, const std::string& code, const std::string& msg, const std::string& detail) {
@@ -4108,7 +4166,8 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
     }
 
     StopVoiceTxThread();
-    if (hotkeyManager_) hotkeyManager_->Stop();
+    if (musicMuteHotkeyManager_) musicMuteHotkeyManager_->Stop();
+    if (micInputMuteHotkeyManager_) micInputMuteHotkeyManager_->Stop();
     if (const auto sourceManager = sourceManager_.load(std::memory_order_acquire)) {
         sourceManager->Stop();
     }
@@ -4116,7 +4175,8 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
         mixMonitor->SetEnabled(false);
     }
     micLevelMonitor_.reset();
-    hotkeyManager_.reset();
+    musicMuteHotkeyManager_.reset();
+    micInputMuteHotkeyManager_.reset();
     sourceManager_.store({}, std::memory_order_release);
     mixMonitorPlayer_.store({}, std::memory_order_release);
     configStore_.reset();
@@ -4134,7 +4194,8 @@ void MicMixApp::Shutdown() {
         musicMetaLastAttemptMs_ = 0;
     }
     SettingsWindowController::Instance().Close();
-    if (hotkeyManager_) hotkeyManager_->Stop();
+    if (musicMuteHotkeyManager_) musicMuteHotkeyManager_->Stop();
+    if (micInputMuteHotkeyManager_) micInputMuteHotkeyManager_->Stop();
     StopVoiceTxThread();
     for (int i = 0; i < 100 && captureCallbacksInFlight_.load(std::memory_order_acquire) > 0; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -4150,7 +4211,8 @@ void MicMixApp::Shutdown() {
         configStore_->Save(settings_, err);
         if (!err.empty()) LogWarn("Config save warning: " + err);
     }
-    hotkeyManager_.reset();
+    musicMuteHotkeyManager_.reset();
+    micInputMuteHotkeyManager_.reset();
     sourceManager_.store({}, std::memory_order_release);
     mixMonitorPlayer_.store({}, std::memory_order_release);
     configStore_.reset();
@@ -4175,8 +4237,11 @@ void MicMixApp::ApplySettings(const MicMixSettings& settings, bool restartSource
     }
 
     engine_.ApplySettings(safe);
-    if (hotkeyManager_) {
-        hotkeyManager_->ApplySettings(safe);
+    if (musicMuteHotkeyManager_) {
+        musicMuteHotkeyManager_->ApplySettings(safe);
+    }
+    if (micInputMuteHotkeyManager_) {
+        micInputMuteHotkeyManager_->ApplySettings(safe);
     }
     if (const auto sourceManager = sourceManager_.load(std::memory_order_acquire)) {
         sourceManager->ApplySettings(safe);
@@ -4204,6 +4269,14 @@ void MicMixApp::ToggleMute() {
     auto s = GetSettings();
     s.musicMuted = engine_.IsMuted();
     ApplySettings(s, false, true);
+}
+
+void MicMixApp::ToggleMicInputMute() {
+    engine_.ToggleMicInputMute();
+    auto s = GetSettings();
+    s.micInputMuted = engine_.IsMicInputMuted();
+    ApplySettings(s, false, true);
+    LogInfo(std::string("mic_input ") + (s.micInputMuted ? "muted" : "unmuted"));
 }
 
 void MicMixApp::SetMonitorEnabled(bool enabled) {

@@ -46,10 +46,13 @@ struct MicMixSettings {
     bool        forceTxEnabled = true;
     int         bufferTargetMs = 60;
     bool        musicMuted = false;
+    bool        micInputMuted = false;
     int         uiLastOpenTab = 0;
     bool        autoSwitchToLoopback = false;
     int         muteHotkeyModifiers = 0;
     int         muteHotkeyVk = 0;
+    int         micInputMuteHotkeyModifiers = 0;
+    int         micInputMuteHotkeyVk = 0;
     std::string captureDeviceId;
     MicGateMode micGateMode = MicGateMode::AutoTs;
     float       micGateThresholdDbfs = -50.0f;
@@ -232,6 +235,9 @@ public:
     void ToggleMute();
     void SetMuted(bool muted);
     bool IsMuted() const { return musicMuted_.load(std::memory_order_relaxed); }
+    void ToggleMicInputMute();
+    void SetMicInputMuted(bool muted);
+    bool IsMicInputMuted() const { return micInputMuted_.load(std::memory_order_relaxed); }
 
     void PushMusicSamples(const float* samples, size_t count);
     void ClearMusicBuffer();
@@ -247,6 +253,7 @@ private:
     SpscRingBuffer<float> ring_;
 
     std::atomic<bool>  musicMuted_{false};
+    std::atomic<bool>  micInputMuted_{false};
     std::atomic<bool>  sourceRunning_{false};
     std::atomic<bool>  forceTxEnabled_{true};
     std::atomic<float> musicGainLinear_{0.5f};
@@ -336,6 +343,7 @@ public:
     void StartSource();
     void StopSource();
     void ToggleMute();
+    void ToggleMicInputMute();
     void SetMonitorEnabled(bool enabled);
     bool IsMonitorEnabled() const;
     void ToggleMonitor();
@@ -376,7 +384,8 @@ private:
     mutable std::mutex settingsMutex_;
     AudioEngine engine_;
     std::atomic<std::shared_ptr<AudioSourceManager>> sourceManager_{};
-    std::unique_ptr<GlobalHotkeyManager> hotkeyManager_;
+    std::unique_ptr<GlobalHotkeyManager> musicMuteHotkeyManager_;
+    std::unique_ptr<GlobalHotkeyManager> micInputMuteHotkeyManager_;
     std::unique_ptr<MicLevelMonitor> micLevelMonitor_;
     std::atomic<std::shared_ptr<MixMonitorPlayer>> mixMonitorPlayer_{};
     std::atomic<uint64> activeSchid_{0};

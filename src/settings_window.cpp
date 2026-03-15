@@ -40,6 +40,7 @@ enum ControlId {
     IDC_GAIN = 1006,
     IDC_GAIN_VALUE = 1007,
     IDC_FORCE_TX = 1008,
+    IDC_MIC_INPUT_MUTE = 1009,
     IDC_MUTE = 1010,
     IDC_AUTOSTART = 1011,
     IDC_START = 1012,
@@ -49,6 +50,8 @@ enum ControlId {
     IDC_METER_TEXT = 1019,
     IDC_MUTE_HOTKEY_SET = 1020,
     IDC_MUTE_HOTKEY_TEXT = 1021,
+    IDC_MIC_INPUT_HOTKEY_SET = 1022,
+    IDC_MIC_INPUT_HOTKEY_TEXT = 1023,
     IDC_MIC_DEVICE = 1024,
     IDC_MIC_METER_TEXT = 1025,
     IDC_MONITOR = 1026,
@@ -65,6 +68,12 @@ enum ControlId {
 enum class SourceChoiceType {
     Loopback,
     App,
+};
+
+enum class HotkeyCaptureTarget {
+    None,
+    MusicMute,
+    MicInputMute,
 };
 
 enum class HeaderStatusBadgeState {
@@ -106,9 +115,11 @@ UiTheme g_theme;
 int g_dpi = 96;
 bool g_loadingUi = false;
 int g_hotkeyRefreshTick = 0;
-bool g_waitingForHotkey = false;
+HotkeyCaptureTarget g_hotkeyCaptureTarget = HotkeyCaptureTarget::None;
 UINT g_muteHotkeyModifiers = 0;
 UINT g_muteHotkeyVk = 0;
+UINT g_micInputMuteHotkeyModifiers = 0;
+UINT g_micInputMuteHotkeyVk = 0;
 std::vector<LoopbackDeviceInfo> g_pendingLoopbacks;
 std::vector<CaptureDeviceInfo> g_pendingCaptureDevices;
 std::vector<AppProcessInfo> g_pendingApps;
@@ -123,6 +134,7 @@ HICON g_loopbackFallbackIcon = nullptr;
 HICON g_appFallbackIcon = nullptr;
 bool g_ownerAutostartChecked = false;
 bool g_ownerForceTxChecked = false;
+bool g_ownerMicInputMuteChecked = false;
 bool g_ownerMuteChecked = false;
 HeaderStatusBadgeState g_headerStatusBadgeState = HeaderStatusBadgeState::Off;
 bool g_windowTitleActive = false;
@@ -144,7 +156,7 @@ constexpr int kMusicGainStepPerDb = 10;
 constexpr int kMusicGainSliderMax = static_cast<int>((kMusicGainMaxDb - kMusicGainMinDb) * static_cast<float>(kMusicGainStepPerDb));
 constexpr int kSourceIconSizePx = 16;
 constexpr int kClientWidthPx = 680;
-constexpr int kClientHeightPx = 710;
+constexpr int kClientHeightPx = 780;
 constexpr int kCardMarginPx = 16;
 constexpr int kCardGapPx = 12;
 constexpr int kCardInnerPaddingPx = 20;
@@ -196,7 +208,7 @@ int S(int px) {
 }
 
 bool IsOwnerCheckboxControlId(int id) {
-    return id == IDC_AUTOSTART || id == IDC_FORCE_TX || id == IDC_MUTE;
+    return id == IDC_AUTOSTART || id == IDC_FORCE_TX || id == IDC_MIC_INPUT_MUTE || id == IDC_MUTE;
 }
 
 bool IsHandCursorControlId(int id) {
@@ -211,8 +223,10 @@ bool IsHandCursorControlId(int id) {
     case IDC_MONITOR:
     case IDC_AUTOSTART:
     case IDC_FORCE_TX:
+    case IDC_MIC_INPUT_MUTE:
     case IDC_MUTE:
     case IDC_MUTE_HOTKEY_SET:
+    case IDC_MIC_INPUT_HOTKEY_SET:
         return true;
     default:
         return false;
@@ -236,6 +250,7 @@ bool GetOwnerCheckboxValue(int id) {
     switch (id) {
     case IDC_AUTOSTART: return g_ownerAutostartChecked;
     case IDC_FORCE_TX: return g_ownerForceTxChecked;
+    case IDC_MIC_INPUT_MUTE: return g_ownerMicInputMuteChecked;
     case IDC_MUTE: return g_ownerMuteChecked;
     default: return false;
     }
@@ -245,6 +260,7 @@ void SetOwnerCheckboxValue(int id, bool value) {
     switch (id) {
     case IDC_AUTOSTART: g_ownerAutostartChecked = value; break;
     case IDC_FORCE_TX: g_ownerForceTxChecked = value; break;
+    case IDC_MIC_INPUT_MUTE: g_ownerMicInputMuteChecked = value; break;
     case IDC_MUTE: g_ownerMuteChecked = value; break;
     default: break;
     }
@@ -772,8 +788,12 @@ std::wstring FormatHotkeyText(UINT mods, UINT vk) {
     return out;
 }
 
+bool IsCapturingHotkey() {
+    return g_hotkeyCaptureTarget != HotkeyCaptureTarget::None;
+}
+
 void UpdateMuteHotkeyLabel(HWND hwnd) {
-    if (g_waitingForHotkey) {
+    if (g_hotkeyCaptureTarget == HotkeyCaptureTarget::MusicMute) {
         return;
     }
     HWND label = GetDlgItem(hwnd, IDC_MUTE_HOTKEY_TEXT);
@@ -784,9 +804,34 @@ void UpdateMuteHotkeyLabel(HWND hwnd) {
     SetWindowTextW(label, text.c_str());
 }
 
-void BeginHotkeyCapture(HWND hwnd) {
-    g_waitingForHotkey = true;
-    SetWindowTextW(GetDlgItem(hwnd, IDC_MUTE_HOTKEY_TEXT), L"Current: Press key... (Esc=Cancel, Del=Clear)");
+void UpdateMicInputMuteHotkeyLabel(HWND hwnd) {
+    if (g_hotkeyCaptureTarget == HotkeyCaptureTarget::MicInputMute) {
+        return;
+    }
+    HWND label = GetDlgItem(hwnd, IDC_MIC_INPUT_HOTKEY_TEXT);
+    if (!label) {
+        return;
+    }
+    const std::wstring text = L"Current: " + FormatHotkeyText(g_micInputMuteHotkeyModifiers, g_micInputMuteHotkeyVk);
+    SetWindowTextW(label, text.c_str());
+}
+
+void UpdateHotkeyLabels(HWND hwnd) {
+    UpdateMuteHotkeyLabel(hwnd);
+    UpdateMicInputMuteHotkeyLabel(hwnd);
+}
+
+void BeginHotkeyCapture(HWND hwnd, HotkeyCaptureTarget target) {
+    g_hotkeyCaptureTarget = target;
+    int labelId = 0;
+    if (target == HotkeyCaptureTarget::MusicMute) {
+        labelId = IDC_MUTE_HOTKEY_TEXT;
+    } else if (target == HotkeyCaptureTarget::MicInputMute) {
+        labelId = IDC_MIC_INPUT_HOTKEY_TEXT;
+    }
+    if (labelId != 0) {
+        SetWindowTextW(GetDlgItem(hwnd, labelId), L"Current: Press key... (Esc=Cancel, Del=Clear)");
+    }
     SetFocus(hwnd);
 }
 
@@ -1028,15 +1073,19 @@ void LoadSettings(HWND hwnd) {
 
     SendMessageW(GetDlgItem(hwnd, IDC_GAIN), TBM_SETPOS, TRUE, GainDbToSlider(s.musicGainDb));
     SetOwnerCheckboxValue(IDC_FORCE_TX, s.forceTxEnabled);
+    SetOwnerCheckboxValue(IDC_MIC_INPUT_MUTE, s.micInputMuted);
     SetOwnerCheckboxValue(IDC_MUTE, s.musicMuted);
     SetOwnerCheckboxValue(IDC_AUTOSTART, s.autostartEnabled);
     InvalidateRect(GetDlgItem(hwnd, IDC_FORCE_TX), nullptr, TRUE);
+    InvalidateRect(GetDlgItem(hwnd, IDC_MIC_INPUT_MUTE), nullptr, TRUE);
     InvalidateRect(GetDlgItem(hwnd, IDC_MUTE), nullptr, TRUE);
     InvalidateRect(GetDlgItem(hwnd, IDC_AUTOSTART), nullptr, TRUE);
     g_muteHotkeyModifiers = static_cast<UINT>(std::max(0, s.muteHotkeyModifiers));
     g_muteHotkeyVk = static_cast<UINT>(std::max(0, s.muteHotkeyVk));
+    g_micInputMuteHotkeyModifiers = static_cast<UINT>(std::max(0, s.micInputMuteHotkeyModifiers));
+    g_micInputMuteHotkeyVk = static_cast<UINT>(std::max(0, s.micInputMuteHotkeyVk));
     UpdateGainLabel(hwnd);
-    UpdateMuteHotkeyLabel(hwnd);
+    UpdateHotkeyLabels(hwnd);
     g_loadingUi = false;
 }
 
@@ -1066,10 +1115,13 @@ MicMixSettings CollectSettings(HWND hwnd) {
 
     s.musicGainDb = SliderToGainDb(static_cast<int>(SendMessageW(GetDlgItem(hwnd, IDC_GAIN), TBM_GETPOS, 0, 0)));
     s.forceTxEnabled = GetOwnerCheckboxValue(IDC_FORCE_TX);
+    s.micInputMuted = GetOwnerCheckboxValue(IDC_MIC_INPUT_MUTE);
     s.musicMuted = GetOwnerCheckboxValue(IDC_MUTE);
     s.autostartEnabled = GetOwnerCheckboxValue(IDC_AUTOSTART);
     s.muteHotkeyModifiers = static_cast<int>(g_muteHotkeyModifiers);
     s.muteHotkeyVk = static_cast<int>(g_muteHotkeyVk);
+    s.micInputMuteHotkeyModifiers = static_cast<int>(g_micInputMuteHotkeyModifiers);
+    s.micInputMuteHotkeyVk = static_cast<int>(g_micInputMuteHotkeyVk);
     return s;
 }
 
@@ -1103,6 +1155,10 @@ void UpdateStatus(HWND hwnd, bool includeDetails = true) {
     if (GetOwnerCheckboxValue(IDC_MUTE) != s.musicMuted) {
         SetOwnerCheckboxValue(IDC_MUTE, s.musicMuted);
         InvalidateRect(GetDlgItem(hwnd, IDC_MUTE), nullptr, TRUE);
+    }
+    if (GetOwnerCheckboxValue(IDC_MIC_INPUT_MUTE) != s.micInputMuted) {
+        SetOwnerCheckboxValue(IDC_MIC_INPUT_MUTE, s.micInputMuted);
+        InvalidateRect(GetDlgItem(hwnd, IDC_MIC_INPUT_MUTE), nullptr, TRUE);
     }
     std::string line1 = "State: " + SourceStateToString(st.state) + "  |  " + (st.message.empty() ? "idle" : st.message);
     if (!st.detail.empty()) {
@@ -1203,6 +1259,7 @@ void ApplyFonts(HWND hwnd) {
     SetControlFont(hwnd, IDC_MIC_CLIP_EVENTS, g_fontClipInfo ? g_fontClipInfo : (g_fontHint ? g_fontHint : g_fontSmall));
     SetControlFont(hwnd, IDC_AUTOSTART, g_fontControlLarge ? g_fontControlLarge : g_fontBody);
     SetControlFont(hwnd, IDC_FORCE_TX, g_fontControlLarge ? g_fontControlLarge : g_fontBody);
+    SetControlFont(hwnd, IDC_MIC_INPUT_MUTE, g_fontControlLarge ? g_fontControlLarge : g_fontBody);
     SetControlFont(hwnd, IDC_MUTE, g_fontControlLarge ? g_fontControlLarge : g_fontBody);
     SetControlFont(hwnd, IDC_MONITOR_HINT, g_fontHint ? g_fontHint : g_fontSmall);
     SetControlFont(hwnd, IDC_MIC_METER_HINT, g_fontHint ? g_fontHint : g_fontSmall);
@@ -1707,6 +1764,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         EnsureUiResources();
         ComputeLayout();
         g_hotkeyRefreshTick = 0;
+        g_hotkeyCaptureTarget = HotkeyCaptureTarget::None;
         g_lastMusicClipEvents = std::numeric_limits<uint64_t>::max();
         g_lastMicClipEvents = std::numeric_limits<uint64_t>::max();
         g_lastMusicMeterLevelPx = -1;
@@ -1742,7 +1800,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const int statusTextX = fieldX + meterW + S(4);
         const int statusTextW = contentRight - statusTextX;
         const int valueTextX = fieldX + gainSliderW;
-        const int muteToggleX = fieldX + S(262);
+        const int forceTxToggleW = S(240);
+        const int muteToggleW = S(156);
+        const int muteToggleGap = S(10);
+        const int muteMusicToggleX = fieldX + muteToggleW + muteToggleGap;
         const int hintTopOffset = S(38);
         const int headerMetaW = S(300);
         const int headerMetaX = contentRight - headerMetaW;
@@ -1770,7 +1831,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const int headerBadgeX = titleX + titleW + S(2);
         const int headerBadgeY = titleY + ((titleH - headerBadgeH) / 2) - S(1);
         const int statusX = contentLeft;
-        const int statusY = S(634);
+        const int statusY = S(704);
         const int statusW = contentRight - statusX;
         const int statusH = S(44);
         g_rcHeaderBadge = { headerBadgeX, headerBadgeY, headerBadgeX + headerBadgeW, headerBadgeY + headerBadgeH };
@@ -1827,18 +1888,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_rcMusicClip = { fieldX, S(466), fieldX + meterW, S(466) + S(12) };
         CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, statusTextX, S(438), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_METER_TEXT), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, statusTextX, S(466), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_CLIP_EVENTS), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Send music when mic is silent", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, fieldX, S(480), S(260), S(28), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Mute music", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, muteToggleX, S(480), S(120), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUTE), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Music keeps sending even when you are not speaking", WS_CHILD | WS_VISIBLE, fieldX, S(510), S(360), S(18), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX_HINT), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Mic Meter", WS_CHILD | WS_VISIBLE, labelX, S(534), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        g_rcMicMeter = { fieldX, S(532), fieldX + meterW, S(532) + S(28) };
-        g_rcMicClip = { fieldX, S(562), fieldX + meterW, S(562) + S(12) };
-        CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, statusTextX, S(534), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_TEXT), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, statusTextX, S(562), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_CLIP_EVENTS), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Only while connected", WS_CHILD | WS_VISIBLE, fieldX, S(576), S(180), S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_HINT), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"MicMix-Mute-Hotkey", WS_CHILD | WS_VISIBLE, labelX, S(596), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Set...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, fieldX, S(592), S(160), S(30), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_SET), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Current: Not set", WS_CHILD | WS_VISIBLE, fieldX + S(172), S(596), S(290), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_TEXT), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Send music when mic is silent", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, fieldX, S(480), forceTxToggleW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Mute mic input", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, fieldX, S(512), muteToggleW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_INPUT_MUTE), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Mute music", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, muteMusicToggleX, S(512), muteToggleW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUTE), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Music keeps sending even when you are not speaking", WS_CHILD | WS_VISIBLE, fieldX, S(544), S(360), S(18), hwnd, reinterpret_cast<HMENU>(IDC_FORCE_TX_HINT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Mic Meter", WS_CHILD | WS_VISIBLE, labelX, S(568), S(130), S(24), hwnd, nullptr, nullptr, nullptr);
+        g_rcMicMeter = { fieldX, S(566), fieldX + meterW, S(566) + S(28) };
+        g_rcMicClip = { fieldX, S(596), fieldX + meterW, S(596) + S(12) };
+        CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, statusTextX, S(568), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_TEXT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, statusTextX, S(596), statusTextW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_CLIP_EVENTS), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Only while connected", WS_CHILD | WS_VISIBLE, fieldX, S(610), S(180), S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_HINT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Music Mute Hotkey", WS_CHILD | WS_VISIBLE, labelX, S(632), S(150), S(24), hwnd, nullptr, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Set...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, fieldX, S(628), S(160), S(30), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_SET), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Current: Not set", WS_CHILD | WS_VISIBLE, fieldX + S(172), S(632), S(290), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MUTE_HOTKEY_TEXT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Mic Input Mute Hotkey", WS_CHILD | WS_VISIBLE, labelX, S(666), S(160), S(24), hwnd, nullptr, nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Set...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, fieldX, S(662), S(160), S(30), hwnd, reinterpret_cast<HMENU>(IDC_MIC_INPUT_HOTKEY_SET), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Current: Not set", WS_CHILD | WS_VISIBLE, fieldX + S(172), S(666), S(290), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MIC_INPUT_HOTKEY_TEXT), nullptr, nullptr);
 
         ApplyControlTheme(hwnd);
         ApplyFonts(hwnd);
@@ -1879,7 +1944,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             DrawSourceComboItem(dis);
             return TRUE;
         }
-        if (dis->CtlID == IDC_AUTOSTART || dis->CtlID == IDC_FORCE_TX || dis->CtlID == IDC_MUTE) {
+        if (dis->CtlID == IDC_AUTOSTART || dis->CtlID == IDC_FORCE_TX ||
+            dis->CtlID == IDC_MIC_INPUT_MUTE || dis->CtlID == IDC_MUTE) {
             DrawOwnerCheckbox(dis);
             return TRUE;
         }
@@ -1947,7 +2013,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (wParam == kTimerStatusUpdate) {
             const int tick = ++g_hotkeyRefreshTick;
             if ((tick % kHotkeyLabelRefreshEveryTicks) == 0) {
-                UpdateMuteHotkeyLabel(hwnd);
+                UpdateHotkeyLabels(hwnd);
             }
             UpdateStatus(hwnd, (tick % kStatusDetailsEveryTicks) == 0);
             return 0;
@@ -1955,30 +2021,47 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
-        if (g_waitingForHotkey) {
+        if (IsCapturingHotkey()) {
             const UINT vk = static_cast<UINT>(wParam);
+            UINT* activeMods = nullptr;
+            UINT* activeVk = nullptr;
+            if (g_hotkeyCaptureTarget == HotkeyCaptureTarget::MusicMute) {
+                activeMods = &g_muteHotkeyModifiers;
+                activeVk = &g_muteHotkeyVk;
+            } else if (g_hotkeyCaptureTarget == HotkeyCaptureTarget::MicInputMute) {
+                activeMods = &g_micInputMuteHotkeyModifiers;
+                activeVk = &g_micInputMuteHotkeyVk;
+            }
             if (vk == VK_ESCAPE) {
-                g_waitingForHotkey = false;
-                UpdateMuteHotkeyLabel(hwnd);
+                g_hotkeyCaptureTarget = HotkeyCaptureTarget::None;
+                UpdateHotkeyLabels(hwnd);
                 return 0;
             }
             if (vk == VK_DELETE || vk == VK_BACK) {
-                g_waitingForHotkey = false;
-                g_muteHotkeyModifiers = 0;
-                g_muteHotkeyVk = 0;
+                g_hotkeyCaptureTarget = HotkeyCaptureTarget::None;
+                if (activeMods) {
+                    *activeMods = 0;
+                }
+                if (activeVk) {
+                    *activeVk = 0;
+                }
                 ApplyLiveSettings(hwnd, false);
-                UpdateMuteHotkeyLabel(hwnd);
+                UpdateHotkeyLabels(hwnd);
                 return 0;
             }
             if (IsModifierOnlyKey(vk)) {
                 return 0;
             }
             const UINT mods = ReadCurrentModifiers();
-            g_waitingForHotkey = false;
-            g_muteHotkeyModifiers = mods;
-            g_muteHotkeyVk = vk;
+            g_hotkeyCaptureTarget = HotkeyCaptureTarget::None;
+            if (activeMods) {
+                *activeMods = mods;
+            }
+            if (activeVk) {
+                *activeVk = vk;
+            }
             ApplyLiveSettings(hwnd, false);
-            UpdateMuteHotkeyLabel(hwnd);
+            UpdateHotkeyLabels(hwnd);
             return 0;
         }
         return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -2016,7 +2099,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         case IDC_MUTE_HOTKEY_SET:
             if (HIWORD(wParam) == BN_CLICKED) {
-                BeginHotkeyCapture(hwnd);
+                BeginHotkeyCapture(hwnd, HotkeyCaptureTarget::MusicMute);
+                return 0;
+            }
+            break;
+        case IDC_MIC_INPUT_HOTKEY_SET:
+            if (HIWORD(wParam) == BN_CLICKED) {
+                BeginHotkeyCapture(hwnd, HotkeyCaptureTarget::MicInputMute);
                 return 0;
             }
             break;
@@ -2042,6 +2131,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             break;
         case IDC_FORCE_TX:
+        case IDC_MIC_INPUT_MUTE:
         case IDC_MUTE:
         case IDC_AUTOSTART:
             if (HIWORD(wParam) == BN_CLICKED) {
@@ -2209,6 +2299,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_sourceRefreshPendingReload.store(false, std::memory_order_release);
         g_saveDebouncePending.store(false, std::memory_order_release);
         g_hotkeyRefreshTick = 0;
+        g_hotkeyCaptureTarget = HotkeyCaptureTarget::None;
         g_lastMusicClipEvents = std::numeric_limits<uint64_t>::max();
         g_lastMicClipEvents = std::numeric_limits<uint64_t>::max();
         g_lastMusicMeterLevelPx = -1;
