@@ -3428,7 +3428,7 @@ void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
     };
 
     if (!active || schid == 0 || !IsConnectedForTx(schid)) {
-        if (currentlyActive && currentSchid != 0) {
+        if (currentlyActive && currentSchid != 0 && IsConnectedForTx(currentSchid)) {
             const bool restored = restoreStateForSchid(currentSchid);
             if (!restored) {
                 const uint64_t nowMs = GetTickCount64();
@@ -3464,7 +3464,9 @@ void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
     }
 
     if (recordingState == VoiceRecordingState::ActiveOtherServer) {
-        restoreStateForSchid(currentSchid);
+        if (IsConnectedForTx(currentSchid)) {
+            restoreStateForSchid(currentSchid);
+        }
         resetSavedState();
     }
 
@@ -3801,12 +3803,17 @@ void MicMixApp::VoiceTxThreadMain() {
                 }
             }
             RefreshVoiceTxControl(schid);
-            if (schid != 0) {
+            const bool connectedForTx = (schid != 0) && IsConnectedForTx(schid);
+            if (!connectedForTx && schid != 0 &&
+                activeSchid_.load(std::memory_order_acquire) == schid) {
+                activeSchid_.store(0, std::memory_order_release);
+            }
+            if (connectedForTx) {
                 const TelemetrySnapshot t = engine_.SnapshotTelemetry();
                 SyncMusicActivityMeta(schid, t.musicActive, false);
             }
 
-            if (schid != 0 && g_ts3Functions.getPreProcessorInfoValueFloat) {
+            if (connectedForTx && g_ts3Functions.getPreProcessorInfoValueFloat) {
                 float micDb = -120.0f;
                 const unsigned int errDb = g_ts3Functions.getPreProcessorInfoValueFloat(
                     schid, "decibel_last_period", &micDb);
@@ -3830,7 +3837,7 @@ void MicMixApp::VoiceTxThreadMain() {
                     }
                 }
 
-                if (schid != 0) {
+                if (schid != 0 && IsConnectedForTx(schid)) {
                     const bool shouldEnsureCapture = voiceRecordingActive_.load(std::memory_order_acquire) &&
                                                     (voiceRecordingSchid_.load(std::memory_order_acquire) == schid);
                     if (shouldEnsureCapture) {
@@ -4007,7 +4014,9 @@ void MicMixApp::VoiceTxThreadMain() {
     if (schid == 0) {
         schid = activeSchid_.load(std::memory_order_acquire);
     }
-    if (schid != 0 && !shutdownRequested_.load(std::memory_order_acquire)) {
+    if (schid != 0 &&
+        !shutdownRequested_.load(std::memory_order_acquire) &&
+        IsConnectedForTx(schid)) {
         SyncMusicActivityMeta(schid, false, true);
     }
     SetVoiceRecordingState(false, 0);
