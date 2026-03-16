@@ -23,10 +23,15 @@ It is built for people who want to speak and play audio in the same voice channe
 - Capture audio either from `Loopback` (system playback device) or `App Session` (a specific running app process, for example Spotify, browser, VLC).
 - Control music level with a gain slider.
 - Mute/unmute music quickly with a hotkey.
+- Mute/unmute mic input separately (button + hotkey).
 - Keep sending music even while you are not talking (`Force TX`).
 - Show live level meters for music and microphone.
+- Show clip strips and clip event counters for music and mic paths.
+- Monitor the mixed output locally (`Monitor Mix`) while connected.
 - Auto-start source capture on plugin startup (optional).
+- Reacquire the selected source automatically after runtime errors.
 - Save settings and restore them on next launch.
+- Publish runtime activity tag `micmix_active=<0|1>` into TeamSpeak client metadata.
 
 ## Typical Use Cases
 
@@ -47,6 +52,36 @@ Technical basics:
 - Ring buffer between capture thread and voice callback.
 - Resampling done with `speexdsp` when source sample rate differs.
 - Source state handling includes start, stop, running, and automatic reacquire after errors.
+
+## Server Operator Tag (`micmix_active`)
+
+MicMix writes a runtime marker into TeamSpeak client metadata:
+
+- `micmix_active=1`: MicMix currently detects active music signal being sent.
+- `micmix_active=0`: no current active music signal.
+
+Implementation details:
+
+- The value is written to `CLIENT_META_DATA` and merged into existing metadata as a `;`-separated key-value pair.
+- Existing metadata tokens are kept, only the `micmix_active` token is updated/replaced.
+- Updates are throttled to avoid metadata spam, so there can be short delay on state transitions.
+
+How server operators can use it:
+
+1. Read `client_meta_data` via ServerQuery or a bot.
+2. Parse for token `micmix_active=1`.
+3. Use it as a signal for UI/badges, logging, moderation hints, or music-bot/channel automation.
+
+Example logic (pseudo):
+
+```text
+if "micmix_active=1" in client_meta_data:
+    mark_client_as_music_source()
+else:
+    clear_music_source_marker()
+```
+
+Important: this tag is client-published metadata and should be treated as a helpful signal, not a hard security control.
 
 ## Requirements
 
