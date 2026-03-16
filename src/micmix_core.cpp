@@ -500,6 +500,30 @@ bool ParseJsonObjectConfigPayload(const std::string& payload, std::unordered_map
     return true;
 }
 
+bool ReadPayloadWithLimit(std::istream& in, size_t maxBytes, std::string& out, bool& exceededLimit) {
+    out.clear();
+    exceededLimit = false;
+    std::array<char, 8192> chunk{};
+    while (in) {
+        in.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+        const std::streamsize got = in.gcount();
+        if (got <= 0) {
+            break;
+        }
+        const size_t appendBytes = static_cast<size_t>(got);
+        const size_t remaining = (out.size() < maxBytes) ? (maxBytes - out.size()) : 0U;
+        if (appendBytes > remaining) {
+            if (remaining > 0) {
+                out.append(chunk.data(), remaining);
+            }
+            exceededLimit = true;
+            return true;
+        }
+        out.append(chunk.data(), appendBytes);
+    }
+    return !in.bad();
+}
+
 std::string HrToHex(HRESULT hr) {
     std::ostringstream ss;
     ss << "0x" << std::hex << std::uppercase << static_cast<uint32_t>(hr);
@@ -991,13 +1015,26 @@ bool ConfigStore::Load(MicMixSettings& outSettings, std::string& warning) {
 
     std::error_code sizeEc;
     const uintmax_t sizeBytes = std::filesystem::file_size(loadPath, sizeEc);
-    if (!sizeEc && sizeBytes > kMaxConfigBytes) {
+    if (sizeEc) {
+        appendWarning("Config size check failed; file ignored.");
+        return true;
+    }
+    if (sizeBytes > kMaxConfigBytes) {
         appendWarning("Config too large; file ignored.");
         return true;
     }
 
     std::unordered_map<std::string, std::string> kv;
-    const std::string payload((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::string payload;
+    bool payloadTooLarge = false;
+    if (!ReadPayloadWithLimit(in, static_cast<size_t>(kMaxConfigBytes), payload, payloadTooLarge)) {
+        appendWarning("Config read failed; file ignored.");
+        return true;
+    }
+    if (payloadTooLarge) {
+        appendWarning("Config too large; file ignored.");
+        return true;
+    }
     bool parseIssue = false;
     bool parsed = false;
     if (LooksLikeJsonObjectPayload(payload)) {
