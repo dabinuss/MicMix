@@ -4,12 +4,14 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include "micmix_core.h"
 
 namespace {
 
 namespace fs = std::filesystem;
+std::vector<fs::path> g_tempDirs;
 
 bool NearlyEqual(float a, float b, float eps = 0.0001f) {
     return std::fabs(a - b) <= eps;
@@ -21,7 +23,16 @@ fs::path MakeUniqueBaseDir(const char* testName) {
         ("micmix_test_" + std::string(testName) + "_" + std::to_string(tick));
     std::error_code ec;
     fs::create_directories(base, ec);
+    g_tempDirs.push_back(base);
     return base;
+}
+
+void CleanupTempDirs() {
+    for (const auto& dir : g_tempDirs) {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    }
+    g_tempDirs.clear();
 }
 
 bool WriteFile(const std::string& path, const std::string& payload) {
@@ -167,6 +178,7 @@ int main() {
     if (!TestOversizedConfigIgnored()) {
         ++failed;
     }
+    CleanupTempDirs();
 
     if (failed != 0) {
         std::cerr << "config_store_tests failed: " << failed << std::endl;

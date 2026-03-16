@@ -14,7 +14,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Fetch third-party dependencies
         shell: pwsh
@@ -74,6 +74,10 @@ jobs:
         shell: pwsh
         run: cmake --build build --config Release
 
+      - name: Run tests (Release)
+        shell: pwsh
+        run: ctest --test-dir build -C Release --output-on-failure
+
       - name: Package TeamSpeak plugin
         shell: pwsh
         run: ./scripts/package_ts3_plugin.ps1 -Version "${{ steps.meta.outputs.version }}" -Configuration Release
@@ -125,7 +129,7 @@ jobs:
           "path=$notesPath" >> $env:GITHUB_OUTPUT
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: MicMix ${{ steps.meta.outputs.version }}

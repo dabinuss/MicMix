@@ -2076,21 +2076,26 @@ private:
             wf = nullptr;
             ownsWf = false;
         };
-        const bool isFloat = IsFloatFormat(wf);
-        bool isPcm16 = IsPcm16Format(wf);
+        bool isFloat = false;
+        bool isPcm16 = false;
+        auto refreshFormatFlags = [&]() {
+            isFloat = IsFloatFormat(wf);
+            isPcm16 = IsPcm16Format(wf);
+        };
+        refreshFormatFlags();
         if (!isFloat && !isPcm16) {
             if (ownsWf) {
                 releaseWf();
             }
             useFallbackFormat();
-            isPcm16 = true;
+            refreshFormatFlags();
             detail = "pid=" + std::to_string(pid) + " using=fallback_pcm_44100";
         }
         if (!IsSupportedSourceRate(wf->nSamplesPerSec)) {
             if (ownsWf) {
                 releaseWf();
                 useFallbackFormat();
-                isPcm16 = true;
+                refreshFormatFlags();
             }
             if (!IsSupportedSourceRate(wf->nSamplesPerSec)) {
                 code = "format_unsupported";
