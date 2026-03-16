@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.2.8] - 2026-03-16
+
+### Added
+
+- Added a dedicated microphone-input mute hotkey in the settings UI, including persisted binding support.
+
+### Changed
+
+- Moved MicMix mute control fully to internal/global hotkey handling and removed TeamSpeak plugin hotkey registration paths.
+- Hardened CI/release workflow quality gates by running Release tests during both CI and tag-release pipelines.
+- Updated pinned GitHub Action references and selected README sections.
+
+### Fixed
+
+- Fixed cases where mic-input mute did not reliably mute transmitted microphone audio, including transport-level mute fallback and safe state restore.
+- Fixed false continuous-transmit behavior and improved disconnect/shutdown handling around forced TX and talk-mode restoration.
+- Fixed race conditions and duplicate-toggle behavior in music/mic mute hotkey handling.
+- Fixed audio format fallback handling for app-session capture to prevent wrong sample interpretation after fallback.
+- Hardened release packaging path handling and config loading size enforcement to prevent unsafe file/path processing.
+
 ## [1.2.7] - 2026-03-14
 
 ### Added
