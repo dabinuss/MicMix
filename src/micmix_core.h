@@ -376,6 +376,7 @@ private:
     void SetVoiceRecordingState(bool active, uint64 schid);
     void RefreshVoiceTxControl(uint64 schidHint);
     void SyncMusicActivityMeta(uint64 schid, bool musicActive, bool force);
+    void ApplyMicInputTransportMute(bool muted);
 
     std::atomic<bool> initialized_{false};
     std::unique_ptr<ConfigStore> configStore_;
@@ -418,6 +419,10 @@ private:
     int savedVadExtraBufferSize_ = 0;
     std::array<std::string, kSavedPreprocessorSlots> savedPreprocessorValues_{};
     std::array<bool, kSavedPreprocessorSlots> savedPreprocessorValuesValid_{};
+    bool micInputTransportMuteActive_ = false;
+    uint64 micInputTransportMuteSchid_ = 0;
+    bool micInputTransportSavedValid_ = false;
+    int micInputTransportSavedState_ = INPUT_DEACTIVATED;
 
     bool TryEnterCaptureCallback();
     void LeaveCaptureCallback();

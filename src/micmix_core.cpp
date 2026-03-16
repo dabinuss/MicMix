@@ -1420,7 +1420,9 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
         limiterGain = std::clamp(limiterGain, 0.1f, 1.0f);
     };
     const bool hasQueuedMusic = ring_.Size() > 0;
-    const bool applyMicInputMute = micInputMuted && sourceRunning;
+    // Mic-input mute is an explicit user privacy control and must apply
+    // regardless of current source state (running/stopped/error).
+    const bool applyMicInputMute = micInputMuted;
     const uint64_t lastSignalMs = lastMusicSignalTickMs_.load(std::memory_order_relaxed);
     const bool recentMusicSignal = sourceRunning && !muted && (nowMs <= (lastSignalMs + kForceTxMusicWindowMs));
 
@@ -1497,7 +1499,7 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
         micGateGain_.store(gateGain, std::memory_order_relaxed);
         limiterGain_.store(limiterGain, std::memory_order_relaxed);
         int outFlags = upstreamFlags;
-        if (gateTouched) {
+        if (gateTouched || applyMicInputMute) {
             outFlags |= 1;
         }
         if (forceTx && recentMusicSignal) {
@@ -1581,7 +1583,7 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
     const bool forceMusicTx = forceTx && (recentMusicSignal || mixedMusic);
 
     int outFlags = upstreamFlags;
-    if (mixedMusic || gateTouched) {
+    if (mixedMusic || gateTouched || applyMicInputMute) {
         outFlags |= 1;
     }
     if (forceMusicTx) {
@@ -3558,13 +3560,27 @@ void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
         return ok;
     };
 
+    auto forceDeactivateInputForSchid = [](uint64 targetSchid) {
+        if (!g_ts3Functions.setClientSelfVariableAsInt || !g_ts3Functions.flushClientSelfUpdates) {
+            return false;
+        }
+        const unsigned int errInput = g_ts3Functions.setClientSelfVariableAsInt(
+            targetSchid, CLIENT_INPUT_DEACTIVATED, INPUT_DEACTIVATED);
+        const unsigned int errFlush = g_ts3Functions.flushClientSelfUpdates(targetSchid, nullptr);
+        const bool okInput = (errInput == ERROR_ok || errInput == ERROR_ok_no_update);
+        const bool okFlush = (errFlush == ERROR_ok || errFlush == ERROR_ok_no_update);
+        return okInput && okFlush;
+    };
+
     if (!active || schid == 0 || !IsConnectedForTx(schid)) {
         if (currentlyActive && currentSchid != 0 && IsConnectedForTx(currentSchid)) {
             const bool restored = restoreStateForSchid(currentSchid);
             if (!restored) {
+                const bool forcedDeactivate = forceDeactivateInputForSchid(currentSchid);
                 const uint64_t nowMs = GetTickCount64();
                 if (nowMs > (lastErrLogMs + 2000ULL)) {
-                    LogWarn("talk_mode restore failed schid=" + std::to_string(currentSchid));
+                    LogWarn("talk_mode restore failed schid=" + std::to_string(currentSchid) +
+                            " fallback_input_deactivate=" + std::to_string(forcedDeactivate ? 1 : 0));
                     lastErrLogMs = nowMs;
                 }
             } else {
@@ -3826,7 +3842,7 @@ void MicMixApp::RefreshVoiceTxControl(uint64 schidHint) {
                           (st.state == SourceState::Starting) ||
                           (st.state == SourceState::Reacquiring);
     const uint64_t nowMs = GetTickCount64();
-    const bool baseEligible = s.forceTxEnabled && sourceUp && !s.musicMuted;
+    const bool baseEligible = s.forceTxEnabled && sourceUp && !s.musicMuted && !s.micInputMuted;
     bool shouldKeepCaptureActive = false;
     if (baseEligible) {
         if (t.musicActive) {
@@ -3840,6 +3856,93 @@ void MicMixApp::RefreshVoiceTxControl(uint64 schidHint) {
         forceTxHoldUntilMs_.store(0ULL, std::memory_order_release);
     }
     SetVoiceRecordingState(shouldKeepCaptureActive, schid);
+}
+
+void MicMixApp::ApplyMicInputTransportMute(bool muted) {
+    if (!g_ts3Functions.setClientSelfVariableAsInt || !g_ts3Functions.flushClientSelfUpdates) {
+        return;
+    }
+
+    auto resolveSchid = [this]() -> uint64 {
+        uint64 schid = activeSchid_.load(std::memory_order_acquire);
+        if (schid == 0 && g_ts3Functions.getCurrentServerConnectionHandlerID) {
+            schid = g_ts3Functions.getCurrentServerConnectionHandlerID();
+            if (schid != 0) {
+                activeSchid_.store(schid, std::memory_order_release);
+            }
+        }
+        return schid;
+    };
+
+    std::lock_guard<std::mutex> lock(voiceTxMutex_);
+    const uint64 activeSchid = resolveSchid();
+
+    if (muted) {
+        if (activeSchid == 0 || !IsConnectedForTx(activeSchid)) {
+            return;
+        }
+        if (micInputTransportMuteActive_ && micInputTransportMuteSchid_ == activeSchid) {
+            return;
+        }
+
+        int currentInputState = INPUT_DEACTIVATED;
+        bool haveCurrentInputState = false;
+        if (g_ts3Functions.getClientSelfVariableAsInt) {
+            const unsigned int errGet = g_ts3Functions.getClientSelfVariableAsInt(
+                activeSchid, CLIENT_INPUT_DEACTIVATED, &currentInputState);
+            haveCurrentInputState = (errGet == ERROR_ok || errGet == ERROR_ok_no_update);
+        }
+
+        const unsigned int errSet = g_ts3Functions.setClientSelfVariableAsInt(
+            activeSchid, CLIENT_INPUT_DEACTIVATED, INPUT_DEACTIVATED);
+        const unsigned int errFlush = g_ts3Functions.flushClientSelfUpdates(activeSchid, nullptr);
+        const bool okSet = (errSet == ERROR_ok || errSet == ERROR_ok_no_update);
+        const bool okFlush = (errFlush == ERROR_ok || errFlush == ERROR_ok_no_update);
+        if (okSet && okFlush) {
+            micInputTransportMuteActive_ = true;
+            micInputTransportMuteSchid_ = activeSchid;
+            micInputTransportSavedValid_ = haveCurrentInputState;
+            if (haveCurrentInputState) {
+                micInputTransportSavedState_ = currentInputState;
+            }
+            LogInfo("mic_input transport muted schid=" + std::to_string(activeSchid));
+        } else {
+            LogWarn("mic_input transport mute failed schid=" + std::to_string(activeSchid) +
+                    " set_err=" + std::to_string(errSet) +
+                    " flush_err=" + std::to_string(errFlush));
+        }
+        return;
+    }
+
+    if (!micInputTransportMuteActive_) {
+        return;
+    }
+
+    uint64 restoreSchid = micInputTransportMuteSchid_;
+    if (restoreSchid == 0 || !IsConnectedForTx(restoreSchid)) {
+        restoreSchid = activeSchid;
+    }
+    if (restoreSchid != 0 && IsConnectedForTx(restoreSchid)) {
+        const int restoreState = micInputTransportSavedValid_ ? micInputTransportSavedState_ : INPUT_ACTIVE;
+        const unsigned int errSet = g_ts3Functions.setClientSelfVariableAsInt(
+            restoreSchid, CLIENT_INPUT_DEACTIVATED, restoreState);
+        const unsigned int errFlush = g_ts3Functions.flushClientSelfUpdates(restoreSchid, nullptr);
+        const bool okSet = (errSet == ERROR_ok || errSet == ERROR_ok_no_update);
+        const bool okFlush = (errFlush == ERROR_ok || errFlush == ERROR_ok_no_update);
+        if (!(okSet && okFlush)) {
+            LogWarn("mic_input transport restore failed schid=" + std::to_string(restoreSchid) +
+                    " set_err=" + std::to_string(errSet) +
+                    " flush_err=" + std::to_string(errFlush));
+        } else {
+            LogInfo("mic_input transport restored schid=" + std::to_string(restoreSchid) +
+                    " state=" + std::to_string(restoreState));
+        }
+    }
+
+    micInputTransportMuteActive_ = false;
+    micInputTransportMuteSchid_ = 0;
+    micInputTransportSavedValid_ = false;
+    micInputTransportSavedState_ = INPUT_DEACTIVATED;
 }
 
 void MicMixApp::SyncMusicActivityMeta(uint64 schid, bool musicActive, bool force) {
@@ -4197,6 +4300,7 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
         SanitizeSettings(settings_);
         if (!warn.empty()) LogWarn(warn);
         engine_.ApplySettings(settings_);
+        ApplyMicInputTransportMute(settings_.micInputMuted);
         // Disabled intentionally: an additional capture stream can interfere with
         // some driver/device combinations and TS microphone preview.
         // Mic activity is derived from TS3 capture callback path.
@@ -4275,7 +4379,6 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
 
 void MicMixApp::Shutdown() {
     if (!initialized_.exchange(false)) return;
-    shutdownRequested_.store(true, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(musicMetaMutex_);
         musicMetaLastStateValid_ = false;
@@ -4284,7 +4387,11 @@ void MicMixApp::Shutdown() {
     SettingsWindowController::Instance().Close();
     if (musicMuteHotkeyManager_) musicMuteHotkeyManager_->Stop();
     if (micInputMuteHotkeyManager_) micInputMuteHotkeyManager_->Stop();
+    // Keep shutdownRequested_ clear until voice-tx cleanup is done so we can
+    // restore TeamSpeak input/VAD state before plugin teardown is finalized.
     StopVoiceTxThread();
+    ApplyMicInputTransportMute(false);
+    shutdownRequested_.store(true, std::memory_order_release);
     for (int i = 0; i < 100 && captureCallbacksInFlight_.load(std::memory_order_acquire) > 0; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
@@ -4315,16 +4422,23 @@ void MicMixApp::ApplySettings(const MicMixSettings& settings, bool restartSource
     MicMixSettings safe = settings;
     SanitizeSettings(safe);
     bool changed = false;
+    bool micInputMuteChanged = false;
+    bool micInputMuted = false;
     {
         std::lock_guard<std::mutex> lock(settingsMutex_);
         changed = !IsSameSettings(settings_, safe);
+        micInputMuteChanged = (settings_.micInputMuted != safe.micInputMuted);
         settings_ = safe;
+        micInputMuted = settings_.micInputMuted;
     }
     if (!changed && !restartSource) {
         return;
     }
 
     engine_.ApplySettings(safe);
+    if (micInputMuteChanged) {
+        ApplyMicInputTransportMute(micInputMuted);
+    }
     if (musicMuteHotkeyManager_) {
         musicMuteHotkeyManager_->ApplySettings(safe);
     }
@@ -4387,6 +4501,7 @@ void MicMixApp::ToggleMicInputMute() {
         }
         snapshot = settings_;
     }
+    ApplyMicInputTransportMute(newMuted);
     if (changed && configStore_) {
         std::string err;
         if (!configStore_->Save(snapshot, err) && !err.empty()) {
@@ -4460,6 +4575,15 @@ void MicMixApp::OnConnectStatusChange(uint64 schid, int newStatus, unsigned int 
     }
     (void)errorNumber;
     if (newStatus == STATUS_DISCONNECTED) {
+        {
+            std::lock_guard<std::mutex> lock(voiceTxMutex_);
+            if (micInputTransportMuteActive_ && micInputTransportMuteSchid_ == schid) {
+                micInputTransportMuteActive_ = false;
+                micInputTransportMuteSchid_ = 0;
+                micInputTransportSavedValid_ = false;
+                micInputTransportSavedState_ = INPUT_DEACTIVATED;
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(musicMetaMutex_);
             if (musicMetaSchid_ == schid) {
