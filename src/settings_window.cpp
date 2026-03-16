@@ -788,6 +788,10 @@ std::wstring FormatHotkeyText(UINT mods, UINT vk) {
     return out;
 }
 
+bool IsHotkeyConflict(UINT lhsMods, UINT lhsVk, UINT rhsMods, UINT rhsVk) {
+    return lhsVk != 0 && rhsVk != 0 && lhsVk == rhsVk && lhsMods == rhsMods;
+}
+
 bool IsCapturingHotkey() {
     return g_hotkeyCaptureTarget != HotkeyCaptureTarget::None;
 }
@@ -2053,6 +2057,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 return 0;
             }
             const UINT mods = ReadCurrentModifiers();
+            if (g_hotkeyCaptureTarget == HotkeyCaptureTarget::MusicMute &&
+                IsHotkeyConflict(mods, vk, g_micInputMuteHotkeyModifiers, g_micInputMuteHotkeyVk)) {
+                g_hotkeyCaptureTarget = HotkeyCaptureTarget::None;
+                MessageBeep(MB_ICONWARNING);
+                SetStatusText(hwnd, L"Hotkey conflict: already assigned to Mic Input Mute.");
+                UpdateHotkeyLabels(hwnd);
+                return 0;
+            }
+            if (g_hotkeyCaptureTarget == HotkeyCaptureTarget::MicInputMute &&
+                IsHotkeyConflict(mods, vk, g_muteHotkeyModifiers, g_muteHotkeyVk)) {
+                g_hotkeyCaptureTarget = HotkeyCaptureTarget::None;
+                MessageBeep(MB_ICONWARNING);
+                SetStatusText(hwnd, L"Hotkey conflict: already assigned to Music Mute.");
+                UpdateHotkeyLabels(hwnd);
+                return 0;
+            }
             g_hotkeyCaptureTarget = HotkeyCaptureTarget::None;
             if (activeMods) {
                 *activeMods = mods;

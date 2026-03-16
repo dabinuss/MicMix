@@ -56,16 +56,6 @@ PluginMenuItem* CreateMenuItem(PluginMenuType type, int id, const char* text, co
     return item;
 }
 
-PluginHotkey* CreateHotkey(const char* keyword, const char* description) {
-    auto* hotkey = static_cast<PluginHotkey*>(std::calloc(1, sizeof(PluginHotkey)));
-    if (!hotkey) {
-        return nullptr;
-    }
-    strcpy_s(hotkey->keyword, PLUGIN_HOTKEY_BUFSZ, keyword ? keyword : "");
-    strcpy_s(hotkey->description, PLUGIN_HOTKEY_BUFSZ, description ? description : "");
-    return hotkey;
-}
-
 } // namespace
 
 extern "C" {
@@ -206,32 +196,8 @@ void ts3plugin_initHotkeys(struct PluginHotkey*** hotkeys) {
     if (!hotkeys) {
         return;
     }
+    // Hotkeys are intentionally handled only via MicMix's internal global hotkey system.
     *hotkeys = nullptr;
-    const size_t sz = 6;
-    auto** keys = static_cast<PluginHotkey**>(std::calloc(sz, sizeof(PluginHotkey*)));
-    if (!keys) {
-        return;
-    }
-    auto releaseKeys = [keys, sz]() {
-        for (size_t i = 0; i < sz; ++i) {
-            if (keys[i]) {
-                std::free(keys[i]);
-                keys[i] = nullptr;
-            }
-        }
-        std::free(keys);
-    };
-
-    keys[0] = CreateHotkey("music_toggle_mute", "MicMix: Music mute (toggle)");
-    keys[1] = CreateHotkey("mic_input_toggle_mute", "MicMix: Microphone mute (toggle)");
-    keys[2] = CreateHotkey("music_toggle_push_to_play", "MicMix: Push-to-play mode (toggle)");
-    keys[3] = CreateHotkey("music_push_to_play_on", "MicMix: Push-to-play mode on");
-    keys[4] = CreateHotkey("music_push_to_play_off", "MicMix: Push-to-play mode off");
-    if (!keys[0] || !keys[1] || !keys[2] || !keys[3] || !keys[4]) {
-        releaseKeys();
-        return;
-    }
-    *hotkeys = keys;
 }
 
 void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenuType type, int menuItemID, uint64 selectedItemID) {
@@ -248,31 +214,8 @@ void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenu
 }
 
 void ts3plugin_onHotkeyEvent(const char* keyword) {
-    if (!IsPluginOperational()) {
-        return;
-    }
-    RunGuarded("ts3plugin_onHotkeyEvent", [&] {
-        if (!keyword) return;
-        if (std::strcmp(keyword, "music_toggle_mute") == 0) {
-            MicMixApp::Instance().ToggleMute();
-            return;
-        }
-        if (std::strcmp(keyword, "mic_input_toggle_mute") == 0) {
-            MicMixApp::Instance().ToggleMicInputMute();
-            return;
-        }
-        if (std::strcmp(keyword, "music_toggle_push_to_play") == 0) {
-            MicMixApp::Instance().TogglePushToPlay();
-            return;
-        }
-        if (std::strcmp(keyword, "music_push_to_play_on") == 0) {
-            MicMixApp::Instance().SetPushToPlayActive(true);
-            return;
-        }
-        if (std::strcmp(keyword, "music_push_to_play_off") == 0) {
-            MicMixApp::Instance().SetPushToPlayActive(false);
-        }
-    });
+    (void)keyword;
+    // Intentionally disabled: TeamSpeak plugin hotkeys are not used by MicMix.
 }
 
 void ts3plugin_currentServerConnectionChanged(uint64 serverConnectionHandlerID) {

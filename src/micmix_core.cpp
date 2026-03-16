@@ -540,6 +540,13 @@ void SanitizeSettings(MicMixSettings& s) {
     s.muteHotkeyVk = std::clamp(s.muteHotkeyVk, 0, 255);
     s.micInputMuteHotkeyModifiers &= (MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN);
     s.micInputMuteHotkeyVk = std::clamp(s.micInputMuteHotkeyVk, 0, 255);
+    if (s.muteHotkeyVk != 0 &&
+        s.muteHotkeyVk == s.micInputMuteHotkeyVk &&
+        s.muteHotkeyModifiers == s.micInputMuteHotkeyModifiers) {
+        // Keep music mute as primary and clear conflicting mic-input hotkey.
+        s.micInputMuteHotkeyModifiers = 0;
+        s.micInputMuteHotkeyVk = 0;
+    }
     s.uiLastOpenTab = std::max(0, s.uiLastOpenTab);
     if (s.micGateMode != MicGateMode::AutoTs && s.micGateMode != MicGateMode::Custom) {
         s.micGateMode = MicGateMode::AutoTs;
@@ -1376,7 +1383,7 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
         limiterGain = std::clamp(limiterGain, 0.1f, 1.0f);
     };
     const bool hasQueuedMusic = ring_.Size() > 0;
-    const bool applyMicInputMute = micInputMuted && sourceRunning && !muted;
+    const bool applyMicInputMute = micInputMuted && sourceRunning;
     const uint64_t lastSignalMs = lastMusicSignalTickMs_.load(std::memory_order_relaxed);
     const bool recentMusicSignal = sourceRunning && !muted && (nowMs <= (lastSignalMs + kForceTxMusicWindowMs));
 
@@ -2273,6 +2280,7 @@ public:
         controlToken_.store(GenerateControlToken(this), std::memory_order_release);
         threadReady_ = false;
         lastRejectedHotkeyLogTick_ = 0;
+        lastAcceptedHotkeyTickMs_ = 0;
         try {
             thread_ = std::thread([this]() { ThreadMain(); });
         } catch (const std::exception& ex) {
@@ -2348,6 +2356,7 @@ private:
     static constexpr WPARAM kMsgApplyTag = static_cast<WPARAM>(0x0A11C0DEu);
     static constexpr WPARAM kMsgStopTag = static_cast<WPARAM>(0x05E0C0DEu);
     static constexpr uint64_t kRejectedHotkeyLogIntervalMs = 5000ULL;
+    static constexpr uint64_t kHotkeyTriggerGuardMs = 180ULL;
     std::function<void()> onHotkey_;
     HotkeyExtractor extractor_;
     int hotkeyId_ = 0;
@@ -2364,6 +2373,7 @@ private:
     bool registeredValid_ = false;
     std::atomic<uint64_t> controlToken_{0};
     uint64_t lastRejectedHotkeyLogTick_ = 0;
+    uint64_t lastAcceptedHotkeyTickMs_ = 0;
     std::atomic<bool> stopRequested_{false};
 
     static uint64_t GenerateControlToken(const GlobalHotkeyManager* self) {
@@ -2423,14 +2433,18 @@ private:
         if (!registeredValid_ || registeredVk_ == 0) {
             return false;
         }
+        const uint64_t now = static_cast<uint64_t>(GetTickCount64());
+        if (now < (lastAcceptedHotkeyTickMs_ + kHotkeyTriggerGuardMs)) {
+            return false;
+        }
         if (!IsRequiredModifiersDown(registeredMods_) || !IsVirtualKeyDown(registeredVk_)) {
-            const uint64_t now = static_cast<uint64_t>(GetTickCount64());
             if (now - lastRejectedHotkeyLogTick_ >= kRejectedHotkeyLogIntervalMs) {
                 lastRejectedHotkeyLogTick_ = now;
                 LogWarn(logTag_ + " ignored event: physical key state mismatch");
             }
             return false;
         }
+        lastAcceptedHotkeyTickMs_ = now;
         return true;
     }
 
@@ -2448,6 +2462,7 @@ private:
         }
         if (vk == 0) {
             registeredValid_ = false;
+            lastAcceptedHotkeyTickMs_ = 0;
             return;
         }
 
@@ -2469,6 +2484,7 @@ private:
             registeredMods_ = mods;
             registeredVk_ = vk;
             registeredValid_ = true;
+            lastAcceptedHotkeyTickMs_ = 0;
         }
     }
 
@@ -4266,17 +4282,46 @@ void MicMixApp::StopSource() {
 
 void MicMixApp::ToggleMute() {
     engine_.ToggleMute();
-    auto s = GetSettings();
-    s.musicMuted = engine_.IsMuted();
-    ApplySettings(s, false, true);
+    const bool newMuted = engine_.IsMuted();
+    bool changed = false;
+    MicMixSettings snapshot;
+    {
+        std::lock_guard<std::mutex> lock(settingsMutex_);
+        if (settings_.musicMuted != newMuted) {
+            settings_.musicMuted = newMuted;
+            changed = true;
+        }
+        snapshot = settings_;
+    }
+    if (changed && configStore_) {
+        std::string err;
+        if (!configStore_->Save(snapshot, err) && !err.empty()) {
+            LogError("Config save failed: " + err);
+        }
+    }
+    LogInfo(std::string("music ") + (newMuted ? "muted" : "unmuted"));
 }
 
 void MicMixApp::ToggleMicInputMute() {
     engine_.ToggleMicInputMute();
-    auto s = GetSettings();
-    s.micInputMuted = engine_.IsMicInputMuted();
-    ApplySettings(s, false, true);
-    LogInfo(std::string("mic_input ") + (s.micInputMuted ? "muted" : "unmuted"));
+    const bool newMuted = engine_.IsMicInputMuted();
+    bool changed = false;
+    MicMixSettings snapshot;
+    {
+        std::lock_guard<std::mutex> lock(settingsMutex_);
+        if (settings_.micInputMuted != newMuted) {
+            settings_.micInputMuted = newMuted;
+            changed = true;
+        }
+        snapshot = settings_;
+    }
+    if (changed && configStore_) {
+        std::string err;
+        if (!configStore_->Save(snapshot, err) && !err.empty()) {
+            LogError("Config save failed: " + err);
+        }
+    }
+    LogInfo(std::string("mic_input ") + (newMuted ? "muted" : "unmuted"));
 }
 
 void MicMixApp::SetMonitorEnabled(bool enabled) {
@@ -4312,9 +4357,23 @@ void MicMixApp::SetPushToPlayActive(bool active) {
         pushToPlaySavedMuteValid_.store(false, std::memory_order_release);
         engine_.SetMuted(restoreMuted);
     }
-    auto s = GetSettings();
-    s.musicMuted = engine_.IsMuted();
-    ApplySettings(s, false, true);
+    const bool newMuted = engine_.IsMuted();
+    bool changed = false;
+    MicMixSettings snapshot;
+    {
+        std::lock_guard<std::mutex> lock(settingsMutex_);
+        if (settings_.musicMuted != newMuted) {
+            settings_.musicMuted = newMuted;
+            changed = true;
+        }
+        snapshot = settings_;
+    }
+    if (changed && configStore_) {
+        std::string err;
+        if (!configStore_->Save(snapshot, err) && !err.empty()) {
+            LogError("Config save failed: " + err);
+        }
+    }
 }
 
 void MicMixApp::TogglePushToPlay() { SetPushToPlayActive(!pushToPlayActive_.load(std::memory_order_acquire)); }
@@ -4394,6 +4453,18 @@ SourceStatus MicMixApp::GetSourceStatus() const {
 }
 TelemetrySnapshot MicMixApp::GetTelemetry() const {
     TelemetrySnapshot t = engine_.SnapshotTelemetry();
+    bool micInputMuted = false;
+    {
+        std::lock_guard<std::mutex> lock(settingsMutex_);
+        micInputMuted = settings_.micInputMuted;
+    }
+    if (micInputMuted) {
+        t.micTalkDetected = false;
+        t.micRmsDbfs = -120.0f;
+        t.micPeakDbfs = -120.0f;
+        t.micClipRecent = false;
+        return t;
+    }
     if (t.micRmsDbfs > -119.0f || !g_ts3Functions.getPreProcessorInfoValueFloat) {
         return t;
     }
