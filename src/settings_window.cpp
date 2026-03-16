@@ -827,6 +827,7 @@ void UpdateHotkeyLabels(HWND hwnd) {
 
 void BeginHotkeyCapture(HWND hwnd, HotkeyCaptureTarget target) {
     g_hotkeyCaptureTarget = target;
+    MicMixApp::Instance().SetGlobalHotkeyCaptureBlocked(true);
     int labelId = 0;
     if (target == HotkeyCaptureTarget::MusicMute) {
         labelId = IDC_MUTE_HOTKEY_TEXT;
@@ -1489,6 +1490,14 @@ void DrawLevelMeter(HDC hdc, const RECT& meterRect, bool active, float visualDb,
     }
 }
 
+void EndHotkeyCapture(HWND hwnd, bool refreshLabels = true) {
+    g_hotkeyCaptureTarget = HotkeyCaptureTarget::None;
+    MicMixApp::Instance().SetGlobalHotkeyCaptureBlocked(false);
+    if (refreshLabels) {
+        UpdateHotkeyLabels(hwnd);
+    }
+}
+
 LRESULT DrawGainSliderCustom(const NMCUSTOMDRAW* cd) {
     if (!cd) {
         return CDRF_DODEFAULT;
@@ -2037,12 +2046,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 activeVk = &g_micInputMuteHotkeyVk;
             }
             if (vk == VK_ESCAPE) {
-                g_hotkeyCaptureTarget = HotkeyCaptureTarget::None;
-                UpdateHotkeyLabels(hwnd);
+                EndHotkeyCapture(hwnd);
                 return 0;
             }
             if (vk == VK_DELETE || vk == VK_BACK) {
-                g_hotkeyCaptureTarget = HotkeyCaptureTarget::None;
+                EndHotkeyCapture(hwnd, false);
                 if (activeMods) {
                     *activeMods = 0;
                 }
@@ -2059,7 +2067,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             const UINT mods = ReadCurrentModifiers();
             if (g_hotkeyCaptureTarget == HotkeyCaptureTarget::MusicMute &&
                 IsHotkeyConflict(mods, vk, g_micInputMuteHotkeyModifiers, g_micInputMuteHotkeyVk)) {
-                g_hotkeyCaptureTarget = HotkeyCaptureTarget::None;
+                EndHotkeyCapture(hwnd, false);
                 MessageBeep(MB_ICONWARNING);
                 SetStatusText(hwnd, L"Hotkey conflict: already assigned to Mic Input Mute.");
                 UpdateHotkeyLabels(hwnd);
@@ -2067,13 +2075,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             if (g_hotkeyCaptureTarget == HotkeyCaptureTarget::MicInputMute &&
                 IsHotkeyConflict(mods, vk, g_muteHotkeyModifiers, g_muteHotkeyVk)) {
-                g_hotkeyCaptureTarget = HotkeyCaptureTarget::None;
+                EndHotkeyCapture(hwnd, false);
                 MessageBeep(MB_ICONWARNING);
                 SetStatusText(hwnd, L"Hotkey conflict: already assigned to Music Mute.");
                 UpdateHotkeyLabels(hwnd);
                 return 0;
             }
-            g_hotkeyCaptureTarget = HotkeyCaptureTarget::None;
+            EndHotkeyCapture(hwnd, false);
             if (activeMods) {
                 *activeMods = mods;
             }
@@ -2082,6 +2090,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             ApplyLiveSettings(hwnd, false);
             UpdateHotkeyLabels(hwnd);
+            return 0;
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    case WM_ACTIVATE:
+        if (LOWORD(wParam) == WA_INACTIVE && IsCapturingHotkey()) {
+            EndHotkeyCapture(hwnd);
+            SetStatusText(hwnd, L"Hotkey capture cancelled.");
             return 0;
         }
         return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -2302,6 +2317,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_ERASEBKGND:
         return 1;
     case WM_CLOSE:
+        EndHotkeyCapture(hwnd, false);
         FlushDebouncedSettingsSave(hwnd);
         if (MicMixApp::Instance().IsMonitorEnabled()) {
             MicMixApp::Instance().SetMonitorEnabled(false);
@@ -2309,6 +2325,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
+        EndHotkeyCapture(hwnd, false);
         if (MicMixApp::Instance().IsMonitorEnabled()) {
             MicMixApp::Instance().SetMonitorEnabled(false);
         }
@@ -2398,6 +2415,14 @@ void WindowThreadMain() {
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        HWND mainHwnd = g_hwnd.load(std::memory_order_acquire);
+        if (mainHwnd &&
+            IsCapturingHotkey() &&
+            msg.hwnd != mainHwnd &&
+            (msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN)) {
+            SendMessageW(mainHwnd, msg.message, msg.wParam, msg.lParam);
+            continue;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }

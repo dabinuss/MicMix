@@ -2350,6 +2350,10 @@ public:
         }
     }
 
+    void SetCaptureBlocked(bool blocked) {
+        captureBlocked_.store(blocked, std::memory_order_release);
+    }
+
 private:
     static constexpr UINT kMsgApplySettings = WM_APP + 0x11;
     static constexpr UINT kMsgStopThread = WM_APP + 0x12;
@@ -2374,6 +2378,8 @@ private:
     std::atomic<uint64_t> controlToken_{0};
     uint64_t lastRejectedHotkeyLogTick_ = 0;
     uint64_t lastAcceptedHotkeyTickMs_ = 0;
+    bool hotkeyHeld_ = false;
+    std::atomic<bool> captureBlocked_{false};
     std::atomic<bool> stopRequested_{false};
 
     static uint64_t GenerateControlToken(const GlobalHotkeyManager* self) {
@@ -2433,6 +2439,12 @@ private:
         if (!registeredValid_ || registeredVk_ == 0) {
             return false;
         }
+        if (captureBlocked_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        if (hotkeyHeld_) {
+            return false;
+        }
         const uint64_t now = static_cast<uint64_t>(GetTickCount64());
         if (now < (lastAcceptedHotkeyTickMs_ + kHotkeyTriggerGuardMs)) {
             return false;
@@ -2444,8 +2456,22 @@ private:
             }
             return false;
         }
+        hotkeyHeld_ = true;
         lastAcceptedHotkeyTickMs_ = now;
         return true;
+    }
+
+    void RefreshHotkeyHoldState() {
+        if (!hotkeyHeld_) {
+            return;
+        }
+        if (!registeredValid_ || registeredVk_ == 0) {
+            hotkeyHeld_ = false;
+            return;
+        }
+        if (!IsRequiredModifiersDown(registeredMods_) || !IsVirtualKeyDown(registeredVk_)) {
+            hotkeyHeld_ = false;
+        }
     }
 
     void ApplyRegistration() {
@@ -2462,6 +2488,7 @@ private:
         }
         if (vk == 0) {
             registeredValid_ = false;
+            hotkeyHeld_ = false;
             lastAcceptedHotkeyTickMs_ = 0;
             return;
         }
@@ -2484,6 +2511,7 @@ private:
             registeredMods_ = mods;
             registeredVk_ = vk;
             registeredValid_ = true;
+            hotkeyHeld_ = false;
             lastAcceptedHotkeyTickMs_ = 0;
         }
     }
@@ -2501,6 +2529,7 @@ private:
         ApplyRegistration();
 
         while (!stopRequested_.load(std::memory_order_acquire)) {
+            RefreshHotkeyHoldState();
             while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
                 if (msg.message == kMsgApplySettings) {
                     if (!IsAuthorizedControlMessage(msg, kMsgApplySettings, kMsgApplyTag)) {
@@ -2539,6 +2568,7 @@ private:
                 break;
             }
             MsgWaitForMultipleObjectsEx(0, nullptr, 200, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            RefreshHotkeyHoldState();
         }
 
         if (hotkeyId_ != 0) {
@@ -4342,41 +4372,14 @@ void MicMixApp::ToggleMonitor() {
     SetMonitorEnabled(!IsMonitorEnabled());
 }
 
-void MicMixApp::SetPushToPlayActive(bool active) {
-    const bool wasActive = pushToPlayActive_.exchange(active, std::memory_order_acq_rel);
-    if (active && !wasActive) {
-        const bool currentMuted = engine_.IsMuted();
-        pushToPlaySavedMuteState_.store(currentMuted, std::memory_order_release);
-        pushToPlaySavedMuteValid_.store(true, std::memory_order_release);
-        engine_.SetMuted(false);
-    } else if (!active && wasActive) {
-        bool restoreMuted = engine_.IsMuted();
-        if (pushToPlaySavedMuteValid_.load(std::memory_order_acquire)) {
-            restoreMuted = pushToPlaySavedMuteState_.load(std::memory_order_acquire);
-        }
-        pushToPlaySavedMuteValid_.store(false, std::memory_order_release);
-        engine_.SetMuted(restoreMuted);
+void MicMixApp::SetGlobalHotkeyCaptureBlocked(bool blocked) {
+    if (musicMuteHotkeyManager_) {
+        musicMuteHotkeyManager_->SetCaptureBlocked(blocked);
     }
-    const bool newMuted = engine_.IsMuted();
-    bool changed = false;
-    MicMixSettings snapshot;
-    {
-        std::lock_guard<std::mutex> lock(settingsMutex_);
-        if (settings_.musicMuted != newMuted) {
-            settings_.musicMuted = newMuted;
-            changed = true;
-        }
-        snapshot = settings_;
-    }
-    if (changed && configStore_) {
-        std::string err;
-        if (!configStore_->Save(snapshot, err) && !err.empty()) {
-            LogError("Config save failed: " + err);
-        }
+    if (micInputMuteHotkeyManager_) {
+        micInputMuteHotkeyManager_->SetCaptureBlocked(blocked);
     }
 }
-
-void MicMixApp::TogglePushToPlay() { SetPushToPlayActive(!pushToPlayActive_.load(std::memory_order_acquire)); }
 
 void MicMixApp::SetTalkStateForOwnClient(uint64 schid, anyID clientId, int talkStatus) {
     if (!initialized_.load(std::memory_order_acquire) || schid == 0 || clientId == 0) {

@@ -347,8 +347,7 @@ public:
     void SetMonitorEnabled(bool enabled);
     bool IsMonitorEnabled() const;
     void ToggleMonitor();
-    void SetPushToPlayActive(bool active);
-    void TogglePushToPlay();
+    void SetGlobalHotkeyCaptureBlocked(bool blocked);
     void SetTalkStateForOwnClient(uint64 schid, anyID clientId, int talkStatus);
     void SetActiveServer(uint64 schid);
     void OnConnectStatusChange(uint64 schid, int newStatus, unsigned int errorNumber);
@@ -389,9 +388,6 @@ private:
     std::unique_ptr<MicLevelMonitor> micLevelMonitor_;
     std::atomic<std::shared_ptr<MixMonitorPlayer>> mixMonitorPlayer_{};
     std::atomic<uint64> activeSchid_{0};
-    std::atomic<bool> pushToPlayActive_{false};
-    std::atomic<bool> pushToPlaySavedMuteValid_{false};
-    std::atomic<bool> pushToPlaySavedMuteState_{false};
     std::atomic<bool> ownTalkStatusActive_{false};
     std::atomic_uint64_t ownTalkStatusTickMs_{0};
     std::thread voiceTxThread_;
