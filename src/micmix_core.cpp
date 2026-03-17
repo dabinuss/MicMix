@@ -3842,7 +3842,7 @@ void MicMixApp::RefreshVoiceTxControl(uint64 schidHint) {
                           (st.state == SourceState::Starting) ||
                           (st.state == SourceState::Reacquiring);
     const uint64_t nowMs = GetTickCount64();
-    const bool baseEligible = s.forceTxEnabled && sourceUp && !s.musicMuted && !s.micInputMuted;
+    const bool baseEligible = s.forceTxEnabled && sourceUp && !s.musicMuted;
     bool shouldKeepCaptureActive = false;
     if (baseEligible) {
         if (t.musicActive) {
@@ -3863,6 +3863,22 @@ void MicMixApp::ApplyMicInputTransportMute(bool muted) {
         return;
     }
 
+    // Transport-level input deactivation mutes the full outgoing capture path.
+    // Keep it as a fallback only when no music pass-through is expected.
+    bool shouldTransportMute = muted;
+    if (muted) {
+        const MicMixSettings s = GetSettings();
+        const auto sourceManager = sourceManager_.load(std::memory_order_acquire);
+        const SourceStatus st = sourceManager ? sourceManager->GetStatus() : SourceStatus{};
+        const bool sourceUp = (st.state == SourceState::Running) ||
+                              (st.state == SourceState::Starting) ||
+                              (st.state == SourceState::Reacquiring);
+        const bool keepMusicPath = sourceUp && !s.musicMuted;
+        if (keepMusicPath) {
+            shouldTransportMute = false;
+        }
+    }
+
     auto resolveSchid = [this]() -> uint64 {
         uint64 schid = activeSchid_.load(std::memory_order_acquire);
         if (schid == 0 && g_ts3Functions.getCurrentServerConnectionHandlerID) {
@@ -3877,7 +3893,7 @@ void MicMixApp::ApplyMicInputTransportMute(bool muted) {
     std::lock_guard<std::mutex> lock(voiceTxMutex_);
     const uint64 activeSchid = resolveSchid();
 
-    if (muted) {
+    if (shouldTransportMute) {
         if (activeSchid == 0 || !IsConnectedForTx(activeSchid)) {
             return;
         }
