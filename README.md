@@ -15,7 +15,7 @@ It is built for people who want to speak and play audio in the same voice channe
 
 ## Screenshot
 
-<img width="682" height="723" alt="grafik" src="https://github.com/user-attachments/assets/cc130399-1bfd-406e-801d-6bd609cdf14c" />
+<img width="682" height="812" alt="Screenshot 2026-03-16 110017" src="https://github.com/user-attachments/assets/a6bb4c2d-27be-468c-b5be-9857590867da" />
 
 ## What MicMix Can Do
 
