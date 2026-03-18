@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.2.9] - 2026-03-18
+
+### Changed
+
+- Added `VERSIONING.md` as the canonical SemVer policy for release bump and reset rules.
+- Updated the README screenshot asset.
+
+### Fixed
+
+- Fixed a regression where enabling mic-input mute could unintentionally stop expected music pass-through.
+
 ## [1.2.8] - 2026-03-16
 
 ### Added
