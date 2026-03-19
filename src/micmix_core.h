@@ -40,6 +40,24 @@ enum class MicGateMode {
     Custom = 1,
 };
 
+enum class EffectChain {
+    Music = 0,
+    Mic = 1,
+};
+
+struct VstEffectSlot {
+    std::string path;
+    std::string name;
+    bool        enabled = true;
+    bool        bypass = false;
+};
+
+struct VstHostStatus {
+    bool        running = false;
+    uint32_t    pid = 0;
+    std::string message;
+};
+
 struct MicMixSettings {
     int         configVersion = 1;
     SourceMode  sourceMode = SourceMode::Loopback;
@@ -65,6 +83,10 @@ struct MicMixSettings {
     bool        micUseSmoothGate = true;
     bool        micUseKeyboardGuard = true;
     bool        micForceTsFilters = true;
+    bool        vstEffectsEnabled = false;
+    bool        vstHostAutostart = true;
+    std::vector<VstEffectSlot> musicEffects;
+    std::vector<VstEffectSlot> micEffects;
 };
 
 struct LoopbackDeviceInfo {
@@ -365,11 +387,22 @@ public:
     TelemetrySnapshot GetTelemetry() const;
     std::string GetConfigDir() const;
     std::string GetPreferredTsCaptureDeviceName() const;
+    VstHostStatus GetVstHostStatus() const;
+    bool IsEffectsEnabled() const;
+    void SetEffectsEnabled(bool enabled, bool saveConfig = true);
+    std::vector<VstEffectSlot> GetEffects(EffectChain chain) const;
+    bool AddEffect(EffectChain chain, const VstEffectSlot& slot, std::string& error);
+    bool RemoveEffect(EffectChain chain, size_t index, std::string& error);
+    bool MoveEffect(EffectChain chain, size_t fromIndex, size_t toIndex, std::string& error);
+    bool SetEffectBypass(EffectChain chain, size_t index, bool bypass, std::string& error);
+    bool SetEffectEnabled(EffectChain chain, size_t index, bool enabled, std::string& error);
+    static void SanitizeEffectList(std::vector<VstEffectSlot>& list);
 
     void EditCapturedVoice(uint64 schid, short* samples, int sampleCount, int channels, int* edited);
     bool IsInitialized() const { return initialized_.load(std::memory_order_relaxed); }
 
     void OpenSettingsWindow();
+    void OpenEffectsWindow();
 
 private:
     static constexpr size_t kSavedPreprocessorSlots = 18;
@@ -429,9 +462,18 @@ private:
     uint64 micInputTransportMuteSchid_ = 0;
     bool micInputTransportSavedValid_ = false;
     int micInputTransportSavedState_ = INPUT_DEACTIVATED;
+    std::atomic<bool> vstHostRunning_{false};
+    std::atomic<uint32_t> vstHostPid_{0};
+    mutable std::mutex vstHostMutex_;
+    HANDLE vstHostProcess_ = nullptr;
+    HANDLE vstHostThread_ = nullptr;
+    std::string vstHostMessage_;
 
     bool TryEnterCaptureCallback();
     void LeaveCaptureCallback();
+    bool StartVstHostProcess(std::string& error);
+    void StopVstHostProcess();
+    std::wstring ResolveVstHostPath() const;
 };
 
 std::string SourceStateToString(SourceState state);

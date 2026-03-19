@@ -57,6 +57,10 @@ $buildDll = Join-Path $repoRoot "build\$Configuration\micmix.dll"
 if (-not (Test-Path $buildDll)) {
     throw "Build artifact missing: $buildDll. Build first (cmake --build build --config $Configuration)."
 }
+$buildHostExe = Join-Path $repoRoot "build\$Configuration\micmix_vst_host.exe"
+if (-not (Test-Path $buildHostExe)) {
+    throw "Build artifact missing: $buildHostExe. Build first (cmake --build build --config $Configuration)."
+}
 
 $icon16 = Join-Path $repoRoot "assets\branding\MicMixIcon16.png"
 if (-not (Test-Path $icon16)) {
@@ -74,6 +78,7 @@ New-Item -ItemType Directory -Path $pluginIconDir -Force | Out-Null
 New-Item -ItemType Directory -Path $distDir -Force | Out-Null
 
 Copy-Item -LiteralPath $buildDll -Destination (Join-Path $pluginDir "micmix_win64.dll") -Force
+Copy-Item -LiteralPath $buildHostExe -Destination (Join-Path $pluginDir "micmix_vst_host.exe") -Force
 Copy-Item -LiteralPath $icon16 -Destination (Join-Path $pluginIconDir "1.png") -Force
 Copy-Item -LiteralPath $icon16 -Destination (Join-Path $pluginIconDir "t.png") -Force
 Copy-Item -LiteralPath $icon16 -Destination (Join-Path $pluginIconDir "menu_icon.png") -Force

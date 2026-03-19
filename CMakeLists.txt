@@ -53,7 +53,9 @@ target_compile_definitions(speexdsp_resampler PRIVATE
 add_library(micmix SHARED
   src/plugin_main.cpp
   src/micmix_core.cpp
+  src/ui_shared.cpp
   src/settings_window.cpp
+  src/effects_window.cpp
   resources/micmix.rc
 )
 
@@ -107,6 +109,33 @@ set_target_properties(micmix PROPERTIES
   OUTPUT_NAME "micmix"
 )
 
+add_executable(micmix_vst_host
+  src/vst_host_main.cpp
+)
+
+target_compile_definitions(micmix_vst_host PRIVATE
+  WIN32_LEAN_AND_MEAN
+  NOMINMAX
+  _CRT_SECURE_NO_WARNINGS
+  UNICODE
+  _UNICODE
+)
+
+if(MSVC)
+  target_compile_options(micmix_vst_host PRIVATE
+    /W4
+    /permissive-
+    /guard:cf
+  )
+  target_link_options(micmix_vst_host PRIVATE
+    /GUARD:CF
+  )
+endif()
+
+set_target_properties(micmix_vst_host PROPERTIES
+  OUTPUT_NAME "micmix_vst_host"
+)
+
 option(MICMIX_BUILD_TESTS "Build MicMix automated tests" ON)
 if(MICMIX_BUILD_TESTS)
   enable_testing()
@@ -114,7 +143,9 @@ if(MICMIX_BUILD_TESTS)
   add_executable(micmix_config_store_tests
     tests/config_store_tests.cpp
     src/micmix_core.cpp
+    src/ui_shared.cpp
     src/settings_window.cpp
+    src/effects_window.cpp
   )
 
   target_include_directories(micmix_config_store_tests PRIVATE

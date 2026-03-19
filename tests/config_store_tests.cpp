@@ -162,6 +162,82 @@ bool TestOversizedConfigIgnored() {
     return pass;
 }
 
+bool TestVstEffectsIniParse() {
+    const fs::path base = MakeUniqueBaseDir("vst_ini");
+    ConfigStore store(base.string());
+    const std::string payload =
+        "vst.effects_enabled=true\n"
+        "vst.host.autostart=true\n"
+        "vst.music.count=2\n"
+        "vst.music.0.path=C:\\\\VST\\\\Comp.vst3\n"
+        "vst.music.0.name=Compressor\n"
+        "vst.music.0.enabled=true\n"
+        "vst.music.0.bypass=false\n"
+        "vst.music.1.path=C:\\\\VST\\\\EQ.vst3\n"
+        "vst.music.1.name=EQ\n"
+        "vst.music.1.enabled=true\n"
+        "vst.music.1.bypass=true\n"
+        "vst.mic.count=1\n"
+        "vst.mic.0.path=C:\\\\VST\\\\Gate.vst3\n"
+        "vst.mic.0.name=Gate\n"
+        "vst.mic.0.enabled=false\n"
+        "vst.mic.0.bypass=true\n";
+    if (!WriteFile(store.ConfigPath(), payload)) {
+        std::cerr << "FAIL: could not write config file for vst_ini" << std::endl;
+        return false;
+    }
+
+    MicMixSettings settings{};
+    std::string warning;
+    const bool ok = store.Load(settings, warning);
+    bool pass = true;
+    pass &= Expect(ok, "Load(vst_ini) should return true");
+    pass &= Expect(settings.vstEffectsEnabled, "vst.effects_enabled should parse");
+    pass &= Expect(settings.vstHostAutostart, "vst.host.autostart should parse");
+    pass &= Expect(settings.musicEffects.size() == 2, "vst.music.count should parse");
+    pass &= Expect(settings.micEffects.size() == 1, "vst.mic.count should parse");
+    pass &= Expect(settings.musicEffects[0].name == "Compressor", "music effect name should parse");
+    pass &= Expect(settings.musicEffects[1].bypass, "music bypass should parse");
+    pass &= Expect(!settings.micEffects[0].enabled, "mic effect enabled should parse");
+    pass &= Expect(warning.empty(), "Valid VST INI config should not produce parse warnings");
+    return pass;
+}
+
+bool TestVstEffectsSaveRoundtrip() {
+    const fs::path base = MakeUniqueBaseDir("vst_roundtrip");
+    ConfigStore store(base.string());
+
+    MicMixSettings writeSettings{};
+    writeSettings.vstEffectsEnabled = true;
+    writeSettings.vstHostAutostart = false;
+    writeSettings.musicEffects = {
+        { "C:\\\\VST\\\\Comp.vst3", "Compressor", true, false },
+        { "C:\\\\VST\\\\EQ.vst3", "EQ", true, true }
+    };
+    writeSettings.micEffects = {
+        { "C:\\\\VST\\\\Gate.vst3", "Gate", false, true }
+    };
+
+    std::string saveErr;
+    const bool saveOk = store.Save(writeSettings, saveErr);
+    bool pass = true;
+    pass &= Expect(saveOk, "Save(vst_roundtrip) should return true");
+    pass &= Expect(saveErr.empty(), "Save(vst_roundtrip) should not return errors");
+
+    MicMixSettings readSettings{};
+    std::string warning;
+    const bool loadOk = store.Load(readSettings, warning);
+    pass &= Expect(loadOk, "Load(vst_roundtrip) should return true");
+    pass &= Expect(readSettings.vstEffectsEnabled, "roundtrip effects enabled should match");
+    pass &= Expect(!readSettings.vstHostAutostart, "roundtrip host autostart should match");
+    pass &= Expect(readSettings.musicEffects.size() == 2, "roundtrip music effect count should match");
+    pass &= Expect(readSettings.micEffects.size() == 1, "roundtrip mic effect count should match");
+    pass &= Expect(readSettings.musicEffects[1].bypass, "roundtrip music bypass should match");
+    pass &= Expect(!readSettings.micEffects[0].enabled, "roundtrip mic enabled should match");
+    pass &= Expect(warning.empty(), "Roundtrip load should not produce parse warnings");
+    return pass;
+}
+
 } // namespace
 
 int main() {
@@ -176,6 +252,12 @@ int main() {
         ++failed;
     }
     if (!TestOversizedConfigIgnored()) {
+        ++failed;
+    }
+    if (!TestVstEffectsIniParse()) {
+        ++failed;
+    }
+    if (!TestVstEffectsSaveRoundtrip()) {
         ++failed;
     }
     CleanupTempDirs();

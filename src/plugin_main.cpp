@@ -18,8 +18,10 @@ namespace {
 
 constexpr int PLUGIN_API_VERSION = 26;
 constexpr int MENU_ID_SETTINGS = 1;
+constexpr int MENU_ID_EFFECTS = 2;
 constexpr char MENU_ICON_FILE[] = "t.png";
 constexpr char SETTINGS_ICON_FILE[] = "1.png";
+constexpr char EFFECTS_ICON_FILE[] = "1.png";
 
 char* g_pluginIdRaw = nullptr;
 std::atomic<bool> g_pluginShuttingDown{false};
@@ -171,7 +173,7 @@ void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
     }
     *menuItems = nullptr;
     *menuIcon = nullptr;
-    const size_t sz = 2;
+    const size_t sz = 3;
     auto** items = static_cast<PluginMenuItem**>(std::calloc(sz, sizeof(PluginMenuItem*)));
     if (!items) {
         return;
@@ -181,8 +183,15 @@ void ts3plugin_initMenus(struct PluginMenuItem*** menuItems, char** menuIcon) {
         std::free(items);
         return;
     }
+    items[1] = CreateMenuItem(PLUGIN_MENU_TYPE_GLOBAL, MENU_ID_EFFECTS, "MicMix Effects...", EFFECTS_ICON_FILE);
+    if (!items[1]) {
+        std::free(items[0]);
+        std::free(items);
+        return;
+    }
     auto* icon = static_cast<char*>(std::malloc(PLUGIN_MENU_BUFSZ));
     if (!icon) {
+        std::free(items[1]);
         std::free(items[0]);
         std::free(items);
         return;
@@ -209,6 +218,8 @@ void ts3plugin_onMenuItemEvent(uint64 serverConnectionHandlerID, enum PluginMenu
         (void)selectedItemID;
         if (type == PLUGIN_MENU_TYPE_GLOBAL && menuItemID == MENU_ID_SETTINGS) {
             MicMixApp::Instance().OpenSettingsWindow();
+        } else if (type == PLUGIN_MENU_TYPE_GLOBAL && menuItemID == MENU_ID_EFFECTS) {
+            MicMixApp::Instance().OpenEffectsWindow();
         }
     });
 }

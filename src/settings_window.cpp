@@ -25,6 +25,7 @@
 #include "micmix_core.h"
 #include "micmix_version.h"
 #include "resource.h"
+#include "ui_shared.h"
 
 #pragma comment(lib, "Comctl32.lib")
 #pragma comment(lib, "Shell32.lib")
@@ -90,15 +91,6 @@ struct SourceChoice {
     uint32_t pid = 0;
 };
 
-struct UiTheme {
-    COLORREF bg = RGB(241, 244, 248);
-    COLORREF card = RGB(255, 255, 255);
-    COLORREF border = RGB(212, 218, 229);
-    COLORREF text = RGB(30, 33, 41);
-    COLORREF muted = RGB(96, 105, 119);
-    COLORREF accent = RGB(33, 112, 218);
-};
-
 std::mutex g_mutex;
 std::mutex g_enumMutex;
 std::mutex g_sourceRefreshThreadMutex;
@@ -111,7 +103,7 @@ std::vector<CaptureDeviceInfo> g_captureDevices;
 std::vector<AppProcessInfo> g_apps;
 std::vector<SourceChoice> g_sourceChoices;
 int g_lastValidSourceSel = -1;
-UiTheme g_theme;
+UiTheme g_theme = DefaultUiTheme();
 int g_dpi = 96;
 bool g_loadingUi = false;
 int g_hotkeyRefreshTick = 0;
@@ -264,15 +256,6 @@ void SetOwnerCheckboxValue(int id, bool value) {
     case IDC_MUTE: g_ownerMuteChecked = value; break;
     default: break;
     }
-}
-
-std::wstring Utf8ToWide(const std::string& text) {
-    if (text.empty()) return {};
-    int len = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
-    std::wstring out(static_cast<size_t>(len), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, out.data(), len);
-    if (!out.empty() && out.back() == L'\0') out.pop_back();
-    return out;
 }
 
 void DestroyIconHandle(HICON& icon) {
@@ -485,14 +468,6 @@ HeaderStatusBadgeState ResolveHeaderStatusBadgeState(const MicMixSettings& setti
     }
     return HeaderStatusBadgeState::Active;
 }
-
-struct HeaderBadgeVisual {
-    const wchar_t* label = L"OFF";
-    COLORREF bg = RGB(134, 150, 173);
-    COLORREF border = RGB(102, 118, 141);
-    COLORREF text = RGB(255, 255, 255);
-    COLORREF dot = RGB(246, 249, 255);
-};
 
 HeaderBadgeVisual GetHeaderBadgeVisual(HeaderStatusBadgeState state) {
     switch (state) {
@@ -1292,14 +1267,7 @@ void ComputeLayout() {
 }
 
 void DrawCard(HDC hdc, const RECT& rc) {
-    FillRect(hdc, &rc, g_brushCard);
-    HPEN pen = CreatePen(PS_SOLID, 1, g_theme.border);
-    HGDIOBJ oldPen = SelectObject(hdc, pen);
-    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-    Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
-    SelectObject(hdc, oldBrush);
-    SelectObject(hdc, oldPen);
-    DeleteObject(pen);
+    DrawFlatCardFrame(hdc, rc, g_brushCard, g_theme.border);
 }
 
 void FillSolidRect(HDC hdc, const RECT& rc, COLORREF color) {
@@ -1313,41 +1281,7 @@ void DrawHeaderStatusBadge(HDC hdc) {
         return;
     }
     const HeaderBadgeVisual visual = GetHeaderBadgeVisual(g_headerStatusBadgeState);
-    HPEN pen = CreatePen(PS_SOLID, 1, visual.border);
-    HBRUSH brush = CreateSolidBrush(visual.bg);
-    HGDIOBJ oldPen = SelectObject(hdc, pen);
-    HGDIOBJ oldBrush = SelectObject(hdc, brush);
-    RoundRect(hdc, g_rcHeaderBadge.left, g_rcHeaderBadge.top, g_rcHeaderBadge.right, g_rcHeaderBadge.bottom, S(10), S(10));
-    SelectObject(hdc, oldBrush);
-    SelectObject(hdc, oldPen);
-    DeleteObject(brush);
-    DeleteObject(pen);
-
-    const int dotSize = S(6);
-    const int dotInsetX = S(8);
-    const int dotY = g_rcHeaderBadge.top + ((g_rcHeaderBadge.bottom - g_rcHeaderBadge.top - dotSize) / 2);
-    RECT dotRc{
-        g_rcHeaderBadge.left + dotInsetX,
-        dotY,
-        g_rcHeaderBadge.left + dotInsetX + dotSize,
-        dotY + dotSize
-    };
-    HPEN dotPen = CreatePen(PS_SOLID, 1, visual.dot);
-    HBRUSH dotBrush = CreateSolidBrush(visual.dot);
-    HGDIOBJ oldDotPen = SelectObject(hdc, dotPen);
-    HGDIOBJ oldDotBrush = SelectObject(hdc, dotBrush);
-    Ellipse(hdc, dotRc.left, dotRc.top, dotRc.right, dotRc.bottom);
-    SelectObject(hdc, oldDotBrush);
-    SelectObject(hdc, oldDotPen);
-    DeleteObject(dotBrush);
-    DeleteObject(dotPen);
-
-    RECT textRc = g_rcHeaderBadge;
-    textRc.left += S(12);
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, visual.text);
-    SelectObject(hdc, g_fontSmall ? g_fontSmall : g_fontBody);
-    DrawTextW(hdc, visual.label, -1, &textRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DrawHeaderBadge(hdc, g_rcHeaderBadge, visual, g_fontSmall, g_fontBody, g_dpi);
 }
 
 void DrawLevelMeter(HDC hdc, const RECT& meterRect, bool active, float visualDb, float holdDb) {

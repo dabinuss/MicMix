@@ -30,11 +30,13 @@
 #include <unordered_set>
 
 #include "settings_window.h"
+#include "effects_window.h"
 
 using Microsoft::WRL::ComPtr;
 
 TS3Functions g_ts3Functions = {};
 std::string g_pluginId;
+extern "C" IMAGE_DOS_HEADER __ImageBase;
 
 namespace {
 
@@ -52,6 +54,9 @@ constexpr uint64_t kClipIndicatorHoldMs = 2600ULL;
 constexpr uint32_t kMinSupportedSourceRate = 8000;
 constexpr uint32_t kMaxSupportedSourceRate = 384000;
 constexpr uintmax_t kMaxConfigBytes = 1024U * 1024U;
+constexpr size_t kMaxEffectsPerChain = 64;
+constexpr size_t kMaxEffectPathLen = 1024;
+constexpr size_t kMaxEffectNameLen = 192;
 
 bool IsSupportedSourceRate(uint32_t sampleRate) {
     return sampleRate >= kMinSupportedSourceRate && sampleRate <= kMaxSupportedSourceRate;
@@ -584,10 +589,28 @@ void SanitizeSettings(MicMixSettings& s) {
     if (!s.appSessionId.empty() && !IsDigitsOnly(s.appSessionId)) {
         s.appSessionId.clear();
     }
+
+    MicMixApp::SanitizeEffectList(s.musicEffects);
+    MicMixApp::SanitizeEffectList(s.micEffects);
 }
 
 bool NearlyEqual(float a, float b) {
     return std::fabs(a - b) < 0.0001f;
+}
+
+bool IsSameEffectSlots(const std::vector<VstEffectSlot>& a, const std::vector<VstEffectSlot>& b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].path != b[i].path ||
+            a[i].name != b[i].name ||
+            a[i].enabled != b[i].enabled ||
+            a[i].bypass != b[i].bypass) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool IsSameSettings(const MicMixSettings& a, const MicMixSettings& b) {
@@ -614,7 +637,11 @@ bool IsSameSettings(const MicMixSettings& a, const MicMixSettings& b) {
            NearlyEqual(a.micGateThresholdDbfs, b.micGateThresholdDbfs) &&
            a.micUseSmoothGate == b.micUseSmoothGate &&
            a.micUseKeyboardGuard == b.micUseKeyboardGuard &&
-           a.micForceTsFilters == b.micForceTsFilters;
+           a.micForceTsFilters == b.micForceTsFilters &&
+           a.vstEffectsEnabled == b.vstEffectsEnabled &&
+           a.vstHostAutostart == b.vstHostAutostart &&
+           IsSameEffectSlots(a.musicEffects, b.musicEffects) &&
+           IsSameEffectSlots(a.micEffects, b.micEffects);
 }
 
 bool IsBlockedUiProcess(uint32_t pid, const std::wstring& exeName) {
@@ -1103,6 +1130,48 @@ bool ConfigStore::Load(MicMixSettings& outSettings, std::string& warning) {
     if (auto it = kv.find("mic.gate.smooth"); it != kv.end()) outSettings.micUseSmoothGate = ::ParseBool(it->second, outSettings.micUseSmoothGate);
     if (auto it = kv.find("mic.gate.keyboard_guard"); it != kv.end()) outSettings.micUseKeyboardGuard = ::ParseBool(it->second, outSettings.micUseKeyboardGuard);
     if (auto it = kv.find("mic.force_ts_filters"); it != kv.end()) outSettings.micForceTsFilters = ::ParseBool(it->second, outSettings.micForceTsFilters);
+    if (auto it = kv.find("vst.effects_enabled"); it != kv.end()) outSettings.vstEffectsEnabled = ::ParseBool(it->second, outSettings.vstEffectsEnabled);
+    if (auto it = kv.find("vst.host.autostart"); it != kv.end()) outSettings.vstHostAutostart = ::ParseBool(it->second, outSettings.vstHostAutostart);
+    auto parseEffectChain = [&](const char* chainPrefix, std::vector<VstEffectSlot>& outList) {
+        outList.clear();
+        int count = -1;
+        parseInt((std::string(chainPrefix) + ".count").c_str(), count);
+        count = std::clamp(count, -1, static_cast<int>(kMaxEffectsPerChain));
+        auto parseAt = [&](int index) {
+            const std::string base = std::string(chainPrefix) + "." + std::to_string(index);
+            const std::string keyPath = base + ".path";
+            const auto pathIt = kv.find(keyPath);
+            if (pathIt == kv.end()) {
+                return false;
+            }
+            VstEffectSlot slot{};
+            slot.path = pathIt->second;
+            if (auto it = kv.find(base + ".name"); it != kv.end()) {
+                slot.name = it->second;
+            }
+            if (auto it = kv.find(base + ".enabled"); it != kv.end()) {
+                slot.enabled = ::ParseBool(it->second, true);
+            }
+            if (auto it = kv.find(base + ".bypass"); it != kv.end()) {
+                slot.bypass = ::ParseBool(it->second, false);
+            }
+            outList.push_back(std::move(slot));
+            return true;
+        };
+        if (count >= 0) {
+            for (int i = 0; i < count; ++i) {
+                parseAt(i);
+            }
+            return;
+        }
+        for (int i = 0; i < static_cast<int>(kMaxEffectsPerChain); ++i) {
+            if (!parseAt(i)) {
+                break;
+            }
+        }
+    };
+    parseEffectChain("vst.music", outSettings.musicEffects);
+    parseEffectChain("vst.mic", outSettings.micEffects);
     parseInt("ui.last_open_tab", outSettings.uiLastOpenTab);
     if (parseIssue) {
         appendWarning("Config parse issue detected; fallback values were used.");
@@ -1139,6 +1208,24 @@ bool ConfigStore::Save(const MicMixSettings& settings, std::string& error) {
     ss << "mic.gate.smooth=" << BoolToString(safe.micUseSmoothGate) << "\n";
     ss << "mic.gate.keyboard_guard=" << BoolToString(safe.micUseKeyboardGuard) << "\n";
     ss << "mic.force_ts_filters=" << BoolToString(safe.micForceTsFilters) << "\n";
+    ss << "vst.effects_enabled=" << BoolToString(safe.vstEffectsEnabled) << "\n";
+    ss << "vst.host.autostart=" << BoolToString(safe.vstHostAutostart) << "\n";
+    ss << "vst.music.count=" << safe.musicEffects.size() << "\n";
+    for (size_t i = 0; i < safe.musicEffects.size(); ++i) {
+        const auto& slot = safe.musicEffects[i];
+        ss << "vst.music." << i << ".path=" << slot.path << "\n";
+        ss << "vst.music." << i << ".name=" << slot.name << "\n";
+        ss << "vst.music." << i << ".enabled=" << BoolToString(slot.enabled) << "\n";
+        ss << "vst.music." << i << ".bypass=" << BoolToString(slot.bypass) << "\n";
+    }
+    ss << "vst.mic.count=" << safe.micEffects.size() << "\n";
+    for (size_t i = 0; i < safe.micEffects.size(); ++i) {
+        const auto& slot = safe.micEffects[i];
+        ss << "vst.mic." << i << ".path=" << slot.path << "\n";
+        ss << "vst.mic." << i << ".name=" << slot.name << "\n";
+        ss << "vst.mic." << i << ".enabled=" << BoolToString(slot.enabled) << "\n";
+        ss << "vst.mic." << i << ".bypass=" << BoolToString(slot.bypass) << "\n";
+    }
     ss << "ui.last_open_tab=" << safe.uiLastOpenTab << "\n";
 
     {
@@ -3392,6 +3479,323 @@ MicMixApp& MicMixApp::Instance() {
 MicMixApp::MicMixApp() = default;
 MicMixApp::~MicMixApp() = default;
 
+void MicMixApp::SanitizeEffectList(std::vector<VstEffectSlot>& list) {
+    if (list.size() > kMaxEffectsPerChain) {
+        list.resize(kMaxEffectsPerChain);
+    }
+    for (auto& slot : list) {
+        StripConfigControlChars(slot.path, kMaxEffectPathLen);
+        StripConfigControlChars(slot.name, kMaxEffectNameLen);
+        if (slot.name.empty() && !slot.path.empty()) {
+            const std::filesystem::path p(Utf8ToWide(slot.path));
+            slot.name = WideToUtf8(p.stem().wstring());
+        }
+    }
+    list.erase(std::remove_if(list.begin(), list.end(), [](const VstEffectSlot& slot) {
+        return slot.path.empty();
+    }), list.end());
+}
+
+std::wstring MicMixApp::ResolveVstHostPath() const {
+    wchar_t pathBuf[MAX_PATH]{};
+    const HMODULE module = reinterpret_cast<HMODULE>(&__ImageBase);
+    const DWORD len = GetModuleFileNameW(module, pathBuf, static_cast<DWORD>(std::size(pathBuf)));
+    if (len == 0 || len >= std::size(pathBuf)) {
+        return {};
+    }
+    std::filesystem::path dllPath(pathBuf);
+    return (dllPath.parent_path() / L"micmix_vst_host.exe").wstring();
+}
+
+bool MicMixApp::StartVstHostProcess(std::string& error) {
+    error.clear();
+    std::lock_guard<std::mutex> lock(vstHostMutex_);
+    if (vstHostProcess_) {
+        const DWORD wait = WaitForSingleObject(vstHostProcess_, 0);
+        if (wait == WAIT_TIMEOUT) {
+            vstHostRunning_.store(true, std::memory_order_release);
+            if (vstHostPid_.load(std::memory_order_acquire) != 0) {
+                return true;
+            }
+        } else {
+            CloseHandle(vstHostProcess_);
+            vstHostProcess_ = nullptr;
+            if (vstHostThread_) {
+                CloseHandle(vstHostThread_);
+                vstHostThread_ = nullptr;
+            }
+            vstHostRunning_.store(false, std::memory_order_release);
+            vstHostPid_.store(0, std::memory_order_release);
+        }
+    }
+
+    const std::wstring hostPath = ResolveVstHostPath();
+    if (hostPath.empty() || !PathFileExistsW(hostPath.c_str())) {
+        error = "vst host binary missing: " + WideToUtf8(hostPath);
+        vstHostMessage_ = error;
+        return false;
+    }
+
+    std::wstring cmdLine = L"\"";
+    cmdLine += hostPath;
+    cmdLine += L"\" --pipe micmix_vst_host";
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(
+            nullptr,
+            cmdLine.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            CREATE_NO_WINDOW,
+            nullptr,
+            nullptr,
+            &si,
+            &pi)) {
+        error = "CreateProcess failed: " + std::to_string(GetLastError());
+        vstHostMessage_ = error;
+        return false;
+    }
+    vstHostProcess_ = pi.hProcess;
+    vstHostThread_ = pi.hThread;
+    vstHostPid_.store(pi.dwProcessId, std::memory_order_release);
+    vstHostRunning_.store(true, std::memory_order_release);
+    vstHostMessage_ = "running";
+    LogInfo("vst_host started pid=" + std::to_string(pi.dwProcessId));
+    return true;
+}
+
+void MicMixApp::StopVstHostProcess() {
+    std::lock_guard<std::mutex> lock(vstHostMutex_);
+    if (!vstHostProcess_) {
+        vstHostRunning_.store(false, std::memory_order_release);
+        vstHostPid_.store(0, std::memory_order_release);
+        if (vstHostThread_) {
+            CloseHandle(vstHostThread_);
+            vstHostThread_ = nullptr;
+        }
+        return;
+    }
+    const DWORD wait = WaitForSingleObject(vstHostProcess_, 1200);
+    if (wait == WAIT_TIMEOUT) {
+        TerminateProcess(vstHostProcess_, 0);
+        WaitForSingleObject(vstHostProcess_, 800);
+    }
+    CloseHandle(vstHostProcess_);
+    vstHostProcess_ = nullptr;
+    if (vstHostThread_) {
+        CloseHandle(vstHostThread_);
+        vstHostThread_ = nullptr;
+    }
+    vstHostRunning_.store(false, std::memory_order_release);
+    vstHostPid_.store(0, std::memory_order_release);
+    vstHostMessage_ = "stopped";
+    LogInfo("vst_host stopped");
+}
+
+VstHostStatus MicMixApp::GetVstHostStatus() const {
+    VstHostStatus status{};
+    status.running = vstHostRunning_.load(std::memory_order_acquire);
+    status.pid = vstHostPid_.load(std::memory_order_acquire);
+    {
+        std::lock_guard<std::mutex> lock(vstHostMutex_);
+        if (vstHostProcess_) {
+            const DWORD wait = WaitForSingleObject(vstHostProcess_, 0);
+            if (wait != WAIT_TIMEOUT) {
+                status.running = false;
+                status.pid = 0;
+            }
+        }
+        status.message = vstHostMessage_;
+    }
+    return status;
+}
+
+bool MicMixApp::IsEffectsEnabled() const {
+    std::lock_guard<std::mutex> lock(settingsMutex_);
+    return settings_.vstEffectsEnabled;
+}
+
+void MicMixApp::SetEffectsEnabled(bool enabled, bool saveConfig) {
+    MicMixSettings snapshot;
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(settingsMutex_);
+        if (settings_.vstEffectsEnabled != enabled) {
+            settings_.vstEffectsEnabled = enabled;
+            changed = true;
+        }
+        snapshot = settings_;
+    }
+    if (!changed) {
+        return;
+    }
+    if (enabled) {
+        std::string err;
+        if (!StartVstHostProcess(err)) {
+            LogWarn("vst_host start failed: " + err);
+        }
+    } else {
+        StopVstHostProcess();
+    }
+    if (saveConfig && configStore_) {
+        std::string err;
+        if (!configStore_->Save(snapshot, err) && !err.empty()) {
+            LogError("Config save failed: " + err);
+        }
+    }
+}
+
+std::vector<VstEffectSlot> MicMixApp::GetEffects(EffectChain chain) const {
+    std::lock_guard<std::mutex> lock(settingsMutex_);
+    if (chain == EffectChain::Music) {
+        return settings_.musicEffects;
+    }
+    return settings_.micEffects;
+}
+
+bool MicMixApp::AddEffect(EffectChain chain, const VstEffectSlot& slot, std::string& error) {
+    error.clear();
+    VstEffectSlot safe = slot;
+    std::vector<VstEffectSlot> tmp{safe};
+    SanitizeEffectList(tmp);
+    if (tmp.empty()) {
+        error = "invalid effect slot";
+        return false;
+    }
+    safe = tmp.front();
+    std::error_code ec;
+    const std::filesystem::path p(Utf8ToWide(safe.path));
+    if (!std::filesystem::exists(p, ec)) {
+        error = "effect path missing";
+        return false;
+    }
+    const std::wstring ext = p.extension().wstring();
+    if (_wcsicmp(ext.c_str(), L".vst3") != 0 && _wcsicmp(ext.c_str(), L".dll") != 0) {
+        error = "unsupported effect file extension";
+        return false;
+    }
+    MicMixSettings snapshot;
+    {
+        std::lock_guard<std::mutex> lock(settingsMutex_);
+        auto& list = (chain == EffectChain::Music) ? settings_.musicEffects : settings_.micEffects;
+        if (list.size() >= kMaxEffectsPerChain) {
+            error = "effect limit reached";
+            return false;
+        }
+        list.push_back(safe);
+        SanitizeEffectList(list);
+        snapshot = settings_;
+    }
+    if (snapshot.vstEffectsEnabled) {
+        std::string startErr;
+        if (!StartVstHostProcess(startErr)) {
+            LogWarn("vst_host start failed after add effect: " + startErr);
+        }
+    }
+    if (configStore_) {
+        std::string saveErr;
+        if (!configStore_->Save(snapshot, saveErr) && !saveErr.empty()) {
+            LogError("Config save failed: " + saveErr);
+        }
+    }
+    return true;
+}
+
+bool MicMixApp::RemoveEffect(EffectChain chain, size_t index, std::string& error) {
+    error.clear();
+    MicMixSettings snapshot;
+    {
+        std::lock_guard<std::mutex> lock(settingsMutex_);
+        auto& list = (chain == EffectChain::Music) ? settings_.musicEffects : settings_.micEffects;
+        if (index >= list.size()) {
+            error = "invalid index";
+            return false;
+        }
+        list.erase(list.begin() + static_cast<std::ptrdiff_t>(index));
+        snapshot = settings_;
+    }
+    if (configStore_) {
+        std::string saveErr;
+        if (!configStore_->Save(snapshot, saveErr) && !saveErr.empty()) {
+            LogError("Config save failed: " + saveErr);
+        }
+    }
+    return true;
+}
+
+bool MicMixApp::MoveEffect(EffectChain chain, size_t fromIndex, size_t toIndex, std::string& error) {
+    error.clear();
+    MicMixSettings snapshot;
+    {
+        std::lock_guard<std::mutex> lock(settingsMutex_);
+        auto& list = (chain == EffectChain::Music) ? settings_.musicEffects : settings_.micEffects;
+        if (fromIndex >= list.size() || toIndex >= list.size()) {
+            error = "invalid move index";
+            return false;
+        }
+        if (fromIndex == toIndex) {
+            return true;
+        }
+        VstEffectSlot moved = list[fromIndex];
+        list.erase(list.begin() + static_cast<std::ptrdiff_t>(fromIndex));
+        list.insert(list.begin() + static_cast<std::ptrdiff_t>(toIndex), std::move(moved));
+        snapshot = settings_;
+    }
+    if (configStore_) {
+        std::string saveErr;
+        if (!configStore_->Save(snapshot, saveErr) && !saveErr.empty()) {
+            LogError("Config save failed: " + saveErr);
+        }
+    }
+    return true;
+}
+
+bool MicMixApp::SetEffectBypass(EffectChain chain, size_t index, bool bypass, std::string& error) {
+    error.clear();
+    MicMixSettings snapshot;
+    {
+        std::lock_guard<std::mutex> lock(settingsMutex_);
+        auto& list = (chain == EffectChain::Music) ? settings_.musicEffects : settings_.micEffects;
+        if (index >= list.size()) {
+            error = "invalid index";
+            return false;
+        }
+        list[index].bypass = bypass;
+        snapshot = settings_;
+    }
+    if (configStore_) {
+        std::string saveErr;
+        if (!configStore_->Save(snapshot, saveErr) && !saveErr.empty()) {
+            LogError("Config save failed: " + saveErr);
+        }
+    }
+    return true;
+}
+
+bool MicMixApp::SetEffectEnabled(EffectChain chain, size_t index, bool enabled, std::string& error) {
+    error.clear();
+    MicMixSettings snapshot;
+    {
+        std::lock_guard<std::mutex> lock(settingsMutex_);
+        auto& list = (chain == EffectChain::Music) ? settings_.musicEffects : settings_.micEffects;
+        if (index >= list.size()) {
+            error = "invalid index";
+            return false;
+        }
+        list[index].enabled = enabled;
+        snapshot = settings_;
+    }
+    if (configStore_) {
+        std::string saveErr;
+        if (!configStore_->Save(snapshot, saveErr) && !saveErr.empty()) {
+            LogError("Config save failed: " + saveErr);
+        }
+    }
+    return true;
+}
+
 namespace {
 bool IsConnectedForTx(uint64 schid) {
     if (schid == 0 || !g_ts3Functions.getConnectionStatus) {
@@ -4304,6 +4708,10 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
         configStore_->Load(settings_, warn);
         SanitizeSettings(settings_);
         if (!warn.empty()) LogWarn(warn);
+        {
+            std::lock_guard<std::mutex> lock(vstHostMutex_);
+            vstHostMessage_ = "stopped";
+        }
         engine_.ApplySettings(settings_);
         ApplyMicInputTransportMute(settings_.micInputMuted);
         // Disabled intentionally: an additional capture stream can interfere with
@@ -4359,6 +4767,12 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
         const uint64_t nowMs = GetTickCount64();
         lastCaptureEditTickMs_.store(nowMs, std::memory_order_release);
         lastCaptureReopenTickMs_.store(0, std::memory_order_release);
+        if (settings_.vstHostAutostart || settings_.vstEffectsEnabled) {
+            std::string hostError;
+            if (!StartVstHostProcess(hostError)) {
+                LogWarn("vst_host startup warning: " + hostError);
+            }
+        }
         StartVoiceTxThread();
         LogInfo("MicMix initialized");
         return true;
@@ -4382,6 +4796,7 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
     micInputMuteHotkeyManager_.reset();
     sourceManager_.store({}, std::memory_order_release);
     mixMonitorPlayer_.store({}, std::memory_order_release);
+    StopVstHostProcess();
     configStore_.reset();
     initialized_.store(false, std::memory_order_release);
     shutdownRequested_.store(true, std::memory_order_release);
@@ -4396,6 +4811,7 @@ void MicMixApp::Shutdown() {
         musicMetaLastAttemptMs_ = 0;
     }
     SettingsWindowController::Instance().Close();
+    EffectsWindowController::Instance().Close();
     if (musicMuteHotkeyManager_) musicMuteHotkeyManager_->Stop();
     if (micInputMuteHotkeyManager_) micInputMuteHotkeyManager_->Stop();
     // Keep shutdownRequested_ clear until voice-tx cleanup is done so we can
@@ -4421,6 +4837,7 @@ void MicMixApp::Shutdown() {
     micInputMuteHotkeyManager_.reset();
     sourceManager_.store({}, std::memory_order_release);
     mixMonitorPlayer_.store({}, std::memory_order_release);
+    StopVstHostProcess();
     configStore_.reset();
 }
 
@@ -4434,11 +4851,15 @@ void MicMixApp::ApplySettings(const MicMixSettings& settings, bool restartSource
     SanitizeSettings(safe);
     bool changed = false;
     bool micInputMuteChanged = false;
+    bool effectsEnabledChanged = false;
+    bool hostAutostartChanged = false;
     bool micInputMuted = false;
     {
         std::lock_guard<std::mutex> lock(settingsMutex_);
         changed = !IsSameSettings(settings_, safe);
         micInputMuteChanged = (settings_.micInputMuted != safe.micInputMuted);
+        effectsEnabledChanged = (settings_.vstEffectsEnabled != safe.vstEffectsEnabled);
+        hostAutostartChanged = (settings_.vstHostAutostart != safe.vstHostAutostart);
         settings_ = safe;
         micInputMuted = settings_.micInputMuted;
     }
@@ -4449,6 +4870,16 @@ void MicMixApp::ApplySettings(const MicMixSettings& settings, bool restartSource
     engine_.ApplySettings(safe);
     if (micInputMuteChanged) {
         ApplyMicInputTransportMute(micInputMuted);
+    }
+    if (effectsEnabledChanged || hostAutostartChanged) {
+        if (safe.vstEffectsEnabled || safe.vstHostAutostart) {
+            std::string err;
+            if (!StartVstHostProcess(err)) {
+                LogWarn("vst_host start failed: " + err);
+            }
+        } else {
+            StopVstHostProcess();
+        }
     }
     if (musicMuteHotkeyManager_) {
         musicMuteHotkeyManager_->ApplySettings(safe);
@@ -4733,6 +5164,10 @@ void MicMixApp::EditCapturedVoice(uint64 schid, short* samples, int sampleCount,
 
 void MicMixApp::OpenSettingsWindow() {
     SettingsWindowController::Instance().Open();
+}
+
+void MicMixApp::OpenEffectsWindow() {
+    EffectsWindowController::Instance().Open();
 }
 
 std::string SourceStateToString(SourceState state) {
