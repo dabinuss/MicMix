@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -50,6 +51,7 @@ enum ControlId {
     IDC_MUSIC_UP = 4223,
     IDC_MUSIC_DOWN = 4224,
     IDC_MUSIC_BYPASS = 4225,
+    IDC_MUSIC_EDITOR = 4226,
 
     IDC_MIC_LIST = 4230,
     IDC_MIC_ADD = 4231,
@@ -57,6 +59,7 @@ enum ControlId {
     IDC_MIC_UP = 4233,
     IDC_MIC_DOWN = 4234,
     IDC_MIC_BYPASS = 4235,
+    IDC_MIC_EDITOR = 4236,
 
     IDC_STATUS = 4240,
 
@@ -78,7 +81,16 @@ std::atomic<HWND> g_hwnd{nullptr};
 UiTheme g_theme = DefaultUiTheme();
 int g_dpi = 96;
 std::wstring g_statusText;
+uint64_t g_lastListRefreshTickMs = 0;
 std::atomic<bool> g_loading{false};
+std::atomic<bool> g_editorOpenPending{false};
+
+constexpr UINT kMsgEditorOpenDone = WM_APP + 42;
+
+struct EditorOpenResult {
+    bool ok = false;
+    std::wstring message;
+};
 
 HFONT g_fontBody = nullptr;
 HFONT g_fontSmall = nullptr;
@@ -169,12 +181,14 @@ bool IsHandCursorControlId(int id) {
     case IDC_MUSIC_UP:
     case IDC_MUSIC_DOWN:
     case IDC_MUSIC_BYPASS:
+    case IDC_MUSIC_EDITOR:
     case IDC_MIC_LIST:
     case IDC_MIC_ADD:
     case IDC_MIC_REMOVE:
     case IDC_MIC_UP:
     case IDC_MIC_DOWN:
     case IDC_MIC_BYPASS:
+    case IDC_MIC_EDITOR:
         return true;
     default:
         return false;
@@ -359,6 +373,11 @@ std::wstring BuildEffectRow(const VstEffectSlot& slot) {
     row += L"] [";
     row += slot.bypass ? L"BYP" : L"ACT";
     row += L"] ";
+    if (!slot.lastStatus.empty()) {
+        row += L"{";
+        row += Utf8ToWide(slot.lastStatus);
+        row += L"} ";
+    }
     row += Utf8ToWide(slot.name.empty() ? slot.path : slot.name);
     return row;
 }
@@ -411,7 +430,7 @@ bool PromptEffectPath(HWND hwnd, std::string& outPath) {
     ofn.lpstrFile = fileBuf;
     ofn.nMaxFile = static_cast<DWORD>(std::size(fileBuf));
     ofn.lpstrTitle = L"Select VST Plugin";
-    ofn.lpstrFilter = L"VST3 Plugins (*.vst3)\0*.vst3\0Libraries (*.dll)\0*.dll\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFilter = L"VST3 Plugins (*.vst3)\0*.vst3\0All Files (*.*)\0*.*\0";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
     if (!GetOpenFileNameW(&ofn)) {
         return false;
@@ -481,6 +500,34 @@ void HandleBypassEffect(HWND hwnd, EffectChain chain, int listId) {
     std::string error;
     const bool ok = MicMixApp::Instance().SetEffectBypass(chain, static_cast<size_t>(idx), nextBypass, error);
     ApplyActionResult(hwnd, ok, error, nextBypass ? L"Effect bypassed." : L"Effect active.");
+}
+
+void HandleOpenEditor(HWND hwnd, EffectChain chain, int listId) {
+    const int idx = GetSelectedIndex(hwnd, listId);
+    if (idx < 0) {
+        SetStatusText(hwnd, L"Select an effect first.");
+        return;
+    }
+    if (g_editorOpenPending.exchange(true, std::memory_order_acq_rel)) {
+        SetStatusText(hwnd, L"Editor request already running...");
+        return;
+    }
+    SetStatusText(hwnd, L"Opening editor...");
+    std::thread([hwnd, chain, idx]() {
+        std::string error;
+        const bool ok = MicMixApp::Instance().OpenEffectEditor(chain, static_cast<size_t>(idx), error);
+        auto* result = new EditorOpenResult{};
+        result->ok = ok;
+        if (ok) {
+            result->message = L"Editor request sent.";
+        } else {
+            result->message = Utf8ToWide(error.empty() ? "editor open failed" : error);
+        }
+        if (!PostMessageW(hwnd, kMsgEditorOpenDone, 0, reinterpret_cast<LPARAM>(result))) {
+            delete result;
+            g_editorOpenPending.store(false, std::memory_order_release);
+        }
+    }).detach();
 }
 
 void RefreshStatus(HWND hwnd) {
@@ -917,6 +964,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_lastMusicClipRecent = false;
         g_lastMicClipLitSegments = -1;
         g_lastMicClipRecent = false;
+        g_lastListRefreshTickMs = 0;
 
         const int contentLeft = S(kCardMarginPx + kCardInnerPaddingPx);
         const int contentRight = S(kClientWidthPx - kCardMarginPx - kCardInnerPaddingPx);
@@ -956,7 +1004,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         CreateWindowW(L"BUTTON", L"Remove", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, musicBtnX, musicListTop + S(30), S(86), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_REMOVE), nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, musicBtnX, musicListTop + S(60), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_UP), nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Down", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, musicBtnX + S(46), musicListTop + S(60), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_DOWN), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Bypass", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, musicBtnX, musicListTop + S(90), S(86), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_BYPASS), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Byp", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, musicBtnX, musicListTop + S(90), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_BYPASS), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Open", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, musicBtnX + S(46), musicListTop + S(90), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_EDITOR), nullptr, nullptr);
 
         const int micLeft = g_rcMic.left + S(kCardInnerPaddingPx);
         const int micTop = g_rcMic.top + S(kCardInnerPaddingPx);
@@ -970,7 +1019,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         CreateWindowW(L"BUTTON", L"Remove", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX, micListTop + S(30), S(86), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_REMOVE), nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX, micListTop + S(60), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_UP), nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Down", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX + S(46), micListTop + S(60), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_DOWN), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Bypass", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX, micListTop + S(90), S(86), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_BYPASS), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Byp", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX, micListTop + S(90), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_BYPASS), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Open", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX + S(46), micListTop + S(90), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_EDITOR), nullptr, nullptr);
 
         CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT, g_rcStatus.left + S(kCardInnerPaddingPx), g_rcStatus.top + S(14), (g_rcStatus.right - g_rcStatus.left) - S(kCardInnerPaddingPx * 2), g_rcStatus.bottom - g_rcStatus.top - S(18), hwnd, reinterpret_cast<HMENU>(IDC_STATUS), nullptr, nullptr);
 
@@ -1006,13 +1056,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     case WM_TIMER:
         if (wParam == kTimerStatus) {
-            ReloadAllLists(hwnd);
+            const uint64_t nowMs = GetTickCount64();
+            if (nowMs > (g_lastListRefreshTickMs + 1000ULL)) {
+                ReloadAllLists(hwnd);
+                g_lastListRefreshTickMs = nowMs;
+            }
             RefreshStatus(hwnd);
             UpdateMeterVisuals(hwnd);
             return 0;
         }
         break;
     case WM_COMMAND:
+        if (HIWORD(wParam) == LBN_DBLCLK) {
+            switch (LOWORD(wParam)) {
+            case IDC_MUSIC_LIST:
+                HandleOpenEditor(hwnd, EffectChain::Music, IDC_MUSIC_LIST);
+                return 0;
+            case IDC_MIC_LIST:
+                HandleOpenEditor(hwnd, EffectChain::Mic, IDC_MIC_LIST);
+                return 0;
+            default:
+                break;
+            }
+        }
         switch (LOWORD(wParam)) {
         case IDC_REPO_LINK:
             if (HIWORD(wParam) == STN_CLICKED) {
@@ -1047,6 +1113,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_MUSIC_BYPASS:
             HandleBypassEffect(hwnd, EffectChain::Music, IDC_MUSIC_LIST);
             return 0;
+        case IDC_MUSIC_EDITOR:
+            HandleOpenEditor(hwnd, EffectChain::Music, IDC_MUSIC_LIST);
+            return 0;
         case IDC_MIC_ADD:
             HandleAddEffect(hwnd, EffectChain::Mic);
             return 0;
@@ -1062,10 +1131,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_MIC_BYPASS:
             HandleBypassEffect(hwnd, EffectChain::Mic, IDC_MIC_LIST);
             return 0;
+        case IDC_MIC_EDITOR:
+            HandleOpenEditor(hwnd, EffectChain::Mic, IDC_MIC_LIST);
+            return 0;
         default:
             break;
         }
         break;
+    case kMsgEditorOpenDone: {
+        std::unique_ptr<EditorOpenResult> result(reinterpret_cast<EditorOpenResult*>(lParam));
+        g_editorOpenPending.store(false, std::memory_order_release);
+        if (result) {
+            SetStatusText(hwnd, result->message);
+            if (result->ok) {
+                ReloadAllLists(hwnd);
+                RefreshStatus(hwnd);
+            }
+        }
+        return 0;
+    }
     case WM_SETCURSOR: {
         const HWND target = reinterpret_cast<HWND>(wParam);
         const UINT hit = LOWORD(lParam);
@@ -1134,6 +1218,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     case WM_DESTROY:
         KillTimer(hwnd, kTimerStatus);
+        g_editorOpenPending.store(false, std::memory_order_release);
         g_hwnd.store(nullptr, std::memory_order_release);
         PostQuitMessage(0);
         return 0;

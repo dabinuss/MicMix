@@ -12,6 +12,7 @@
 #include <functional>
 #include <cstdint>
 
+#include "vst_audio_ipc.h"
 #include "teamspeak/public_definitions.h"
 #include "teamspeak/public_errors.h"
 #include "ts3_functions.h"
@@ -48,6 +49,9 @@ enum class EffectChain {
 struct VstEffectSlot {
     std::string path;
     std::string name;
+    std::string uid;
+    std::string stateBlob;
+    std::string lastStatus;
     bool        enabled = true;
     bool        bypass = false;
 };
@@ -396,6 +400,7 @@ public:
     bool MoveEffect(EffectChain chain, size_t fromIndex, size_t toIndex, std::string& error);
     bool SetEffectBypass(EffectChain chain, size_t index, bool bypass, std::string& error);
     bool SetEffectEnabled(EffectChain chain, size_t index, bool enabled, std::string& error);
+    bool OpenEffectEditor(EffectChain chain, size_t index, std::string& error);
     static void SanitizeEffectList(std::vector<VstEffectSlot>& list);
 
     void EditCapturedVoice(uint64 schid, short* samples, int sampleCount, int channels, int* edited);
@@ -416,6 +421,8 @@ private:
     void RefreshVoiceTxControl(uint64 schidHint);
     void SyncMusicActivityMeta(uint64 schid, bool musicActive, bool force);
     void ApplyMicInputTransportMute(bool muted);
+    void OnSourceSamples(const float* data, size_t count);
+    void ProcessMicInputWithVst(short* samples, int sampleCount, int channels);
 
     std::atomic<bool> initialized_{false};
     std::unique_ptr<ConfigStore> configStore_;
@@ -463,17 +470,40 @@ private:
     bool micInputTransportSavedValid_ = false;
     int micInputTransportSavedState_ = INPUT_DEACTIVATED;
     std::atomic<bool> vstHostRunning_{false};
+    std::atomic<bool> vstEffectsEnabledCached_{false};
+    std::atomic<bool> vstHostSyncPending_{false};
+    std::atomic<bool> vstHostStopPending_{false};
     std::atomic<uint32_t> vstHostPid_{0};
     mutable std::mutex vstHostMutex_;
+    mutable std::mutex vstHostIpcMutex_;
+    std::recursive_mutex vstHostLifecycleMutex_;
     HANDLE vstHostProcess_ = nullptr;
     HANDLE vstHostThread_ = nullptr;
+    HANDLE vstHostJob_ = nullptr;
+    HANDLE vstAudioMap_ = nullptr;
+    micmix::vstipc::SharedMemory* vstAudioShared_ = nullptr;
     std::string vstHostMessage_;
+    std::atomic<uint32_t> vstMusicSeq_{1};
+    std::atomic<uint32_t> vstMicSeq_{1};
 
     bool TryEnterCaptureCallback();
     void LeaveCaptureCallback();
     bool StartVstHostProcess(std::string& error);
     void StopVstHostProcess();
     std::wstring ResolveVstHostPath() const;
+    std::wstring BuildVstHostPipePath() const;
+    bool SendVstHostCommand(const std::string& command, std::string& response, DWORD timeoutMs, std::string& error) const;
+    bool SyncVstHostState(const MicMixSettings& settings, std::string& error);
+    bool PingVstHost(std::string& response, std::string& error) const;
+    bool EnsureVstAudioIpc();
+    void CloseVstAudioIpc();
+    void MaintainVstHost(uint64_t nowMs);
+
+    std::atomic_uint64_t vstHostNextRestartTickMs_{0};
+    std::atomic<uint32_t> vstHostRestartAttempts_{0};
+    std::atomic_uint64_t vstHostLastRestartLogTickMs_{0};
+    std::atomic_uint64_t vstHostLastHeartbeatTickMs_{0};
+    std::atomic_uint64_t vstHostEditorKeepAliveUntilMs_{0};
 };
 
 std::string SourceStateToString(SourceState state);

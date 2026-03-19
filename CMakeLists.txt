@@ -113,6 +113,11 @@ add_executable(micmix_vst_host
   src/vst_host_main.cpp
 )
 
+target_include_directories(micmix_vst_host PRIVATE
+  src
+  ${CMAKE_SOURCE_DIR}/third_party/vst3sdk
+)
+
 target_compile_definitions(micmix_vst_host PRIVATE
   WIN32_LEAN_AND_MEAN
   NOMINMAX
