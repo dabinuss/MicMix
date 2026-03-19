@@ -466,6 +466,19 @@ bool IsSourceUp(SourceState state) {
            state == SourceState::Reacquiring;
 }
 
+void SetControlEnabled(HWND hwnd, int controlId, bool enabled) {
+    HWND ctl = GetDlgItem(hwnd, controlId);
+    if (!ctl) {
+        return;
+    }
+    const BOOL currentlyEnabled = IsWindowEnabled(ctl);
+    if ((currentlyEnabled != FALSE) == enabled) {
+        return;
+    }
+    EnableWindow(ctl, enabled ? TRUE : FALSE);
+    InvalidateRect(ctl, nullptr, TRUE);
+}
+
 HeaderStatusBadgeState ResolveHeaderStatusBadgeState(const MicMixSettings& settings, const SourceStatus& status) {
     if (status.state == SourceState::Error) {
         return HeaderStatusBadgeState::Error;
@@ -1156,6 +1169,9 @@ void UpdateStatus(HWND hwnd, bool includeDetails = true) {
 
     const MicMixSettings s = app.GetSettings();
     const SourceStatus st = app.GetSourceStatus();
+    const bool sourceUp = IsSourceUp(st.state);
+    SetControlEnabled(hwnd, IDC_MIC_INPUT_MUTE, sourceUp);
+    SetControlEnabled(hwnd, IDC_MUTE, sourceUp);
     UpdateHeaderStatusBadgeState(hwnd, s, st);
     if (GetOwnerCheckboxValue(IDC_MUTE) != s.musicMuted) {
         SetOwnerCheckboxValue(IDC_MUTE, s.musicMuted);
@@ -2171,6 +2187,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_AUTOSTART:
             if (HIWORD(wParam) == BN_CLICKED) {
                 const int id = LOWORD(wParam);
+                if ((id == IDC_MIC_INPUT_MUTE || id == IDC_MUTE) &&
+                    IsWindowEnabled(GetDlgItem(hwnd, id)) == FALSE) {
+                    return 0;
+                }
                 if (IsOwnerCheckboxControlId(id)) {
                     SetOwnerCheckboxValue(id, !GetOwnerCheckboxValue(id));
                     InvalidateRect(GetDlgItem(hwnd, id), nullptr, TRUE);

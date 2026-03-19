@@ -82,6 +82,12 @@ int ResolveResamplerQualitySetting(int configuredValue) {
     return std::clamp(configuredValue, 0, 10);
 }
 
+bool IsSourceStateActive(SourceState state) {
+    return state == SourceState::Running ||
+           state == SourceState::Starting ||
+           state == SourceState::Reacquiring;
+}
+
 std::mutex g_logMutex;
 std::string g_logPath;
 std::string g_lastLogPayload;
@@ -1420,9 +1426,9 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
         limiterGain = std::clamp(limiterGain, 0.1f, 1.0f);
     };
     const bool hasQueuedMusic = ring_.Size() > 0;
-    // Mic-input mute is an explicit user privacy control and must apply
-    // regardless of current source state (running/stopped/error).
-    const bool applyMicInputMute = micInputMuted;
+    // Apply mic-input mute only while MicMix is actively running.
+    // When MicMix is off, the dry microphone path must pass through unchanged.
+    const bool applyMicInputMute = micInputMuted && sourceRunning;
     const uint64_t lastSignalMs = lastMusicSignalTickMs_.load(std::memory_order_relaxed);
     const bool recentMusicSignal = sourceRunning && !muted && (nowMs <= (lastSignalMs + kForceTxMusicWindowMs));
 
@@ -3838,9 +3844,7 @@ void MicMixApp::RefreshVoiceTxControl(uint64 schidHint) {
     const auto sourceManager = sourceManager_.load(std::memory_order_acquire);
     const SourceStatus st = sourceManager ? sourceManager->GetStatus() : SourceStatus{};
     const TelemetrySnapshot t = engine_.SnapshotTelemetry();
-    const bool sourceUp = (st.state == SourceState::Running) ||
-                          (st.state == SourceState::Starting) ||
-                          (st.state == SourceState::Reacquiring);
+    const bool sourceUp = IsSourceStateActive(st.state);
     const uint64_t nowMs = GetTickCount64();
     const bool baseEligible = s.forceTxEnabled && sourceUp && !s.musicMuted;
     bool shouldKeepCaptureActive = false;
@@ -3864,19 +3868,15 @@ void MicMixApp::ApplyMicInputTransportMute(bool muted) {
     }
 
     // Transport-level input deactivation mutes the full outgoing capture path.
-    // Keep it as a fallback only when no music pass-through is expected.
-    bool shouldTransportMute = muted;
+    // Only apply this while MicMix is active. In OFF state, always restore pass-through.
+    bool shouldTransportMute = false;
     if (muted) {
         const MicMixSettings s = GetSettings();
         const auto sourceManager = sourceManager_.load(std::memory_order_acquire);
         const SourceStatus st = sourceManager ? sourceManager->GetStatus() : SourceStatus{};
-        const bool sourceUp = (st.state == SourceState::Running) ||
-                              (st.state == SourceState::Starting) ||
-                              (st.state == SourceState::Reacquiring);
+        const bool sourceUp = IsSourceStateActive(st.state);
         const bool keepMusicPath = sourceUp && !s.musicMuted;
-        if (keepMusicPath) {
-            shouldTransportMute = false;
-        }
+        shouldTransportMute = sourceUp && !keepMusicPath;
     }
 
     auto resolveSchid = [this]() -> uint64 {
@@ -4348,6 +4348,12 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
                 if (st == SourceState::Reacquiring) {
                     engine_.NoteReconnect();
                 }
+                bool micInputMuted = false;
+                {
+                    std::lock_guard<std::mutex> lock(settingsMutex_);
+                    micInputMuted = settings_.micInputMuted;
+                }
+                ApplyMicInputTransportMute(micInputMuted);
                 std::string line = "source=" + SourceStateToString(st) + " code=" + code + " msg=" + msg;
                 if (!detail.empty()) line += " detail=" + detail;
                 LogInfo(line);
@@ -4483,6 +4489,12 @@ void MicMixApp::StopSource() {
 }
 
 void MicMixApp::ToggleMute() {
+    const auto sourceManager = sourceManager_.load(std::memory_order_acquire);
+    const SourceStatus st = sourceManager ? sourceManager->GetStatus() : SourceStatus{};
+    if (!IsSourceStateActive(st.state)) {
+        LogInfo("music mute toggle ignored: micmix inactive");
+        return;
+    }
     engine_.ToggleMute();
     const bool newMuted = engine_.IsMuted();
     bool changed = false;
@@ -4505,6 +4517,13 @@ void MicMixApp::ToggleMute() {
 }
 
 void MicMixApp::ToggleMicInputMute() {
+    const auto sourceManager = sourceManager_.load(std::memory_order_acquire);
+    const SourceStatus st = sourceManager ? sourceManager->GetStatus() : SourceStatus{};
+    if (!IsSourceStateActive(st.state)) {
+        ApplyMicInputTransportMute(false);
+        LogInfo("mic_input mute toggle ignored: micmix inactive");
+        return;
+    }
     engine_.ToggleMicInputMute();
     const bool newMuted = engine_.IsMicInputMuted();
     bool changed = false;
