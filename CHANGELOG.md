@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.2.10] - 2026-03-19
+
+### Changed
+
+- Centralized active source-state detection with `IsSourceStateActive(...)` and reused it in core and settings UI paths.
+- Tightened mute control behavior so inactive-source UI and runtime paths stay consistent.
+
+### Fixed
+
+- Fixed a regression where dry microphone pass-through could be unintentionally attenuated while MicMix source was inactive or no music was queued.
+- Fixed `auto_ts` talk-gate stale-event fallback to fail open and prevent hard microphone dropouts.
+- Fixed edge cases where transport mute restoration could become inconsistent across source-state transitions.
+
 ## [1.2.9] - 2026-03-18
 
 ### Changed
