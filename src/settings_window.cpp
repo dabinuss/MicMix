@@ -460,12 +460,6 @@ void SetStatusText(HWND hwnd, const std::wstring& text) {
     }
 }
 
-bool IsSourceUp(SourceState state) {
-    return state == SourceState::Running ||
-           state == SourceState::Starting ||
-           state == SourceState::Reacquiring;
-}
-
 void SetControlEnabled(HWND hwnd, int controlId, bool enabled) {
     HWND ctl = GetDlgItem(hwnd, controlId);
     if (!ctl) {
@@ -483,7 +477,7 @@ HeaderStatusBadgeState ResolveHeaderStatusBadgeState(const MicMixSettings& setti
     if (status.state == SourceState::Error) {
         return HeaderStatusBadgeState::Error;
     }
-    if (!IsSourceUp(status.state)) {
+    if (!IsSourceStateActive(status.state)) {
         return HeaderStatusBadgeState::Off;
     }
     if (settings.musicMuted) {
@@ -535,7 +529,7 @@ void UpdateHeaderStatusBadgeState(HWND hwnd, const MicMixSettings& settings, con
             InvalidateRect(hwnd, nullptr, FALSE);
         }
     }
-    UpdateWindowTitleState(hwnd, IsSourceUp(status.state) && status.state != SourceState::Error);
+    UpdateWindowTitleState(hwnd, IsSourceStateActive(status.state) && status.state != SourceState::Error);
 }
 
 int GainDbToSlider(float db) {
@@ -1169,7 +1163,7 @@ void UpdateStatus(HWND hwnd, bool includeDetails = true) {
 
     const MicMixSettings s = app.GetSettings();
     const SourceStatus st = app.GetSourceStatus();
-    const bool sourceUp = IsSourceUp(st.state);
+    const bool sourceUp = IsSourceStateActive(st.state);
     SetControlEnabled(hwnd, IDC_MIC_INPUT_MUTE, sourceUp);
     SetControlEnabled(hwnd, IDC_MUTE, sourceUp);
     UpdateHeaderStatusBadgeState(hwnd, s, st);

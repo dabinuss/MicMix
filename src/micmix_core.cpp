@@ -82,12 +82,6 @@ int ResolveResamplerQualitySetting(int configuredValue) {
     return std::clamp(configuredValue, 0, 10);
 }
 
-bool IsSourceStateActive(SourceState state) {
-    return state == SourceState::Running ||
-           state == SourceState::Starting ||
-           state == SourceState::Reacquiring;
-}
-
 std::mutex g_logMutex;
 std::string g_logPath;
 std::string g_lastLogPayload;
@@ -1475,27 +1469,26 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
         const float decayedSendPeakDb = std::max(-120.0f, prevSendPeakDb - 1.8f);
         musicSendPeakDbfs_.store(decayedSendPeakDb, std::memory_order_release);
         micTalkDetected_.store(talkOpen, std::memory_order_release);
-        bool gateTouched = false;
+        bool touched = false;
 
         // TS3 bitmask semantics:
         // bit 1 (value 1): audio buffer modified
         // bit 2 (value 2): packet should be sent
         // Keep upstream flags untouched when we did not mix anything.
-        if (applyMicInputMute || gateGain < 0.9999f || targetGateGain < 0.9999f) {
+        if (applyMicInputMute) {
             for (int i = 0; i < sampleCount; ++i) {
-                advanceGate();
                 for (int ch = 0; ch < channels; ++ch) {
                     const int idx = (i * channels) + ch;
-                    const float dryInput = applyMicInputMute ? 0.0f : (static_cast<float>(samples[idx]) / 32768.0f);
-                    const float dry = dryInput * gateGain;
-                    const float clipped = std::clamp(dry, -1.0f, 1.0f);
-                    const short next = static_cast<short>(std::lrintf(clipped * 32767.0f));
+                    const short next = 0;
                     if (next != samples[idx]) {
-                        gateTouched = true;
+                        touched = true;
                         samples[idx] = next;
                     }
                 }
             }
+        } else {
+            // In OFF/no-music path keep dry mic pass-through untouched.
+            gateGain = 1.0f;
         }
         // Match limiter recovery behavior to the per-sample release path used
         // while mixing so transitions stay consistent when music stops.
@@ -1505,7 +1498,7 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
         micGateGain_.store(gateGain, std::memory_order_relaxed);
         limiterGain_.store(limiterGain, std::memory_order_relaxed);
         int outFlags = upstreamFlags;
-        if (gateTouched || applyMicInputMute) {
+        if (touched || applyMicInputMute) {
             outFlags |= 1;
         }
         if (forceTx && recentMusicSignal) {
@@ -4143,12 +4136,8 @@ void MicMixApp::VoiceTxThreadMain() {
                                     candidateOpen = ownTalkStatusActive_.load(std::memory_order_acquire);
                                     haveDecision = true;
                                 } else {
-                                    if (haveMicDb) {
-                                        candidateOpen = micDb >= vadThresholdDb;
-                                    } else {
-                                        const TelemetrySnapshot tel = engine_.SnapshotTelemetry();
-                                        candidateOpen = tel.micRmsDbfs >= (vadThresholdDb - 1.0f);
-                                    }
+                                    // Fail-open on stale talk events to avoid hard mic dropouts.
+                                    candidateOpen = true;
                                     haveDecision = true;
                                     if (nowMs > (lastVadFallbackLogMs + 4000ULL)) {
                                         LogWarn("talk_gate auto_ts stale event schid=" + std::to_string(schid));

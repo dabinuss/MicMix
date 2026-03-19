@@ -29,6 +29,12 @@ enum class SourceState {
     Error = 4,
 };
 
+inline constexpr bool IsSourceStateActive(SourceState state) noexcept {
+    return state == SourceState::Running ||
+           state == SourceState::Starting ||
+           state == SourceState::Reacquiring;
+}
+
 enum class MicGateMode {
     AutoTs = 0,
     Custom = 1,
