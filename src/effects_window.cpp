@@ -44,6 +44,7 @@ enum ControlId {
     IDC_DISABLE_EFFECTS = 4211,
     IDC_MONITOR = 4212,
     IDC_MONITOR_HINT = 4213,
+    IDC_VST_AUTOSTART = 4214,
 
     IDC_MUSIC_LIST = 4220,
     IDC_MUSIC_ADD = 4221,
@@ -175,6 +176,7 @@ bool IsHandCursorControlId(int id) {
     case IDC_ENABLE_EFFECTS:
     case IDC_DISABLE_EFFECTS:
     case IDC_MONITOR:
+    case IDC_VST_AUTOSTART:
     case IDC_MUSIC_LIST:
     case IDC_MUSIC_ADD:
     case IDC_MUSIC_REMOVE:
@@ -201,6 +203,22 @@ void SetStatusText(HWND hwnd, const std::wstring& text) {
     if (ctl) {
         SetWindowTextW(ctl, g_statusText.c_str());
     }
+}
+
+bool GetCheckboxValue(HWND hwnd, int id) {
+    const HWND ctl = GetDlgItem(hwnd, id);
+    if (!ctl) {
+        return false;
+    }
+    return SendMessageW(ctl, BM_GETCHECK, 0, 0) == BST_CHECKED;
+}
+
+void SetCheckboxValue(HWND hwnd, int id, bool checked) {
+    const HWND ctl = GetDlgItem(hwnd, id);
+    if (!ctl) {
+        return;
+    }
+    SendMessageW(ctl, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 
 HeaderBadgeState ResolveBadgeState() {
@@ -531,7 +549,9 @@ void HandleOpenEditor(HWND hwnd, EffectChain chain, int listId) {
 }
 
 void RefreshStatus(HWND hwnd) {
-    const bool effectsEnabled = MicMixApp::Instance().IsEffectsEnabled();
+    const MicMixSettings settings = MicMixApp::Instance().GetSettings();
+    const bool effectsEnabled = settings.vstEffectsEnabled;
+    const bool hostAutostart = settings.vstHostAutostart;
     const VstHostStatus host = MicMixApp::Instance().GetVstHostStatus();
     const auto music = MicMixApp::Instance().GetEffects(EffectChain::Music);
     const auto mic = MicMixApp::Instance().GetEffects(EffectChain::Mic);
@@ -544,10 +564,12 @@ void RefreshStatus(HWND hwnd) {
     }
     std::wstring line2 = L"Music plugins=" + std::to_wstring(music.size()) +
                          L"  |  Mic plugins=" + std::to_wstring(mic.size()) +
-                         L"  |  Monitor=" + std::wstring(MicMixApp::Instance().IsMonitorEnabled() ? L"On" : L"Off");
+                         L"  |  Monitor=" + std::wstring(MicMixApp::Instance().IsMonitorEnabled() ? L"On" : L"Off") +
+                         L"  |  Host autostart=" + std::wstring(hostAutostart ? L"On" : L"Off");
     std::wstring line3 = Utf8ToWide(host.message.empty() ? "host_status=idle" : ("host_status=" + host.message));
     SetStatusText(hwnd, line1 + L"\r\n" + line2 + L"\r\n" + line3);
     SetWindowTextW(hwnd, effectsEnabled ? L"MicMix Effects - ACTIVE" : L"MicMix Effects - OFF");
+    SetCheckboxValue(hwnd, IDC_VST_AUTOSTART, hostAutostart);
     UpdateMonitorButton(hwnd);
     InvalidateRect(hwnd, &g_rcHeaderBadge, TRUE);
 }
@@ -971,6 +993,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const int controlGap = S(12);
         const int actionButtonW = S(142);
         const int monitorButtonW = S(122);
+        const int autostartCheckboxW = S(170);
         const int headerMetaW = S(300);
         const int headerMetaX = contentRight - headerMetaW;
         const int titleX = contentLeft;
@@ -990,6 +1013,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         CreateWindowW(L"BUTTON", L"Enable Effects", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, topLeft, topY, actionButtonW, S(34), hwnd, reinterpret_cast<HMENU>(IDC_ENABLE_EFFECTS), nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Disable Effects", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, topLeft + actionButtonW + controlGap, topY, actionButtonW, S(34), hwnd, reinterpret_cast<HMENU>(IDC_DISABLE_EFFECTS), nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Monitor Mix: Off", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, topLeft + (actionButtonW + controlGap) * 2, topY, monitorButtonW, S(34), hwnd, reinterpret_cast<HMENU>(IDC_MONITOR), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"VST Host autostart", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP, topLeft + (actionButtonW + controlGap) * 2 + monitorButtonW + controlGap, topY + S(8), autostartCheckboxW, S(20), hwnd, reinterpret_cast<HMENU>(IDC_VST_AUTOSTART), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Shared with MicMix monitor path", WS_CHILD | WS_VISIBLE, topLeft + (actionButtonW + controlGap) * 2, topY + S(38), S(220), S(18), hwnd, reinterpret_cast<HMENU>(IDC_MONITOR_HINT), nullptr, nullptr);
 
         const int sectionLeft = g_rcMusic.left + S(kCardInnerPaddingPx);
@@ -1097,6 +1121,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             MicMixApp::Instance().ToggleMonitor();
             UpdateMonitorButton(hwnd);
             RefreshStatus(hwnd);
+            return 0;
+        case IDC_VST_AUTOSTART:
+            if (HIWORD(wParam) == BN_CLICKED) {
+                MicMixSettings settings = MicMixApp::Instance().GetSettings();
+                const bool autostartEnabled = GetCheckboxValue(hwnd, IDC_VST_AUTOSTART);
+                if (settings.vstHostAutostart != autostartEnabled) {
+                    settings.vstHostAutostart = autostartEnabled;
+                    MicMixApp::Instance().ApplySettings(settings, false, true);
+                }
+                RefreshStatus(hwnd);
+            }
             return 0;
         case IDC_MUSIC_ADD:
             HandleAddEffect(hwnd, EffectChain::Music);

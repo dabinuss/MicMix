@@ -101,6 +101,22 @@ std::wstring Utf8ToWide(const std::string& text) {
     return out;
 }
 
+std::string WideToUtf8(const std::wstring& text) {
+    if (text.empty()) {
+        return {};
+    }
+    const int len = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 0) {
+        return {};
+    }
+    std::string out(static_cast<size_t>(len), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, out.data(), len, nullptr, nullptr);
+    if (!out.empty() && out.back() == '\0') {
+        out.pop_back();
+    }
+    return out;
+}
+
 std::string Trim(std::string v) {
     while (!v.empty() && (v.back() == '\r' || v.back() == '\n' || v.back() == '\t' || v.back() == ' ')) {
         v.pop_back();
@@ -202,6 +218,56 @@ std::string HexEncode(const std::string& in) {
     return out;
 }
 
+bool IsAmd64PeBinary(const std::filesystem::path& filePath) {
+    HANDLE file = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    LARGE_INTEGER fileSize{};
+    if (!GetFileSizeEx(file, &fileSize) || fileSize.QuadPart <= 0) {
+        CloseHandle(file);
+        return false;
+    }
+    const uint64_t bytes = static_cast<uint64_t>(fileSize.QuadPart);
+    if (bytes < static_cast<uint64_t>(sizeof(IMAGE_DOS_HEADER))) {
+        CloseHandle(file);
+        return false;
+    }
+
+    HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (!mapping) {
+        CloseHandle(file);
+        return false;
+    }
+    void* view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+    if (!view) {
+        CloseHandle(mapping);
+        CloseHandle(file);
+        return false;
+    }
+
+    bool ok = false;
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(view);
+    if (dos->e_magic == IMAGE_DOS_SIGNATURE && dos->e_lfanew > 0) {
+        const uint64_t ntOffset = static_cast<uint64_t>(dos->e_lfanew);
+        const uint64_t ntEnd = ntOffset + static_cast<uint64_t>(sizeof(IMAGE_NT_HEADERS64));
+        if (ntOffset < bytes && ntEnd <= bytes) {
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+                reinterpret_cast<const BYTE*>(view) + dos->e_lfanew);
+            if (nt->Signature == IMAGE_NT_SIGNATURE &&
+                nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64 &&
+                nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+                ok = true;
+            }
+        }
+    }
+
+    UnmapViewOfFile(view);
+    CloseHandle(mapping);
+    CloseHandle(file);
+    return ok;
+}
+
 bool ValidateVstPath(const std::string& path, std::string& error) {
     error.clear();
     if (path.empty()) {
@@ -231,6 +297,19 @@ bool ValidateVstPath(const std::string& path, std::string& error) {
     }
     if (!std::filesystem::exists(resolved, ec) || ec || std::filesystem::is_directory(resolved, ec)) {
         error = "path_missing";
+        return false;
+    }
+    const DWORD attrs = GetFileAttributesW(resolved.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        error = "path_attributes_unavailable";
+        return false;
+    }
+    if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        error = "reparse_path_blocked";
+        return false;
+    }
+    if (!IsAmd64PeBinary(resolved)) {
+        error = "unsupported_architecture";
         return false;
     }
     return true;
@@ -1587,9 +1666,17 @@ std::string HandleEditorClose(const std::string& args, HostState& state) {
 
 int wmain(int argc, wchar_t** argv) {
     std::wstring pipeName = L"micmix_vst_host";
+    std::string authToken;
     for (int i = 1; i + 1 < argc; ++i) {
         if (_wcsicmp(argv[i], L"--pipe") == 0) {
             pipeName = argv[i + 1];
+            ++i;
+            continue;
+        }
+        if (_wcsicmp(argv[i], L"--auth") == 0) {
+            authToken = WideToUtf8(argv[i + 1]);
+            ++i;
+            continue;
         }
     }
     const std::wstring pipePath = std::wstring(L"\\\\.\\pipe\\") + pipeName;
@@ -1620,10 +1707,14 @@ int wmain(int argc, wchar_t** argv) {
 
     bool running = true;
     while (running) {
+        DWORD pipeMode = PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT;
+#ifdef PIPE_REJECT_REMOTE_CLIENTS
+        pipeMode |= PIPE_REJECT_REMOTE_CLIENTS;
+#endif
         HANDLE pipe = CreateNamedPipeW(
             pipePath.c_str(),
             PIPE_ACCESS_DUPLEX,
-            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+            pipeMode,
             1,
             static_cast<DWORD>(kMaxPipeMessageBytes),
             static_cast<DWORD>(kMaxPipeMessageBytes),
@@ -1643,29 +1734,53 @@ int wmain(int argc, wchar_t** argv) {
 
         std::string command;
         while (running && ReadMessage(pipe, command)) {
-            if (_stricmp(command.c_str(), "PING") == 0 || _stricmp(command.c_str(), "STATUS") == 0) {
+            std::string commandText = command;
+            if (!authToken.empty()) {
+                static constexpr const char kAuthPrefix[] = "AUTH ";
+                if (commandText.rfind(kAuthPrefix, 0) != 0) {
+                    WriteResponse(pipe, "ERR unauthorized");
+                    continue;
+                }
+                const size_t tokenStart = std::strlen(kAuthPrefix);
+                const size_t tokenEnd = commandText.find(' ', tokenStart);
+                if (tokenEnd == std::string::npos) {
+                    WriteResponse(pipe, "ERR unauthorized");
+                    continue;
+                }
+                const std::string providedToken = commandText.substr(tokenStart, tokenEnd - tokenStart);
+                if (providedToken != authToken) {
+                    WriteResponse(pipe, "ERR unauthorized");
+                    continue;
+                }
+                commandText = Trim(commandText.substr(tokenEnd + 1));
+                if (commandText.empty()) {
+                    WriteResponse(pipe, "ERR unauthorized");
+                    continue;
+                }
+            }
+            if (_stricmp(commandText.c_str(), "PING") == 0 || _stricmp(commandText.c_str(), "STATUS") == 0) {
                 WriteResponse(pipe, BuildPong(state));
                 continue;
             }
-            if (_stricmp(command.c_str(), "QUIT") == 0) {
+            if (_stricmp(commandText.c_str(), "QUIT") == 0) {
                 WriteResponse(pipe, "BYE");
                 running = false;
                 break;
             }
-            if (command.size() > 5U && _strnicmp(command.c_str(), "SYNC ", 5) == 0) {
-                WriteResponse(pipe, HandleSync(Trim(command.substr(5)), state));
+            if (commandText.size() > 5U && _strnicmp(commandText.c_str(), "SYNC ", 5) == 0) {
+                WriteResponse(pipe, HandleSync(Trim(commandText.substr(5)), state));
                 continue;
             }
-            if (command.size() > 5U && _strnicmp(command.c_str(), "SCAN ", 5) == 0) {
-                WriteResponse(pipe, HandleScan(Trim(command.substr(5))));
+            if (commandText.size() > 5U && _strnicmp(commandText.c_str(), "SCAN ", 5) == 0) {
+                WriteResponse(pipe, HandleScan(Trim(commandText.substr(5))));
                 continue;
             }
-            if (command.size() > 12U && _strnicmp(command.c_str(), "EDITOR_OPEN ", 12) == 0) {
-                WriteResponse(pipe, HandleEditorOpen(Trim(command.substr(12)), state));
+            if (commandText.size() > 12U && _strnicmp(commandText.c_str(), "EDITOR_OPEN ", 12) == 0) {
+                WriteResponse(pipe, HandleEditorOpen(Trim(commandText.substr(12)), state));
                 continue;
             }
-            if (command.size() > 13U && _strnicmp(command.c_str(), "EDITOR_CLOSE ", 13) == 0) {
-                WriteResponse(pipe, HandleEditorClose(Trim(command.substr(13)), state));
+            if (commandText.size() > 13U && _strnicmp(commandText.c_str(), "EDITOR_CLOSE ", 13) == 0) {
+                WriteResponse(pipe, HandleEditorClose(Trim(commandText.substr(13)), state));
                 continue;
             }
             WriteResponse(pipe, "ERR unknown_command");

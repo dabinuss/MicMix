@@ -293,6 +293,7 @@ private:
 
     std::atomic<bool>  talkState_{true};
     std::atomic<bool>  micTalkDetected_{false};
+    std::atomic<bool>  micTailTxActive_{false};
     std::atomic<float> micRmsDbfs_{-120.0f};
     std::atomic<float> micPeakDbfs_{-120.0f};
     std::atomic<float> externalMicLinear_{0.0f};
@@ -481,13 +482,16 @@ private:
     HANDLE vstHostThread_ = nullptr;
     HANDLE vstHostJob_ = nullptr;
     HANDLE vstAudioMap_ = nullptr;
-    micmix::vstipc::SharedMemory* vstAudioShared_ = nullptr;
+    std::atomic<micmix::vstipc::SharedMemory*> vstAudioShared_{nullptr};
+    std::wstring vstHostPipeName_;
+    std::string vstHostAuthToken_;
     std::string vstHostMessage_;
     std::atomic<uint32_t> vstMusicSeq_{1};
     std::atomic<uint32_t> vstMicSeq_{1};
 
     bool TryEnterCaptureCallback();
     void LeaveCaptureCallback();
+    bool WaitForCaptureCallbacksToDrain(uint32_t maxWaitMs) const;
     bool StartVstHostProcess(std::string& error);
     void StopVstHostProcess();
     std::wstring ResolveVstHostPath() const;

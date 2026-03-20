@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <random>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -62,6 +63,8 @@ constexpr size_t kMaxEffectUidLen = 96;
 constexpr size_t kMaxEffectStateBlobLen = 4096;
 constexpr size_t kMaxEffectStatusLen = 64;
 constexpr wchar_t kVstHostPipeName[] = L"micmix_vst_host";
+constexpr size_t kVstHostMaxPipeMessageBytes = 64U * 1024U;
+constexpr size_t kVstHostSyncPayloadMaxBytes = 28U * 1024U;
 constexpr uint64_t kVstOutputWaitMinUs = 6000ULL;
 constexpr uint64_t kVstOutputWaitMaxUs = 24000ULL;
 constexpr size_t kVstPendingPacketLimit = 128;
@@ -643,9 +646,47 @@ std::string BuildEffectUid(const std::string& normalizedPath) {
     return ss.str();
 }
 
+std::string GenerateHexToken(size_t byteCount) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::random_device rd;
+    std::mt19937_64 rng(
+        (static_cast<uint64_t>(rd()) << 32) ^
+        static_cast<uint64_t>(rd()) ^
+        static_cast<uint64_t>(GetTickCount64()));
+    std::uniform_int_distribution<uint32_t> dist(0U, 255U);
+    std::string out;
+    out.reserve(byteCount * 2U);
+    for (size_t i = 0; i < byteCount; ++i) {
+        const unsigned char b = static_cast<unsigned char>(dist(rng));
+        out.push_back(kHex[(b >> 4) & 0x0F]);
+        out.push_back(kHex[b & 0x0F]);
+    }
+    return out;
+}
+
+std::wstring GenerateVstHostPipeName() {
+    std::wostringstream ss;
+    ss << kVstHostPipeName << L"_"
+       << std::hex << std::nouppercase
+       << static_cast<unsigned long>(GetCurrentProcessId())
+       << L"_"
+       << Utf8ToWide(GenerateHexToken(8));
+    return ss.str();
+}
+
 bool IsAmd64PeBinary(const std::filesystem::path& filePath) {
     HANDLE file = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    LARGE_INTEGER fileSize{};
+    if (!GetFileSizeEx(file, &fileSize) || fileSize.QuadPart <= 0) {
+        CloseHandle(file);
+        return false;
+    }
+    const uint64_t bytes = static_cast<uint64_t>(fileSize.QuadPart);
+    if (bytes < static_cast<uint64_t>(sizeof(IMAGE_DOS_HEADER))) {
+        CloseHandle(file);
         return false;
     }
     HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
@@ -663,14 +704,17 @@ bool IsAmd64PeBinary(const std::filesystem::path& filePath) {
     bool ok = false;
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(view);
     if (dos->e_magic == IMAGE_DOS_SIGNATURE &&
-        dos->e_lfanew > 0 &&
-        static_cast<size_t>(dos->e_lfanew) < 0x100000) {
+        dos->e_lfanew > 0) {
+        const uint64_t ntOffset = static_cast<uint64_t>(dos->e_lfanew);
+        const uint64_t ntEnd = ntOffset + static_cast<uint64_t>(sizeof(IMAGE_NT_HEADERS64));
+        if (ntOffset < bytes && ntEnd <= bytes) {
         const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
             reinterpret_cast<const BYTE*>(view) + dos->e_lfanew);
         if (nt->Signature == IMAGE_NT_SIGNATURE &&
             nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64 &&
             nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
             ok = true;
+        }
         }
     }
 
@@ -904,27 +948,49 @@ bool HexDecode(const std::string& hex, std::string& out) {
     return true;
 }
 
+bool NormalizeAndValidateEffectPath(const std::string& rawPath, std::string& normalizedPath, std::string& error);
+
 std::string BuildHostSyncPayload(const MicMixSettings& settings) {
+    auto sanitizeChain = [](const std::vector<VstEffectSlot>& slots) {
+        std::vector<VstEffectSlot> sanitized;
+        sanitized.reserve(slots.size());
+        for (const auto& slot : slots) {
+            std::string normalizedPath;
+            std::string pathError;
+            if (!NormalizeAndValidateEffectPath(slot.path, normalizedPath, pathError)) {
+                continue;
+            }
+            VstEffectSlot safe = slot;
+            safe.path = normalizedPath;
+            if (safe.uid.empty()) {
+                safe.uid = BuildEffectUid(safe.path);
+            }
+            sanitized.push_back(std::move(safe));
+        }
+        return sanitized;
+    };
+
+    const auto safeMusic = sanitizeChain(settings.musicEffects);
+    const auto safeMic = sanitizeChain(settings.micEffects);
+
     std::ostringstream ss;
     ss << "effects_enabled=" << (settings.vstEffectsEnabled ? 1 : 0) << "\n";
-    ss << "music.count=" << settings.musicEffects.size() << "\n";
-    for (size_t i = 0; i < settings.musicEffects.size(); ++i) {
-        const auto& slot = settings.musicEffects[i];
+    ss << "music.count=" << safeMusic.size() << "\n";
+    for (size_t i = 0; i < safeMusic.size(); ++i) {
+        const auto& slot = safeMusic[i];
         ss << "music." << i << ".path=" << slot.path << "\n";
         ss << "music." << i << ".name=" << slot.name << "\n";
         ss << "music." << i << ".uid=" << slot.uid << "\n";
-        ss << "music." << i << ".state_blob=" << slot.stateBlob << "\n";
         ss << "music." << i << ".last_status=" << slot.lastStatus << "\n";
         ss << "music." << i << ".enabled=" << (slot.enabled ? 1 : 0) << "\n";
         ss << "music." << i << ".bypass=" << (slot.bypass ? 1 : 0) << "\n";
     }
-    ss << "mic.count=" << settings.micEffects.size() << "\n";
-    for (size_t i = 0; i < settings.micEffects.size(); ++i) {
-        const auto& slot = settings.micEffects[i];
+    ss << "mic.count=" << safeMic.size() << "\n";
+    for (size_t i = 0; i < safeMic.size(); ++i) {
+        const auto& slot = safeMic[i];
         ss << "mic." << i << ".path=" << slot.path << "\n";
         ss << "mic." << i << ".name=" << slot.name << "\n";
         ss << "mic." << i << ".uid=" << slot.uid << "\n";
-        ss << "mic." << i << ".state_blob=" << slot.stateBlob << "\n";
         ss << "mic." << i << ".last_status=" << slot.lastStatus << "\n";
         ss << "mic." << i << ".enabled=" << (slot.enabled ? 1 : 0) << "\n";
         ss << "mic." << i << ".bypass=" << (slot.bypass ? 1 : 0) << "\n";
@@ -1598,6 +1664,8 @@ void AudioEngine::ApplySettings(const MicMixSettings& settings) {
     bufferTargetMs_.store(bufferMs, std::memory_order_release);
     micUseSmoothGate_.store(settings.micUseSmoothGate, std::memory_order_release);
     micTalkDetected_.store(false, std::memory_order_release);
+    micTailTxActive_.store(false, std::memory_order_release);
+    lastMicTalkTickMs_.store(0, std::memory_order_release);
     micGateGain_.store(1.0f, std::memory_order_release);
     limiterGain_.store(1.0f, std::memory_order_release);
 }
@@ -1607,6 +1675,8 @@ void AudioEngine::SetMusicSourceRunning(bool running) {
     if (!running) {
         ring_.Reset();
         micTalkDetected_.store(false, std::memory_order_release);
+        micTailTxActive_.store(false, std::memory_order_release);
+        lastMicTalkTickMs_.store(0, std::memory_order_release);
         micRmsDbfs_.store(-120.0f, std::memory_order_release);
         micPeakDbfs_.store(-120.0f, std::memory_order_release);
         externalMicLinear_.store(0.0f, std::memory_order_release);
@@ -1827,6 +1897,34 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
     const bool applyMicInputMute = micInputMuted && sourceRunning;
     const uint64_t lastSignalMs = lastMusicSignalTickMs_.load(std::memory_order_relaxed);
     const bool recentMusicSignal = sourceRunning && !muted && (nowMs <= (lastSignalMs + kForceTxMusicWindowMs));
+    // Mic tail TX is driven by actual outgoing post-effect PCM level:
+    // - hysteresis thresholds avoid TX flutter around silence floor,
+    // - short hangover avoids packet-boundary chatter.
+    constexpr float kMicTailTxOnLevelLinear = 0.00050f;  // ~ -66 dBFS
+    constexpr float kMicTailTxOffLevelLinear = 0.00025f; // ~ -72 dBFS
+    constexpr uint64_t kMicTailTxHangoverMs = 180ULL;
+    auto updateTailTxFromPeak = [&](float txPeakLinear) -> bool {
+        bool micTailActive = micTailTxActive_.load(std::memory_order_relaxed);
+        if (!applyMicInputMute) {
+            if (micTailActive) {
+                if (txPeakLinear >= kMicTailTxOffLevelLinear) {
+                    lastMicTalkTickMs_.store(nowMs, std::memory_order_release);
+                } else {
+                    micTailActive = false;
+                }
+            } else if (txPeakLinear >= kMicTailTxOnLevelLinear) {
+                micTailActive = true;
+                lastMicTalkTickMs_.store(nowMs, std::memory_order_release);
+            }
+        } else {
+            micTailActive = false;
+        }
+        micTailTxActive_.store(micTailActive, std::memory_order_release);
+        const uint64_t lastMicTalkMs = lastMicTalkTickMs_.load(std::memory_order_relaxed);
+        return !applyMicInputMute &&
+               (micTailActive ||
+                ((lastMicTalkMs != 0ULL) && (nowMs <= (lastMicTalkMs + kMicTailTxHangoverMs))));
+    };
 
     float micRmsAcc = 0.0f;
     float micPeak = 0.0f;
@@ -1899,11 +1997,20 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
         limiterGain = std::clamp(limiterGain, 0.1f, 1.0f);
         micGateGain_.store(gateGain, std::memory_order_relaxed);
         limiterGain_.store(limiterGain, std::memory_order_relaxed);
+        float txPeakLinear = 0.0f;
+        for (int i = 0; i < sampleCount; ++i) {
+            for (int ch = 0; ch < channels; ++ch) {
+                const int idx = (i * channels) + ch;
+                const float v = static_cast<float>(samples[idx]) / 32768.0f;
+                txPeakLinear = std::max(txPeakLinear, std::fabs(v));
+            }
+        }
+        const bool recentMicTailSignal = updateTailTxFromPeak(txPeakLinear);
         int outFlags = upstreamFlags;
         if (touched || applyMicInputMute) {
             outFlags |= 1;
         }
-        if (forceTx && recentMusicSignal) {
+        if ((forceTx && recentMusicSignal) || recentMicTailSignal) {
             outFlags |= 2;
         }
         *edited = outFlags;
@@ -1915,6 +2022,7 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
     bool touched = false;
     bool gateTouched = false;
     float mixPeak = 0.0f;
+    float txPeakLinear = 0.0f;
     const float musicGain = musicGainLinear_.load(std::memory_order_relaxed);
     int offset = 0;
     while (offset < sampleCount) {
@@ -1952,6 +2060,9 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
                 float out = dry + m;
                 out *= limiterGain;
                 const float absOut = std::fabs(out);
+                if (absOut > txPeakLinear) {
+                    txPeakLinear = absOut;
+                }
                 if (absOut > 1.0f) {
                     clippedSamples_.fetch_add(1, std::memory_order_relaxed);
                     out = std::copysign(1.0f, out);
@@ -1979,9 +2090,10 @@ void AudioEngine::EditCapturedVoice(short* samples, int sampleCount, int channel
     micTalkDetected_.store(talkOpen, std::memory_order_release);
     micGateGain_.store(gateGain, std::memory_order_relaxed);
     limiterGain_.store(limiterGain, std::memory_order_relaxed);
+    const bool recentMicTailSignal = updateTailTxFromPeak(txPeakLinear);
 
     const bool mixedMusic = touched && anyMusicSignal && sourceRunning && !muted;
-    const bool forceMusicTx = forceTx && (recentMusicSignal || mixedMusic);
+    const bool forceMusicTx = (forceTx && (recentMusicSignal || mixedMusic)) || recentMicTailSignal;
 
     int outFlags = upstreamFlags;
     if (mixedMusic || gateTouched || applyMicInputMute) {
@@ -3832,7 +3944,8 @@ std::wstring MicMixApp::ResolveVstHostPath() const {
 }
 
 std::wstring MicMixApp::BuildVstHostPipePath() const {
-    return std::wstring(L"\\\\.\\pipe\\") + kVstHostPipeName;
+    const std::wstring pipeName = vstHostPipeName_.empty() ? std::wstring(kVstHostPipeName) : vstHostPipeName_;
+    return std::wstring(L"\\\\.\\pipe\\") + pipeName;
 }
 
 bool MicMixApp::SendVstHostCommand(
@@ -3888,7 +4001,17 @@ bool MicMixApp::SendVstHostCommand(
     DWORD mode = PIPE_READMODE_MESSAGE;
     SetNamedPipeHandleState(pipe, &mode, nullptr, nullptr);
 
-    std::string wire = command;
+    std::string wire;
+    if (!vstHostAuthToken_.empty()) {
+        wire = "AUTH " + vstHostAuthToken_ + " " + command;
+    } else {
+        wire = command;
+    }
+    if ((wire.size() + 1U) > kVstHostMaxPipeMessageBytes) {
+        error = "pipe command too large";
+        CloseHandle(pipe);
+        return false;
+    }
     if (wire.empty() || wire.back() != '\n') {
         wire.push_back('\n');
     }
@@ -3940,7 +4063,7 @@ bool MicMixApp::PingVstHost(std::string& response, std::string& error) const {
 }
 
 bool MicMixApp::EnsureVstAudioIpc() {
-    if (vstAudioShared_ != nullptr) {
+    if (vstAudioShared_.load(std::memory_order_acquire) != nullptr) {
         return true;
     }
     HANDLE map = CreateFileMappingW(
@@ -3971,16 +4094,20 @@ bool MicMixApp::EnsureVstAudioIpc() {
     InterlockedExchange(&shm->hostHeartbeat, 0);
     InterlockedExchange(&shm->pluginHeartbeat, 0);
     vstAudioMap_ = map;
-    vstAudioShared_ = shm;
+    vstAudioShared_.store(shm, std::memory_order_release);
     vstMusicSeq_.store(1U, std::memory_order_release);
     vstMicSeq_.store(1U, std::memory_order_release);
     return true;
 }
 
 void MicMixApp::CloseVstAudioIpc() {
-    if (vstAudioShared_) {
-        UnmapViewOfFile(vstAudioShared_);
-        vstAudioShared_ = nullptr;
+    if (!WaitForCaptureCallbacksToDrain(2000U)) {
+        LogWarn("vst ipc close postponed: capture callback still active");
+        return;
+    }
+    auto* shared = vstAudioShared_.exchange(nullptr, std::memory_order_acq_rel);
+    if (shared) {
+        UnmapViewOfFile(shared);
     }
     if (vstAudioMap_) {
         CloseHandle(vstAudioMap_);
@@ -3993,6 +4120,10 @@ void MicMixApp::CloseVstAudioIpc() {
 bool MicMixApp::SyncVstHostState(const MicMixSettings& settings, std::string& error) {
     error.clear();
     std::string payload = BuildHostSyncPayload(settings);
+    if (payload.size() > kVstHostSyncPayloadMaxBytes) {
+        error = "vst sync payload too large";
+        return false;
+    }
     std::string response;
     if (!SendVstHostCommand("SYNC " + HexEncode(payload), response, 220, error)) {
         return false;
@@ -4073,10 +4204,19 @@ bool MicMixApp::StartVstHostProcess(std::string& error) {
         vstHostMessage_ = error;
         return false;
     }
+    if (vstHostPipeName_.empty()) {
+        vstHostPipeName_ = GenerateVstHostPipeName();
+    }
+    if (vstHostAuthToken_.empty()) {
+        vstHostAuthToken_ = GenerateHexToken(16);
+    }
 
     std::wstring cmdLine = L"\"";
     cmdLine += hostPath;
-    cmdLine += L"\" --pipe micmix_vst_host";
+    cmdLine += L"\" --pipe ";
+    cmdLine += vstHostPipeName_;
+    cmdLine += L" --auth ";
+    cmdLine += Utf8ToWide(vstHostAuthToken_);
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
@@ -4148,13 +4288,14 @@ bool MicMixApp::StartVstHostProcess(std::string& error) {
         StopVstHostProcess();
         return false;
     }
-    if (vstAudioShared_) {
-        micmix::vstipc::RingReset(vstAudioShared_->musicIn);
-        micmix::vstipc::RingReset(vstAudioShared_->musicOut);
-        micmix::vstipc::RingReset(vstAudioShared_->micIn);
-        micmix::vstipc::RingReset(vstAudioShared_->micOut);
-        InterlockedExchange(&vstAudioShared_->hostHeartbeat, 0);
-        InterlockedExchange(&vstAudioShared_->pluginHeartbeat, 0);
+    auto* shared = vstAudioShared_.load(std::memory_order_acquire);
+    if (shared) {
+        micmix::vstipc::RingReset(shared->musicIn);
+        micmix::vstipc::RingReset(shared->musicOut);
+        micmix::vstipc::RingReset(shared->micIn);
+        micmix::vstipc::RingReset(shared->micOut);
+        InterlockedExchange(&shared->hostHeartbeat, 0);
+        InterlockedExchange(&shared->pluginHeartbeat, 0);
     }
     vstMusicSeq_.store(1U, std::memory_order_release);
     vstMicSeq_.store(1U, std::memory_order_release);
@@ -4286,7 +4427,7 @@ void MicMixApp::MaintainVstHost(uint64_t nowMs) {
     if (alive) {
         vstHostNextRestartTickMs_.store(0, std::memory_order_release);
         vstHostRestartAttempts_.store(0, std::memory_order_release);
-        auto* shm = vstAudioShared_;
+        auto* shm = vstAudioShared_.load(std::memory_order_acquire);
         if (shm) {
             const LONG hostHeartbeat = micmix::vstipc::AtomicLoad(&shm->hostHeartbeat);
             if (hostHeartbeat != 0) {
@@ -4350,35 +4491,24 @@ void MicMixApp::MaintainVstHost(uint64_t nowMs) {
     const uint32_t attempts = std::min<uint32_t>(prevAttempts + 1U, 10U);
     vstHostRestartAttempts_.store(attempts, std::memory_order_release);
     if (attempts >= 8U) {
-        MicMixSettings forced;
-        bool changed = false;
-        {
-            std::lock_guard<std::mutex> settingsLock(settingsMutex_);
-            if (settings_.vstEffectsEnabled || settings_.vstHostAutostart) {
-                settings_.vstEffectsEnabled = false;
-                settings_.vstHostAutostart = false;
-                vstEffectsEnabledCached_.store(false, std::memory_order_release);
-                changed = true;
-            }
-            forced = settings_;
-        }
-        if (changed) {
-            engine_.ApplySettings(forced);
-            if (configStore_) {
-                std::string saveErr;
-                if (!configStore_->Save(forced, saveErr) && !saveErr.empty()) {
-                    LogError("Config save failed: " + saveErr);
-                }
-            }
-            LogError("vst_host disabled after repeated restart failures");
-        }
+        // Keep user settings intact; only throttle retries after repeated failures.
+        constexpr uint64_t kBlockedRetryDelayMs = 10000ULL;
         {
             std::lock_guard<std::mutex> lock(vstHostMutex_);
             vstHostMessage_ = "blocked_after_retries";
         }
-        vstHostSyncPending_.store(false, std::memory_order_release);
-        vstHostStopPending_.store(true, std::memory_order_release);
-        vstHostNextRestartTickMs_.store(0, std::memory_order_release);
+        vstHostSyncPending_.store(true, std::memory_order_release);
+        vstHostStopPending_.store(false, std::memory_order_release);
+        vstHostNextRestartTickMs_.store(nowMs + kBlockedRetryDelayMs, std::memory_order_release);
+
+        const uint64_t lastLogMs = vstHostLastRestartLogTickMs_.load(std::memory_order_acquire);
+        if (nowMs > (lastLogMs + 1200ULL)) {
+            vstHostLastRestartLogTickMs_.store(nowMs, std::memory_order_release);
+            LogWarn(
+                "vst_host blocked_after_retries attempt=" + std::to_string(attempts) +
+                " retry_in_ms=" + std::to_string(kBlockedRetryDelayMs) +
+                " cause=" + startError);
+        }
         return;
     }
     const uint32_t shift = std::min<uint32_t>(attempts, 6U);
@@ -4731,6 +4861,17 @@ void MicMixApp::LeaveCaptureCallback() {
             return;
         }
     }
+}
+
+bool MicMixApp::WaitForCaptureCallbacksToDrain(uint32_t maxWaitMs) const {
+    const uint64_t deadline = GetTickCount64() + static_cast<uint64_t>(maxWaitMs);
+    while (captureCallbacksInFlight_.load(std::memory_order_acquire) > 0U) {
+        if (GetTickCount64() >= deadline) {
+            return false;
+        }
+        Sleep(2);
+    }
+    return true;
 }
 
 void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
@@ -5563,6 +5704,8 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
     try {
         shutdownRequested_.store(false, std::memory_order_release);
         captureCallbacksInFlight_.store(0, std::memory_order_release);
+        vstHostPipeName_ = GenerateVstHostPipeName();
+        vstHostAuthToken_ = GenerateHexToken(16);
         {
             std::lock_guard<std::mutex> lock(musicMetaMutex_);
             musicMetaSchid_ = 0;
@@ -5662,6 +5805,7 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
         LogError("MicMix initialize failed: unknown");
     }
 
+    shutdownRequested_.store(true, std::memory_order_release);
     StopVoiceTxThread();
     if (musicMuteHotkeyManager_) musicMuteHotkeyManager_->Stop();
     if (micInputMuteHotkeyManager_) micInputMuteHotkeyManager_->Stop();
@@ -5689,9 +5833,10 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
         vstHostJob_ = nullptr;
     }
     vstEffectsEnabledCached_.store(false, std::memory_order_release);
+    vstHostPipeName_.clear();
+    vstHostAuthToken_.clear();
     configStore_.reset();
     initialized_.store(false, std::memory_order_release);
-    shutdownRequested_.store(true, std::memory_order_release);
     return false;
 }
 
@@ -5711,8 +5856,8 @@ void MicMixApp::Shutdown() {
     StopVoiceTxThread();
     ApplyMicInputTransportMute(false);
     shutdownRequested_.store(true, std::memory_order_release);
-    for (int i = 0; i < 100 && captureCallbacksInFlight_.load(std::memory_order_acquire) > 0; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    if (!WaitForCaptureCallbacksToDrain(1500U)) {
+        LogWarn("capture callbacks still active during shutdown");
     }
     if (const auto sourceManager = sourceManager_.load(std::memory_order_acquire)) {
         sourceManager->Stop();
@@ -5742,6 +5887,8 @@ void MicMixApp::Shutdown() {
         vstHostJob_ = nullptr;
     }
     vstEffectsEnabledCached_.store(false, std::memory_order_release);
+    vstHostPipeName_.clear();
+    vstHostAuthToken_.clear();
     configStore_.reset();
 }
 
@@ -5903,12 +6050,18 @@ void MicMixApp::OnSourceSamples(const float* data, size_t count) {
     }
     thread_local PendingVstPackets pendingMusicPackets;
     thread_local uint32_t lastMusicSeq = 0;
+    thread_local float musicWetMix = 1.0f;
+    thread_local std::array<float, micmix::vstipc::kMaxFramesPerPacket> blended{};
+    constexpr float kVstMixTransitionMs = 4.0f;
+    constexpr float kVstMixTransitionSamples = (static_cast<float>(kTargetRate) * kVstMixTransitionMs) / 1000.0f;
+    constexpr float kVstMixStep = 1.0f / kVstMixTransitionSamples;
     const bool effectsEnabled = vstEffectsEnabledCached_.load(std::memory_order_acquire);
-    auto* shm = vstAudioShared_;
+    auto* shm = vstAudioShared_.load(std::memory_order_acquire);
     if (!effectsEnabled ||
         !shm ||
         !vstHostRunning_.load(std::memory_order_acquire)) {
         pendingMusicPackets.Clear();
+        musicWetMix = 0.0f;
         engine_.PushMusicSamples(data, count);
         return;
     }
@@ -5916,6 +6069,7 @@ void MicMixApp::OnSourceSamples(const float* data, size_t count) {
     if (hostHeartbeat == 0 ||
         (static_cast<uint32_t>(GetTickCount()) - static_cast<uint32_t>(hostHeartbeat)) > 3000U) {
         pendingMusicPackets.Clear();
+        musicWetMix = 0.0f;
         engine_.PushMusicSamples(data, count);
         return;
     }
@@ -5946,11 +6100,19 @@ void MicMixApp::OnSourceSamples(const float* data, size_t count) {
                 ComputeVstOutputWaitUs(frames));
         }
 
-        if (processed && out.frames == frames) {
-            engine_.PushMusicSamples(out.samples, frames);
-        } else {
-            engine_.PushMusicSamples(data + offset, frames);
+        const bool haveWet = processed && out.frames == frames;
+        const float targetMix = haveWet ? 1.0f : 0.0f;
+        for (uint32_t i = 0; i < frames; ++i) {
+            if (targetMix > musicWetMix) {
+                musicWetMix = std::min(targetMix, musicWetMix + kVstMixStep);
+            } else if (targetMix < musicWetMix) {
+                musicWetMix = std::max(targetMix, musicWetMix - kVstMixStep);
+            }
+            const float dry = data[offset + i];
+            const float wet = haveWet ? (std::isfinite(out.samples[i]) ? out.samples[i] : dry) : dry;
+            blended[i] = dry + ((wet - dry) * musicWetMix);
         }
+        engine_.PushMusicSamples(blended.data(), frames);
         offset += frames;
     }
 }
@@ -5963,18 +6125,24 @@ void MicMixApp::ProcessMicInputWithVst(short* samples, int sampleCount, int chan
     std::lock_guard<std::mutex> ipcLock(micVstIpcMutex);
     thread_local PendingVstPackets pendingMicPackets;
     thread_local uint32_t lastMicSeq = 0;
+    thread_local float micWetMix = 1.0f;
+    constexpr float kVstMixTransitionMs = 4.0f;
+    constexpr float kVstMixTransitionSamples = (static_cast<float>(kTargetRate) * kVstMixTransitionMs) / 1000.0f;
+    constexpr float kVstMixStep = 1.0f / kVstMixTransitionSamples;
     const bool effectsEnabled = vstEffectsEnabledCached_.load(std::memory_order_acquire);
-    auto* shm = vstAudioShared_;
+    auto* shm = vstAudioShared_.load(std::memory_order_acquire);
     if (!effectsEnabled ||
         !shm ||
         !vstHostRunning_.load(std::memory_order_acquire)) {
         pendingMicPackets.Clear();
+        micWetMix = 0.0f;
         return;
     }
     const LONG hostHeartbeat = micmix::vstipc::AtomicLoad(&shm->hostHeartbeat);
     if (hostHeartbeat == 0 ||
         (static_cast<uint32_t>(GetTickCount()) - static_cast<uint32_t>(hostHeartbeat)) > 3000U) {
         pendingMicPackets.Clear();
+        micWetMix = 0.0f;
         return;
     }
 
@@ -6007,30 +6175,31 @@ void MicMixApp::ProcessMicInputWithVst(short* samples, int sampleCount, int chan
         bool processed = false;
         micmix::vstipc::AudioPacket out{};
         if (micmix::vstipc::RingPush(shm->micIn, packet)) {
+            const uint64_t waitUs = std::min<uint64_t>(12000ULL, ComputeVstOutputWaitUs(frames));
             processed = TryReadMatchingVstPacket(
                 shm->micOut,
                 packet.seq,
                 pendingMicPackets,
                 out,
-                ComputeVstOutputWaitUs(frames));
+                waitUs);
         }
 
-        if (processed && out.frames == frames) {
-            float peak = 0.0f;
-            for (uint32_t i = 0; i < frames; ++i) {
-                const float v = std::isfinite(out.samples[i]) ? out.samples[i] : 0.0f;
-                peak = std::max(peak, std::fabs(v));
+        const bool haveWet = processed && out.frames == frames;
+        const float targetMix = haveWet ? 1.0f : 0.0f;
+        for (uint32_t i = 0; i < frames; ++i) {
+            if (targetMix > micWetMix) {
+                micWetMix = std::min(targetMix, micWetMix + kVstMixStep);
+            } else if (targetMix < micWetMix) {
+                micWetMix = std::max(targetMix, micWetMix - kVstMixStep);
             }
-            const float gain = (peak > 0.98f) ? (0.98f / peak) : 1.0f;
-            for (uint32_t i = 0; i < frames; ++i) {
-                const float v = std::isfinite(out.samples[i]) ? out.samples[i] : 0.0f;
-                const float scaled = v * gain;
-                const short s = static_cast<short>(std::lrintf(
-                    std::clamp(scaled, -1.0f, 1.0f) * 32767.0f));
-                for (int ch = 0; ch < channels; ++ch) {
-                    const int idx = ((offset + static_cast<int>(i)) * channels) + ch;
-                    samples[idx] = s;
-                }
+            const float dry = mono[i];
+            const float wet = haveWet ? (std::isfinite(out.samples[i]) ? out.samples[i] : dry) : dry;
+            const float mixed = dry + ((wet - dry) * micWetMix);
+            const short s = static_cast<short>(std::lrintf(
+                std::clamp(mixed, -1.0f, 1.0f) * 32767.0f));
+            for (int ch = 0; ch < channels; ++ch) {
+                const int idx = ((offset + static_cast<int>(i)) * channels) + ch;
+                samples[idx] = s;
             }
         }
         offset += static_cast<int>(frames);
