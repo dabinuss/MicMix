@@ -84,10 +84,13 @@ std::atomic<HWND> g_hwnd{nullptr};
 UiTheme g_theme = DefaultUiTheme();
 int g_dpi = 96;
 std::wstring g_statusText;
+HeaderBadgeState g_headerBadgeState = HeaderBadgeState::Off;
+bool g_headerBadgeStateValid = false;
 std::atomic_uint64_t g_statusHoldUntilMs{0};
 uint64_t g_lastListRefreshTickMs = 0;
 std::atomic<bool> g_loading{false};
 std::atomic<bool> g_editorOpenPending{false};
+bool g_ownerVstAutostartChecked = false;
 
 constexpr UINT kMsgEditorOpenDone = WM_APP + 42;
 
@@ -100,10 +103,12 @@ HFONT g_fontBody = nullptr;
 HFONT g_fontSmall = nullptr;
 HFONT g_fontHint = nullptr;
 HFONT g_fontTiny = nullptr;
+HFONT g_fontControlLarge = nullptr;
 HFONT g_fontTitle = nullptr;
 HFONT g_fontMono = nullptr;
 HBRUSH g_brushBg = nullptr;
 HBRUSH g_brushCard = nullptr;
+UiCommonResources g_commonUi{};
 
 RECT g_rcHeaderBadge{};
 RECT g_rcTop{};
@@ -131,46 +136,22 @@ bool g_lastMusicClipRecent = false;
 int g_lastMicClipLitSegments = -1;
 bool g_lastMicClipRecent = false;
 
-constexpr int kClientWidthPx = 680;
-constexpr int kClientHeightPx = 780;
-constexpr int kCardMarginPx = 16;
-constexpr int kCardGapPx = 12;
-constexpr int kCardInnerPaddingPx = 20;
+constexpr int kClientWidthPx = kUiClientWidthPx;
+constexpr int kClientHeightPx = kUiClientHeightPx;
+constexpr int kCardMarginPx = kUiCardMarginPx;
+constexpr int kCardGapPx = kUiCardGapPx;
+constexpr int kCardInnerPaddingPx = kUiCardInnerPaddingPx;
 constexpr UINT kTimerStatus = 1;
 constexpr UINT kTimerMs = 250;
 constexpr int kListItemHeightPx = 22;
 constexpr wchar_t kRepoUrl[] = L"https://github.com/dabinuss/MicMix";
+constexpr wchar_t kEffectsHeaderTitle[] = L"MicMix - Audio Effects";
+constexpr wchar_t kEffectsSectionTopTitle[] = L"EFFECTS SETTINGS";
+constexpr wchar_t kEffectsSectionMusicTitle[] = L"AUDIO EFFECTS";
+constexpr wchar_t kEffectsSectionMicTitle[] = L"MIC EFFECTS";
 
 int S(int px) {
     return MulDiv(px, g_dpi, 96);
-}
-
-void FillSolidRect(HDC hdc, const RECT& rc, COLORREF color) {
-    HBRUSH brush = CreateSolidBrush(color);
-    FillRect(hdc, &rc, brush);
-    DeleteObject(brush);
-}
-
-int MeterDbToPixels(float dbfs, int widthPx) {
-    const float clamped = std::clamp(dbfs, -60.0f, 0.0f);
-    return static_cast<int>(((clamped + 60.0f) / 60.0f) * static_cast<float>(widthPx));
-}
-
-float ClipDangerUnitFromDb(float dbfs) {
-    const float clamped = std::clamp(dbfs, -18.0f, 0.0f);
-    return (clamped + 18.0f) / 18.0f;
-}
-
-int ClipLitSegmentsFromDb(float dbfs) {
-    constexpr int kClipSegments = 18;
-    const float dangerUnit = ClipDangerUnitFromDb(dbfs);
-    return std::clamp(static_cast<int>((dangerUnit * static_cast<float>(kClipSegments)) + 0.5f), 0, kClipSegments);
-}
-
-bool IsMusicMeterActive(const TelemetrySnapshot& t) {
-    const float shownPeakDb = (t.musicSendPeakDbfs > -119.0f) ? t.musicSendPeakDbfs : t.musicPeakDbfs;
-    const bool levelSuggestsSignal = (shownPeakDb > -96.0f) || (t.musicRmsDbfs > -100.0f);
-    return t.musicActive || levelSuggestsSignal;
 }
 
 bool IsHandCursorControlId(int id) {
@@ -220,22 +201,6 @@ void SetTransientStatusText(HWND hwnd, const std::wstring& text) {
     SetStatusText(hwnd, text, kStatusHoldMs);
 }
 
-bool GetCheckboxValue(HWND hwnd, int id) {
-    const HWND ctl = GetDlgItem(hwnd, id);
-    if (!ctl) {
-        return false;
-    }
-    return SendMessageW(ctl, BM_GETCHECK, 0, 0) == BST_CHECKED;
-}
-
-void SetCheckboxValue(HWND hwnd, int id, bool checked) {
-    const HWND ctl = GetDlgItem(hwnd, id);
-    if (!ctl) {
-        return;
-    }
-    SendMessageW(ctl, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
-}
-
 HeaderBadgeState ResolveBadgeState() {
     return MicMixApp::Instance().IsEffectsEnabled() ? HeaderBadgeState::Active : HeaderBadgeState::Off;
 }
@@ -250,86 +215,43 @@ HeaderBadgeVisual GetHeaderBadgeVisual(HeaderBadgeState state) {
 }
 
 void EnsureUiResources() {
-    if (!g_brushBg) {
-        g_brushBg = CreateSolidBrush(g_theme.bg);
-    }
-    if (!g_brushCard) {
-        g_brushCard = CreateSolidBrush(g_theme.card);
-    }
-    if (!g_fontBody) {
-        g_fontBody = CreateFontW(-S(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-    }
-    if (!g_fontSmall) {
-        g_fontSmall = CreateFontW(-S(12), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-    }
-    if (!g_fontHint) {
-        g_fontHint = CreateFontW(-S(11), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-    }
-    if (!g_fontTiny) {
-        g_fontTiny = CreateFontW(-S(10), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-    }
-    if (!g_fontTitle) {
-        g_fontTitle = CreateFontW(-S(24), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI Semibold");
-    }
-    if (!g_fontMono) {
-        g_fontMono = CreateFontW(-S(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
-    }
+    EnsureCommonUiResources(g_commonUi, g_theme, g_dpi);
+    g_brushBg = g_commonUi.bgBrush;
+    g_brushCard = g_commonUi.cardBrush;
+    g_fontBody = g_commonUi.bodyFont;
+    g_fontSmall = g_commonUi.smallFont;
+    g_fontHint = g_commonUi.hintFont;
+    g_fontTiny = g_commonUi.tinyFont;
+    g_fontControlLarge = g_commonUi.controlLargeFont;
+    g_fontTitle = g_commonUi.titleFont;
+    g_fontMono = g_commonUi.monoFont;
 }
 
 void ReleaseUiResources() {
-    if (g_fontBody) {
-        DeleteObject(g_fontBody);
-        g_fontBody = nullptr;
-    }
-    if (g_fontSmall) {
-        DeleteObject(g_fontSmall);
-        g_fontSmall = nullptr;
-    }
-    if (g_fontHint) {
-        DeleteObject(g_fontHint);
-        g_fontHint = nullptr;
-    }
-    if (g_fontTiny) {
-        DeleteObject(g_fontTiny);
-        g_fontTiny = nullptr;
-    }
-    if (g_fontTitle) {
-        DeleteObject(g_fontTitle);
-        g_fontTitle = nullptr;
-    }
-    if (g_fontMono) {
-        DeleteObject(g_fontMono);
-        g_fontMono = nullptr;
-    }
-    if (g_brushBg) {
-        DeleteObject(g_brushBg);
-        g_brushBg = nullptr;
-    }
-    if (g_brushCard) {
-        DeleteObject(g_brushCard);
-        g_brushCard = nullptr;
-    }
-}
-
-void SetControlFont(HWND hwnd, int id, HFONT font) {
-    HWND ctl = GetDlgItem(hwnd, id);
-    if (ctl && font) {
-        SendMessageW(ctl, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
-    }
+    ReleaseCommonUiResources(g_commonUi);
+    g_fontBody = nullptr;
+    g_fontSmall = nullptr;
+    g_fontHint = nullptr;
+    g_fontTiny = nullptr;
+    g_fontControlLarge = nullptr;
+    g_fontTitle = nullptr;
+    g_fontMono = nullptr;
+    g_brushBg = nullptr;
+    g_brushCard = nullptr;
 }
 
 void ComputeLayout(HWND hwnd) {
     const int left = S(kCardMarginPx);
     const int right = S(kClientWidthPx - kCardMarginPx);
     const int cardW = right - left;
-    const int topY = S(88);
-    const int topH = S(88);
+    const int topY = S(kUiTopCardYpx);
+    const int topH = S(128);
     const int musicY = topY + topH + S(kCardGapPx);
-    const int musicH = S(228);
+    const int musicH = S(214);
     const int micY = musicY + musicH + S(kCardGapPx);
-    const int micH = S(228);
+    const int micH = S(214);
     const int statusY = micY + micH + S(kCardGapPx);
-    const int statusH = S(104);
+    const int statusH = S(84);
     g_rcTop = { left, topY, left + cardW, topY + topH };
     g_rcMusic = { left, musicY, left + cardW, musicY + musicH };
     g_rcMic = { left, micY, left + cardW, micY + micH };
@@ -339,41 +261,36 @@ void ComputeLayout(HWND hwnd) {
     const int sectionPad = S(kCardInnerPaddingPx);
     const int musicSectionTop = g_rcMusic.top + sectionPad;
     const int musicSectionLeft = g_rcMusic.left + sectionPad;
-    const int musicMeterLeft = musicSectionLeft + S(138);
+    const int musicMeterLeft = musicSectionLeft + S(144);
     g_rcMusicMeter = { musicMeterLeft, musicSectionTop + S(32), musicMeterLeft + meterWidth, musicSectionTop + S(32) + S(28) };
     g_rcMusicClip = { musicMeterLeft, musicSectionTop + S(62), musicMeterLeft + meterWidth, musicSectionTop + S(62) + S(12) };
 
     const int micSectionTop = g_rcMic.top + sectionPad;
     const int micSectionLeft = g_rcMic.left + sectionPad;
-    const int micMeterLeft = micSectionLeft + S(138);
+    const int micMeterLeft = micSectionLeft + S(144);
     g_rcMicMeter = { micMeterLeft, micSectionTop + S(32), micMeterLeft + meterWidth, micSectionTop + S(32) + S(28) };
     g_rcMicClip = { micMeterLeft, micSectionTop + S(62), micMeterLeft + meterWidth, micSectionTop + S(62) + S(12) };
 
     const int contentLeft = S(kCardMarginPx + kCardInnerPaddingPx);
-    const int titleX = contentLeft;
-    const int titleY = S(14);
-    const int titleH = S(36);
-    int titleW = S(112);
-    int badgeW = S(74);
+    const int titleY = S(10);
+    const int titleH = S(42);
     HDC dc = GetDC(hwnd);
+    const HeaderLayout headerLayout = ComputeHeaderLayout(
+        dc,
+        g_fontTitle,
+        g_fontSmall,
+        g_fontBody,
+        g_dpi,
+        kEffectsHeaderTitle,
+        contentLeft,
+        S(kClientWidthPx - kCardMarginPx - kCardInnerPaddingPx),
+        titleY,
+        titleH,
+        300);
     if (dc) {
-        HGDIOBJ old = SelectObject(dc, g_fontTitle ? g_fontTitle : g_fontBody);
-        SIZE titleSize{};
-        if (GetTextExtentPoint32W(dc, L"MicMix", 6, &titleSize) != 0) {
-            titleW = titleSize.cx + S(2);
-        }
-        SelectObject(dc, g_fontSmall ? g_fontSmall : g_fontBody);
-        SIZE badgeText{};
-        if (GetTextExtentPoint32W(dc, L"ACTIVE", 6, &badgeText) != 0) {
-            badgeW = std::clamp<int>(badgeText.cx + S(28), S(78), S(108));
-        }
-        SelectObject(dc, old);
         ReleaseDC(hwnd, dc);
     }
-    const int badgeH = S(22);
-    const int badgeX = titleX + titleW + S(2);
-    const int badgeY = titleY + ((titleH - badgeH) / 2) - S(1);
-    g_rcHeaderBadge = { badgeX, badgeY, badgeX + badgeW, badgeY + badgeH };
+    g_rcHeaderBadge = headerLayout.badgeRect;
 }
 
 void ApplyFonts(HWND hwnd) {
@@ -381,23 +298,18 @@ void ApplyFonts(HWND hwnd) {
         SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontBody), TRUE);
         return TRUE;
     }, 0);
-    SetControlFont(hwnd, IDC_TITLE, g_fontTitle);
-    SetControlFont(hwnd, IDC_SUBTITLE, g_fontHint ? g_fontHint : g_fontSmall);
-    SetControlFont(hwnd, IDC_VERSION, g_fontSmall);
-    SetControlFont(hwnd, IDC_REPO_LINK, g_fontSmall);
-    SetControlFont(hwnd, IDC_MONITOR_HINT, g_fontHint ? g_fontHint : g_fontSmall);
-    SetControlFont(hwnd, IDC_AUDIO_SECTION_TITLE, g_fontSmall);
-    SetControlFont(hwnd, IDC_MIC_SECTION_TITLE, g_fontSmall);
-    SetControlFont(hwnd, IDC_STATUS, g_fontMono ? g_fontMono : g_fontBody);
+    SetControlFontById(hwnd, IDC_TITLE, g_fontTitle);
+    SetControlFontById(hwnd, IDC_SUBTITLE, g_fontHint ? g_fontHint : g_fontSmall);
+    SetControlFontById(hwnd, IDC_VERSION, g_fontSmall);
+    SetControlFontById(hwnd, IDC_REPO_LINK, g_fontSmall);
+    SetControlFontById(hwnd, IDC_MONITOR_HINT, g_fontHint ? g_fontHint : g_fontSmall);
+    SetControlFontById(hwnd, IDC_VST_AUTOSTART, g_fontControlLarge ? g_fontControlLarge : g_fontBody);
+    SetControlFontById(hwnd, IDC_STATUS, g_fontMono ? g_fontMono : g_fontBody);
 }
 
 void UpdateMonitorButton(HWND hwnd) {
-    HWND btn = GetDlgItem(hwnd, IDC_MONITOR);
-    if (!btn) {
-        return;
-    }
     const bool enabled = MicMixApp::Instance().IsMonitorEnabled();
-    SetWindowTextW(btn, enabled ? L"Monitor Mix: On" : L"Monitor Mix: Off");
+    SetMonitorButtonText(hwnd, IDC_MONITOR, enabled);
 }
 
 std::wstring BuildEffectRow(const VstEffectSlot& slot) {
@@ -610,40 +522,31 @@ void RefreshStatus(HWND hwnd) {
     if (holdUntil == 0 || nowMs >= holdUntil) {
         SetStatusText(hwnd, line1 + L"\r\n" + line2 + L"\r\n" + line3);
     }
+    const HeaderBadgeState nextBadge = effectsEnabled ? HeaderBadgeState::Active : HeaderBadgeState::Off;
+    if (!g_headerBadgeStateValid || nextBadge != g_headerBadgeState) {
+        g_headerBadgeState = nextBadge;
+        g_headerBadgeStateValid = true;
+        InvalidateRect(hwnd, &g_rcHeaderBadge, FALSE);
+    }
     SetWindowTextW(hwnd, effectsEnabled ? L"MicMix Effects - ACTIVE" : L"MicMix Effects - OFF");
-    SetCheckboxValue(hwnd, IDC_VST_AUTOSTART, hostAutostart);
+    if (g_ownerVstAutostartChecked != hostAutostart) {
+        g_ownerVstAutostartChecked = hostAutostart;
+        InvalidateRect(GetDlgItem(hwnd, IDC_VST_AUTOSTART), nullptr, TRUE);
+    }
     UpdateMonitorButton(hwnd);
-    InvalidateRect(hwnd, &g_rcHeaderBadge, TRUE);
 }
 
 void ApplyControlTheme(HWND hwnd) {
-    EnumChildWindows(hwnd, [](HWND child, LPARAM) -> BOOL {
-        wchar_t className[32]{};
-        GetClassNameW(child, className, static_cast<int>(std::size(className)));
-        if (_wcsicmp(className, L"ListBox") == 0) {
-            SetWindowTheme(child, L"Explorer", nullptr);
-        }
-        if (_wcsicmp(className, L"Button") == 0) {
-            const LONG_PTR style = GetWindowLongPtrW(child, GWL_STYLE);
-            const LONG_PTR type = (style & BS_TYPEMASK);
-            if (type == BS_PUSHBUTTON || type == BS_DEFPUSHBUTTON) {
-                SetWindowLongPtrW(child, GWL_STYLE, style | BS_FLAT);
-            }
-            SetWindowTheme(child, L"Explorer", nullptr);
-        }
-        return TRUE;
-    }, 0);
-}
-
-HINSTANCE GetPluginModuleHandle() {
-    HMODULE mod = nullptr;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCWSTR>(&GetPluginModuleHandle),
-                           &mod) == 0 || mod == nullptr) {
-        return GetModuleHandleW(nullptr);
-    }
-    return mod;
+    const int unthemeOwnerDrawIds[] = {
+        IDC_VST_AUTOSTART,
+    };
+    ApplyMicMixControlTheme(
+        hwnd,
+        kUiThemeButtons | kUiThemeListBoxes,
+        true,
+        true,
+        unthemeOwnerDrawIds,
+        static_cast<int>(std::size(unthemeOwnerDrawIds)));
 }
 
 void DrawEffectListItem(const DRAWITEMSTRUCT* dis) {
@@ -690,235 +593,38 @@ void DrawEffectListItem(const DRAWITEMSTRUCT* dis) {
     }
 }
 
+void DrawOwnerCheckbox(const DRAWITEMSTRUCT* dis) {
+    if (!dis) {
+        return;
+    }
+    DrawOwnerCheckboxShared(
+        dis,
+        g_ownerVstAutostartChecked,
+        g_fontControlLarge,
+        g_fontBody,
+        g_theme.text,
+        g_theme.card,
+        g_dpi);
+}
+
 void DrawLevelMeter(HDC hdc, const RECT& meterRect, bool active, float visualDb, float holdDb) {
-    if (meterRect.right <= meterRect.left || meterRect.bottom <= meterRect.top) {
-        return;
-    }
-    const int targetWidth = static_cast<int>(meterRect.right - meterRect.left);
-    const int targetHeight = static_cast<int>(meterRect.bottom - meterRect.top);
-    if (targetWidth <= 2 || targetHeight <= 2) {
-        return;
-    }
-
-    HDC drawDc = hdc;
-    HDC memDc = CreateCompatibleDC(hdc);
-    HBITMAP memBmp = nullptr;
-    HGDIOBJ oldBmp = nullptr;
-    bool buffered = false;
-    if (memDc) {
-        memBmp = CreateCompatibleBitmap(hdc, targetWidth, targetHeight);
-        if (memBmp) {
-            oldBmp = SelectObject(memDc, memBmp);
-            drawDc = memDc;
-            buffered = true;
-        } else {
-            DeleteDC(memDc);
-            memDc = nullptr;
-        }
-    }
-
-    RECT rc = buffered ? RECT{ 0, 0, targetWidth, targetHeight } : meterRect;
-    const int left = static_cast<int>(rc.left);
-    const int right = static_cast<int>(rc.right);
-    const int width = right - left;
-    const int height = static_cast<int>(rc.bottom - rc.top);
-    if (width <= 2 || height <= 2) {
-        if (buffered) {
-            SelectObject(memDc, oldBmp);
-            DeleteObject(memBmp);
-            DeleteDC(memDc);
-        }
-        return;
-    }
-
-    constexpr float kYellowStartDb = -24.0f;
-    constexpr float kRedStartDb = -12.0f;
-    const int scaleBandH = std::clamp(S(10), 7, std::max(7, height - S(8)));
-    RECT scaleRc = rc;
-    scaleRc.bottom = std::min(rc.bottom, rc.top + scaleBandH);
-    RECT barRc = rc;
-    barRc.top = std::min(rc.bottom - 1, scaleRc.bottom);
-
-    FillSolidRect(drawDc, scaleRc, RGB(244, 247, 252));
-    FillSolidRect(drawDc, barRc, RGB(235, 240, 246));
-
-    const std::array<int, 7> tickDb = { -60, -36, -24, -18, -12, -6, 0 };
-    SetBkMode(drawDc, TRANSPARENT);
-    SetTextColor(drawDc, RGB(96, 107, 122));
-    HGDIOBJ oldFont = SelectObject(drawDc, g_fontTiny ? g_fontTiny : (g_fontHint ? g_fontHint : g_fontSmall));
-    for (size_t i = 0; i < tickDb.size(); ++i) {
-        const int db = tickDb[i];
-        int x = left + MeterDbToPixels(static_cast<float>(db), width);
-        x = std::clamp(x, left, right - 1);
-
-        const COLORREF guideColor = (db == -24)
-            ? RGB(198, 176, 104)
-            : (db == -12 || db == 0)
-                ? RGB(198, 130, 124)
-                : RGB(206, 214, 225);
-        HPEN guidePen = CreatePen(PS_SOLID, 1, guideColor);
-        HGDIOBJ oldGuidePen = SelectObject(drawDc, guidePen);
-        MoveToEx(drawDc, x, barRc.top, nullptr);
-        LineTo(drawDc, x, barRc.bottom);
-        SelectObject(drawDc, oldGuidePen);
-        DeleteObject(guidePen);
-
-        RECT tickRc{ x, scaleRc.bottom - S(3), x + 1, scaleRc.bottom };
-        FillSolidRect(drawDc, tickRc, RGB(162, 171, 184));
-
-        wchar_t label[8]{};
-        swprintf_s(label, L"%d", db);
-        SIZE textSize{};
-        if (GetTextExtentPoint32W(drawDc, label, lstrlenW(label), &textSize) != 0) {
-            int textLeft = x - (textSize.cx / 2);
-            if (i == 0) {
-                textLeft = left + S(2);
-            } else if (i == (tickDb.size() - 1)) {
-                textLeft = right - textSize.cx - S(2);
-            } else {
-                const int labelMinX = left + S(2);
-                const int labelMaxX = right - static_cast<int>(textSize.cx) - S(2);
-                textLeft = std::clamp(textLeft, labelMinX, labelMaxX);
-            }
-            TextOutW(drawDc, textLeft, scaleRc.top, label, lstrlenW(label));
-        }
-    }
-    SelectObject(drawDc, oldFont);
-
-    const int barWidth = std::max(1, static_cast<int>(barRc.right - barRc.left));
-    const int levelPx = std::clamp(MeterDbToPixels(visualDb, width), 0, width);
-    const int holdPx = std::clamp(MeterDbToPixels(holdDb, width), 0, width - 1);
-    const int greenEnd = std::clamp(MeterDbToPixels(kYellowStartDb, barWidth), 0, barWidth);
-    const int yellowEnd = std::clamp(MeterDbToPixels(kRedStartDb, barWidth), 0, barWidth);
-
-    if (active && levelPx > 0) {
-        RECT seg = barRc;
-        seg.right = barRc.left + std::min(levelPx, greenEnd);
-        if (seg.right > seg.left) FillSolidRect(drawDc, seg, RGB(54, 181, 78));
-
-        if (levelPx > greenEnd) {
-            seg.left = barRc.left + greenEnd;
-            seg.right = barRc.left + std::min(levelPx, yellowEnd);
-            if (seg.right > seg.left) FillSolidRect(drawDc, seg, RGB(232, 191, 58));
-        }
-        if (levelPx > yellowEnd) {
-            seg.left = barRc.left + yellowEnd;
-            seg.right = barRc.left + levelPx;
-            if (seg.right > seg.left) FillSolidRect(drawDc, seg, RGB(214, 75, 63));
-        }
-
-        HPEN holdPen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
-        HGDIOBJ oldPen = SelectObject(drawDc, holdPen);
-        MoveToEx(drawDc, barRc.left + holdPx, barRc.top, nullptr);
-        LineTo(drawDc, barRc.left + holdPx, barRc.bottom);
-        SelectObject(drawDc, oldPen);
-        DeleteObject(holdPen);
-    }
-
-    HPEN border = CreatePen(PS_SOLID, 1, RGB(184, 193, 207));
-    HGDIOBJ oldPen = SelectObject(drawDc, border);
-    HGDIOBJ oldBrush = SelectObject(drawDc, GetStockObject(HOLLOW_BRUSH));
-    Rectangle(drawDc, rc.left, rc.top, rc.right, rc.bottom);
-    SelectObject(drawDc, oldBrush);
-    SelectObject(drawDc, oldPen);
-    DeleteObject(border);
-
-    if (buffered) {
-        BitBlt(hdc, meterRect.left, meterRect.top, targetWidth, targetHeight, memDc, 0, 0, SRCCOPY);
-        SelectObject(memDc, oldBmp);
-        DeleteObject(memBmp);
-        DeleteDC(memDc);
-    }
+    const MeterFonts fonts{
+        g_fontTiny,
+        g_fontHint,
+        g_fontSmall,
+        g_fontBody,
+    };
+    DrawLevelMeterShared(hdc, meterRect, active, visualDb, holdDb, fonts, g_dpi);
 }
 
 void DrawClipStrip(HDC hdc, const RECT& rcStrip, float dangerUnit, bool clipRecent) {
-    if (rcStrip.right <= rcStrip.left || rcStrip.bottom <= rcStrip.top) {
-        return;
-    }
-    const int targetWidth = static_cast<int>(rcStrip.right - rcStrip.left);
-    const int targetHeight = static_cast<int>(rcStrip.bottom - rcStrip.top);
-    if (targetWidth <= 2 || targetHeight <= 2) {
-        return;
-    }
-
-    HDC drawDc = hdc;
-    HDC memDc = CreateCompatibleDC(hdc);
-    HBITMAP memBmp = nullptr;
-    HGDIOBJ oldBmp = nullptr;
-    bool buffered = false;
-    if (memDc) {
-        memBmp = CreateCompatibleBitmap(hdc, targetWidth, targetHeight);
-        if (memBmp) {
-            oldBmp = SelectObject(memDc, memBmp);
-            drawDc = memDc;
-            buffered = true;
-        } else {
-            DeleteDC(memDc);
-            memDc = nullptr;
-        }
-    }
-
-    RECT rc = buffered ? RECT{ 0, 0, targetWidth, targetHeight } : rcStrip;
-    FillSolidRect(drawDc, rc, RGB(246, 249, 252));
-
-    const int width = rc.right - rc.left;
-    constexpr int kSegments = 18;
-    const int segGap = std::max(1, S(1));
-    const int litSegments = std::clamp(static_cast<int>(std::floor(dangerUnit * static_cast<float>(kSegments) + 0.5f)), 0, kSegments);
-    const COLORREF offColor = RGB(218, 225, 235);
-    const COLORREF clipColor = clipRecent ? RGB(226, 63, 51) : RGB(196, 72, 64);
-
-    for (int i = 0; i < kSegments; ++i) {
-        const int segLeft = rc.left + ((i * width) / kSegments);
-        const int segRightFull = rc.left + (((i + 1) * width) / kSegments);
-        int segRight = segRightFull;
-        if (i < (kSegments - 1)) {
-            segRight = std::max(segLeft + 1, segRightFull - segGap);
-        }
-        RECT seg{ segLeft, rc.top + S(2), segRight, rc.bottom - S(2) };
-        float t = static_cast<float>(i) / static_cast<float>(kSegments - 1);
-        COLORREF onColor = RGB(
-            static_cast<BYTE>(84 + (154.0f * t)),
-            static_cast<BYTE>(176 - (126.0f * t)),
-            static_cast<BYTE>(86 - (40.0f * t)));
-        COLORREF color = (i < litSegments) ? onColor : offColor;
-        FillSolidRect(drawDc, seg, color);
-    }
-
-    HPEN border = CreatePen(PS_SOLID, 1, clipRecent ? RGB(208, 72, 60) : RGB(188, 197, 210));
-    HGDIOBJ oldPen = SelectObject(drawDc, border);
-    HGDIOBJ oldBrush = SelectObject(drawDc, GetStockObject(HOLLOW_BRUSH));
-    Rectangle(drawDc, rc.left, rc.top, rc.right, rc.bottom);
-    SelectObject(drawDc, oldBrush);
-    SelectObject(drawDc, oldPen);
-    DeleteObject(border);
-
-    SetBkMode(drawDc, TRANSPARENT);
-    SetTextColor(drawDc, clipRecent ? RGB(132, 24, 24) : RGB(112, 120, 132));
-    SelectObject(drawDc, g_fontTiny ? g_fontTiny : (g_fontHint ? g_fontHint : g_fontSmall));
-    RECT labelRc{ rc.left + S(5), rc.top, rc.right - S(52), rc.bottom };
-    DrawTextW(drawDc, L"Clip Meter", -1, &labelRc, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-
-    RECT inner{ rc.left + 1, rc.top + 1, rc.right - 1, rc.bottom - 1 };
-    RECT pulse{};
-    const int pulseWidth = S(44);
-    if (clipRecent) {
-        pulse = { std::max(inner.left, inner.right - pulseWidth), inner.top, inner.right, inner.bottom };
-        FillSolidRect(drawDc, pulse, clipColor);
-    }
-
-    if (clipRecent) {
-        SetTextColor(drawDc, RGB(255, 255, 255));
-        SelectObject(drawDc, g_fontTiny ? g_fontTiny : (g_fontHint ? g_fontHint : g_fontSmall));
-        DrawTextW(drawDc, L"CLIP", -1, &pulse, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
-    }
-
-    if (buffered) {
-        BitBlt(hdc, rcStrip.left, rcStrip.top, targetWidth, targetHeight, memDc, 0, 0, SRCCOPY);
-        SelectObject(memDc, oldBmp);
-        DeleteObject(memBmp);
-        DeleteDC(memDc);
-    }
+    const MeterFonts fonts{
+        g_fontTiny,
+        g_fontHint,
+        g_fontSmall,
+        g_fontBody,
+    };
+    DrawClipStripShared(hdc, rcStrip, dangerUnit, clipRecent, fonts, g_dpi);
 }
 
 void UpdateMeterVisuals(HWND hwnd) {
@@ -926,7 +632,11 @@ void UpdateMeterVisuals(HWND hwnd) {
     g_lastTelemetry = t;
 
     const float shownMusicPeakDb = (t.musicSendPeakDbfs > -119.0f) ? t.musicSendPeakDbfs : t.musicPeakDbfs;
-    const bool musicMeterActive = IsMusicMeterActive(t);
+    const bool musicMeterActive = IsSignalMeterActive(
+        t.musicActive,
+        t.musicSendPeakDbfs,
+        t.musicPeakDbfs,
+        t.musicRmsDbfs);
     float musicTargetDb = -60.0f;
     if (musicMeterActive) {
         musicTargetDb = std::clamp(shownMusicPeakDb, -60.0f, 0.0f);
@@ -944,8 +654,8 @@ void UpdateMeterVisuals(HWND hwnd) {
     }
 
     const int musicMeterWidth = std::max(1, static_cast<int>(g_rcMusicMeter.right - g_rcMusicMeter.left));
-    const int musicLevelPx = std::clamp(MeterDbToPixels(g_musicMeterVisualDb, musicMeterWidth), 0, musicMeterWidth);
-    const int musicHoldPx = std::clamp(MeterDbToPixels(g_musicMeterHoldDb, musicMeterWidth), 0, musicMeterWidth - 1);
+    const int musicLevelPx = std::clamp(::MeterDbToPixels(g_musicMeterVisualDb, musicMeterWidth), 0, musicMeterWidth);
+    const int musicHoldPx = std::clamp(::MeterDbToPixels(g_musicMeterHoldDb, musicMeterWidth), 0, musicMeterWidth - 1);
     const bool musicMeterChanged =
         (musicLevelPx != g_lastMusicMeterLevelPx) ||
         (musicHoldPx != g_lastMusicMeterHoldPx) ||
@@ -957,7 +667,7 @@ void UpdateMeterVisuals(HWND hwnd) {
         InvalidateRect(hwnd, &g_rcMusicMeter, FALSE);
     }
 
-    const int musicClipLitSegments = ClipLitSegmentsFromDb(shownMusicPeakDb);
+    const int musicClipLitSegments = ::ClipLitSegmentsFromDb(shownMusicPeakDb);
     const bool musicClipChanged =
         (musicClipLitSegments != g_lastMusicClipLitSegments) ||
         (t.sourceClipRecent != g_lastMusicClipRecent);
@@ -985,8 +695,8 @@ void UpdateMeterVisuals(HWND hwnd) {
 
     const bool micMeterActive = t.micRmsDbfs > -119.0f;
     const int micMeterWidth = std::max(1, static_cast<int>(g_rcMicMeter.right - g_rcMicMeter.left));
-    const int micLevelPx = std::clamp(MeterDbToPixels(g_micMeterVisualDb, micMeterWidth), 0, micMeterWidth);
-    const int micHoldPx = std::clamp(MeterDbToPixels(g_micMeterHoldDb, micMeterWidth), 0, micMeterWidth - 1);
+    const int micLevelPx = std::clamp(::MeterDbToPixels(g_micMeterVisualDb, micMeterWidth), 0, micMeterWidth);
+    const int micHoldPx = std::clamp(::MeterDbToPixels(g_micMeterHoldDb, micMeterWidth), 0, micMeterWidth - 1);
     const bool micMeterChanged =
         (micLevelPx != g_lastMicMeterLevelPx) ||
         (micHoldPx != g_lastMicMeterHoldPx) ||
@@ -998,7 +708,7 @@ void UpdateMeterVisuals(HWND hwnd) {
         InvalidateRect(hwnd, &g_rcMicMeter, FALSE);
     }
 
-    const int micClipLitSegments = ClipLitSegmentsFromDb(t.micPeakDbfs);
+    const int micClipLitSegments = ::ClipLitSegmentsFromDb(t.micPeakDbfs);
     const bool micClipChanged =
         (micClipLitSegments != g_lastMicClipLitSegments) ||
         (t.micClipRecent != g_lastMicClipRecent);
@@ -1015,6 +725,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_dpi = GetDpiForWindow(hwnd);
         EnsureUiResources();
         ComputeLayout(hwnd);
+        g_headerBadgeState = HeaderBadgeState::Off;
+        g_headerBadgeStateValid = false;
         g_lastTelemetry = {};
         g_musicMeterVisualDb = -60.0f;
         g_musicMeterHoldDb = -60.0f;
@@ -1031,40 +743,57 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_lastMicClipLitSegments = -1;
         g_lastMicClipRecent = false;
         g_lastListRefreshTickMs = 0;
+        g_ownerVstAutostartChecked = MicMixApp::Instance().GetSettings().vstHostAutostart;
 
         const int contentLeft = S(kCardMarginPx + kCardInnerPaddingPx);
         const int contentRight = S(kClientWidthPx - kCardMarginPx - kCardInnerPaddingPx);
         const int controlGap = S(12);
         const int actionButtonW = S(142);
         const int monitorButtonW = S(122);
-        const int autostartCheckboxW = S(170);
-        const int headerMetaW = S(300);
-        const int headerMetaX = contentRight - headerMetaW;
+        const int autostartCheckboxW = S(kUiTopCardCheckboxWidthPx);
         const int titleX = contentLeft;
-        const int titleY = S(14);
-        const int titleH = S(36);
-        const int titleW = S(190);
+        const int titleY = S(10);
+        const int titleH = S(42);
+        HDC headerMeasureDc = GetDC(hwnd);
+        const HeaderLayout headerLayout = ComputeHeaderLayout(
+            headerMeasureDc,
+            g_fontTitle,
+            g_fontSmall,
+            g_fontBody,
+            g_dpi,
+            kEffectsHeaderTitle,
+            contentLeft,
+            contentRight,
+            titleY,
+            titleH,
+            300);
+        if (headerMeasureDc) {
+            ReleaseDC(hwnd, headerMeasureDc);
+        }
+        g_rcHeaderBadge = headerLayout.badgeRect;
+        const int titleW = headerLayout.titleWidthPx;
+        const int headerMetaX = headerLayout.metaX;
+        const int headerMetaActualW = headerLayout.metaWidth;
 
         const std::wstring versionText = Utf8ToWide(std::string("v") + MICMIX_VERSION + "  by dabinuss");
 
-        CreateWindowW(L"STATIC", L"MicMix", WS_CHILD | WS_VISIBLE, titleX, titleY, titleW, titleH, hwnd, reinterpret_cast<HMENU>(IDC_TITLE), nullptr, nullptr);
+        CreateWindowW(L"STATIC", kEffectsHeaderTitle, WS_CHILD | WS_VISIBLE, titleX, titleY, titleW, titleH, hwnd, reinterpret_cast<HMENU>(IDC_TITLE), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"Configure MicMix Effects and route VST chains for music and mic", WS_CHILD | WS_VISIBLE, contentLeft, S(43), headerMetaX - contentLeft - S(8), S(24), hwnd, reinterpret_cast<HMENU>(IDC_SUBTITLE), nullptr, nullptr);
-        CreateWindowW(L"STATIC", versionText.c_str(), WS_CHILD | WS_VISIBLE | SS_RIGHT, headerMetaX, S(18), headerMetaW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_VERSION), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"github.com/dabinuss/MicMix", WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_NOTIFY, headerMetaX, S(36), headerMetaW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_REPO_LINK), nullptr, nullptr);
+        CreateWindowW(L"STATIC", versionText.c_str(), WS_CHILD | WS_VISIBLE | SS_RIGHT, headerMetaX, S(18), headerMetaActualW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_VERSION), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"github.com/dabinuss/MicMix", WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_NOTIFY, headerMetaX, S(36), headerMetaActualW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_REPO_LINK), nullptr, nullptr);
 
         const int topLeft = g_rcTop.left + S(kCardInnerPaddingPx);
-        const int topY = g_rcTop.top + S(kCardInnerPaddingPx);
+        const int topY = g_rcTop.top + S(kUiTopCardPrimaryRowOffsetYpx);
         CreateWindowW(L"BUTTON", L"Enable Effects", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, topLeft, topY, actionButtonW, S(34), hwnd, reinterpret_cast<HMENU>(IDC_ENABLE_EFFECTS), nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Disable Effects", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, topLeft + actionButtonW + controlGap, topY, actionButtonW, S(34), hwnd, reinterpret_cast<HMENU>(IDC_DISABLE_EFFECTS), nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"Monitor Mix: Off", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, topLeft + (actionButtonW + controlGap) * 2, topY, monitorButtonW, S(34), hwnd, reinterpret_cast<HMENU>(IDC_MONITOR), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"VST Host autostart", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP, topLeft + (actionButtonW + controlGap) * 2 + monitorButtonW + controlGap, topY + S(8), autostartCheckboxW, S(20), hwnd, reinterpret_cast<HMENU>(IDC_VST_AUTOSTART), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Shared with MicMix monitor path", WS_CHILD | WS_VISIBLE, topLeft + (actionButtonW + controlGap) * 2, topY + S(38), S(220), S(18), hwnd, reinterpret_cast<HMENU>(IDC_MONITOR_HINT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Shared with MicMix monitor path", WS_CHILD | WS_VISIBLE, topLeft + (actionButtonW + controlGap) * 2, topY + S(kUiTopCardHintOffsetYpx), S(220), S(18), hwnd, reinterpret_cast<HMENU>(IDC_MONITOR_HINT), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"VST Host autostart", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, topLeft, g_rcTop.top + S(kUiTopCardCheckboxOffsetYpx), autostartCheckboxW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_VST_AUTOSTART), nullptr, nullptr);
 
         const int sectionLeft = g_rcMusic.left + S(kCardInnerPaddingPx);
         const int sectionTop = g_rcMusic.top + S(kCardInnerPaddingPx);
-        const int musicListTop = sectionTop + S(84);
-        CreateWindowW(L"STATIC", L"AUDIO SOURCE", WS_CHILD | WS_VISIBLE, sectionLeft, sectionTop, S(220), S(20), hwnd, reinterpret_cast<HMENU>(IDC_AUDIO_SECTION_TITLE), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Audio Meter", WS_CHILD | WS_VISIBLE, sectionLeft, sectionTop + S(34), S(120), S(20), hwnd, reinterpret_cast<HMENU>(IDC_AUDIO_METER_LABEL), nullptr, nullptr);
+        const int musicListTop = sectionTop + S(kUiSectionListTopOffsetYpx);
+        CreateWindowW(L"STATIC", L"Audio Meter", WS_CHILD | WS_VISIBLE, sectionLeft, sectionTop + S(kUiSectionMeterLabelOffsetYpx), S(120), S(24), hwnd, reinterpret_cast<HMENU>(IDC_AUDIO_METER_LABEL), nullptr, nullptr);
         CreateWindowW(L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
             sectionLeft, musicListTop, S(458), S(90), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_LIST), nullptr, nullptr);
         const int musicBtnX = sectionLeft + S(468);
@@ -1078,9 +807,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         const int micLeft = g_rcMic.left + S(kCardInnerPaddingPx);
         const int micTop = g_rcMic.top + S(kCardInnerPaddingPx);
-        const int micListTop = micTop + S(84);
-        CreateWindowW(L"STATIC", L"MIC SOURCE", WS_CHILD | WS_VISIBLE, micLeft, micTop, S(220), S(20), hwnd, reinterpret_cast<HMENU>(IDC_MIC_SECTION_TITLE), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Mic Meter", WS_CHILD | WS_VISIBLE, micLeft, micTop + S(34), S(120), S(20), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_LABEL), nullptr, nullptr);
+        const int micListTop = micTop + S(kUiSectionListTopOffsetYpx);
+        CreateWindowW(L"STATIC", L"Mic Meter", WS_CHILD | WS_VISIBLE, micLeft, micTop + S(kUiSectionMeterLabelOffsetYpx), S(120), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_LABEL), nullptr, nullptr);
         CreateWindowW(L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
             micLeft, micListTop, S(458), S(90), hwnd, reinterpret_cast<HMENU>(IDC_MIC_LIST), nullptr, nullptr);
         const int micBtnX = micLeft + S(468);
@@ -1120,6 +848,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         if (dis->CtlID == IDC_MUSIC_LIST || dis->CtlID == IDC_MIC_LIST) {
             DrawEffectListItem(dis);
+            return TRUE;
+        }
+        if (dis->CtlID == IDC_VST_AUTOSTART) {
+            DrawOwnerCheckbox(dis);
             return TRUE;
         }
         break;
@@ -1171,7 +903,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_VST_AUTOSTART:
             if (HIWORD(wParam) == BN_CLICKED) {
                 MicMixSettings settings = MicMixApp::Instance().GetSettings();
-                const bool autostartEnabled = GetCheckboxValue(hwnd, IDC_VST_AUTOSTART);
+                g_ownerVstAutostartChecked = !g_ownerVstAutostartChecked;
+                InvalidateRect(GetDlgItem(hwnd, IDC_VST_AUTOSTART), nullptr, TRUE);
+                const bool autostartEnabled = g_ownerVstAutostartChecked;
                 if (settings.vstHostAutostart != autostartEnabled) {
                     settings.vstHostAutostart = autostartEnabled;
                     MicMixApp::Instance().ApplySettings(settings, false, true);
@@ -1261,8 +995,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const int id = GetDlgCtrlID(ctl);
         if (id == IDC_TITLE) {
             SetTextColor(hdc, g_theme.text);
-        } else if (id == IDC_SUBTITLE || id == IDC_VERSION || id == IDC_MONITOR_HINT ||
-                   id == IDC_AUDIO_SECTION_TITLE || id == IDC_MIC_SECTION_TITLE) {
+        } else if (id == IDC_SUBTITLE || id == IDC_VERSION || id == IDC_MONITOR_HINT) {
             SetTextColor(hdc, g_theme.muted);
         } else if (id == IDC_REPO_LINK) {
             SetTextColor(hdc, RGB(25, 100, 200));
@@ -1289,15 +1022,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         DrawFlatCardFrame(dc, g_rcMic, g_brushCard, g_theme.border);
         DrawFlatCardFrame(dc, g_rcStatus, g_brushCard, g_theme.border);
         DrawLevelMeter(dc, g_rcMusicMeter, g_lastMusicMeterActive, g_musicMeterVisualDb, g_musicMeterHoldDb);
-        DrawClipStrip(dc, g_rcMusicClip, ClipDangerUnitFromDb((g_lastTelemetry.musicSendPeakDbfs > -119.0f) ? g_lastTelemetry.musicSendPeakDbfs : g_lastTelemetry.musicPeakDbfs), g_lastTelemetry.sourceClipRecent);
+        DrawClipStrip(dc, g_rcMusicClip, ::ClipDangerUnitFromDb((g_lastTelemetry.musicSendPeakDbfs > -119.0f) ? g_lastTelemetry.musicSendPeakDbfs : g_lastTelemetry.musicPeakDbfs), g_lastTelemetry.sourceClipRecent);
         DrawLevelMeter(dc, g_rcMicMeter, g_lastMicMeterActive, g_micMeterVisualDb, g_micMeterHoldDb);
-        DrawClipStrip(dc, g_rcMicClip, ClipDangerUnitFromDb(g_lastTelemetry.micPeakDbfs), g_lastTelemetry.micClipRecent);
+        DrawClipStrip(dc, g_rcMicClip, ::ClipDangerUnitFromDb(g_lastTelemetry.micPeakDbfs), g_lastTelemetry.micClipRecent);
         DrawHeaderBadge(
             dc,
             g_rcHeaderBadge,
-            GetHeaderBadgeVisual(ResolveBadgeState()),
+            GetHeaderBadgeVisual(g_headerBadgeState),
             g_fontSmall,
             g_fontBody,
+            g_dpi);
+        const SectionHeading sectionHeadings[] = {
+            { g_rcTop, kEffectsSectionTopTitle },
+            { g_rcMusic, kEffectsSectionMusicTitle },
+            { g_rcMic, kEffectsSectionMicTitle },
+        };
+        DrawSectionHeadings(
+            dc,
+            sectionHeadings,
+            static_cast<int>(std::size(sectionHeadings)),
+            g_fontSmall,
+            g_fontBody,
+            g_theme.muted,
             g_dpi);
 
         EndPaint(hwnd, &ps);
@@ -1319,7 +1065,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 void WindowThreadMain() {
-    HINSTANCE hInst = GetPluginModuleHandle();
+    HINSTANCE hInst = ResolveModuleHandleFromAddress(reinterpret_cast<const void*>(&WindowThreadMain));
     INITCOMMONCONTROLSEX icc{};
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES | ICC_LISTVIEW_CLASSES;
