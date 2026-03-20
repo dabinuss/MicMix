@@ -640,6 +640,8 @@ uint64_t Fnv1a64(const std::string& text) {
     return hash;
 }
 
+std::string GenerateHexToken(size_t byteCount);
+
 std::string BuildEffectUid(const std::string& normalizedPath) {
     std::string folded = normalizedPath;
     std::transform(folded.begin(), folded.end(), folded.begin(), [](char ch) {
@@ -648,6 +650,54 @@ std::string BuildEffectUid(const std::string& normalizedPath) {
     std::ostringstream ss;
     ss << "mmx_" << std::hex << std::nouppercase << Fnv1a64(folded);
     return ss.str();
+}
+
+std::string BuildEffectUidWithSuffix(const std::string& normalizedPath, const std::string& suffix) {
+    const std::string base = BuildEffectUid(normalizedPath);
+    if (suffix.empty()) {
+        return base;
+    }
+    const std::string sep = "_";
+    if (base.size() + sep.size() + suffix.size() <= kMaxEffectUidLen) {
+        return base + sep + suffix;
+    }
+    const size_t suffixBudget = std::min(suffix.size(), kMaxEffectUidLen > 1U ? (kMaxEffectUidLen - 1U) : 0U);
+    const size_t baseBudget = (kMaxEffectUidLen > (1U + suffixBudget)) ? (kMaxEffectUidLen - 1U - suffixBudget) : 0U;
+    std::string out = base.substr(0, baseBudget);
+    out.push_back('_');
+    out.append(suffix.substr(0, suffixBudget));
+    return out;
+}
+
+template <typename ExistsFn>
+std::string BuildUniqueEffectUidWithExists(const std::string& normalizedPath, ExistsFn exists) {
+    const std::string baseUid = BuildEffectUid(normalizedPath);
+    if (!exists(baseUid)) {
+        return baseUid;
+    }
+
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        std::string token = GenerateHexToken(3);
+        if (token.empty()) {
+            std::ostringstream fallback;
+            fallback << std::hex << std::nouppercase << GetTickCount64() << attempt;
+            token = fallback.str();
+        }
+        const std::string candidate = BuildEffectUidWithSuffix(normalizedPath, token);
+        if (!exists(candidate)) {
+            return candidate;
+        }
+    }
+
+    for (uint64_t counter = 0; counter < 2048; ++counter) {
+        std::ostringstream ss;
+        ss << std::hex << std::nouppercase << counter;
+        const std::string candidate = BuildEffectUidWithSuffix(normalizedPath, ss.str());
+        if (!exists(candidate)) {
+            return candidate;
+        }
+    }
+    return BuildEffectUidWithSuffix(normalizedPath, "uniq");
 }
 
 std::string GenerateHexToken(size_t byteCount) {
@@ -990,6 +1040,7 @@ std::string BuildHostSyncPayload(const MicMixSettings& settings) {
     auto sanitizeChain = [](const std::vector<VstEffectSlot>& slots) {
         std::vector<VstEffectSlot> sanitized;
         sanitized.reserve(slots.size());
+        std::unordered_set<std::string> usedUids;
         for (const auto& slot : slots) {
             std::string normalizedPath;
             std::string pathError;
@@ -999,8 +1050,15 @@ std::string BuildHostSyncPayload(const MicMixSettings& settings) {
             VstEffectSlot safe = slot;
             safe.path = normalizedPath;
             if (safe.uid.empty()) {
-                safe.uid = BuildEffectUid(safe.path);
+                safe.uid = BuildUniqueEffectUidWithExists(
+                    safe.path,
+                    [&usedUids](const std::string& uid) { return usedUids.find(uid) != usedUids.end(); });
+            } else if (usedUids.find(safe.uid) != usedUids.end()) {
+                safe.uid = BuildUniqueEffectUidWithExists(
+                    safe.path,
+                    [&usedUids](const std::string& uid) { return usedUids.find(uid) != usedUids.end(); });
             }
+            usedUids.insert(safe.uid);
             sanitized.push_back(std::move(safe));
         }
         return sanitized;
@@ -3946,6 +4004,8 @@ void MicMixApp::SanitizeEffectList(std::vector<VstEffectSlot>& list) {
     if (list.size() > kMaxEffectsPerChain) {
         list.resize(kMaxEffectsPerChain);
     }
+    std::unordered_set<std::string> usedUids;
+    usedUids.reserve(list.size() * 2U);
     for (auto& slot : list) {
         StripConfigControlChars(slot.path, kMaxEffectPathLen);
         StripConfigControlChars(slot.name, kMaxEffectNameLen);
@@ -3957,10 +4017,20 @@ void MicMixApp::SanitizeEffectList(std::vector<VstEffectSlot>& list) {
             slot.name = WideToUtf8(p.stem().wstring());
         }
         if (slot.uid.empty() && !slot.path.empty()) {
-            slot.uid = BuildEffectUid(slot.path);
+            slot.uid = BuildUniqueEffectUidWithExists(
+                slot.path,
+                [&usedUids](const std::string& uid) { return usedUids.find(uid) != usedUids.end(); });
+        } else if (!slot.uid.empty() && usedUids.find(slot.uid) != usedUids.end()) {
+            const std::string uidSeed = !slot.path.empty() ? slot.path : slot.uid;
+            slot.uid = BuildUniqueEffectUidWithExists(
+                uidSeed,
+                [&usedUids](const std::string& uid) { return usedUids.find(uid) != usedUids.end(); });
         }
         if (slot.lastStatus.empty()) {
             slot.lastStatus = "pending";
+        }
+        if (!slot.uid.empty()) {
+            usedUids.insert(slot.uid);
         }
     }
     list.erase(std::remove_if(list.begin(), list.end(), [](const VstEffectSlot& slot) {
@@ -4665,7 +4735,6 @@ bool MicMixApp::AddEffect(EffectChain chain, const VstEffectSlot& slot, std::str
         return false;
     }
     safe.path = normalizedPath;
-    safe.uid = BuildEffectUid(safe.path);
     safe.lastStatus = "pending";
     MicMixSettings snapshot;
     {
@@ -4675,6 +4744,13 @@ bool MicMixApp::AddEffect(EffectChain chain, const VstEffectSlot& slot, std::str
             error = "effect limit reached";
             return false;
         }
+        safe.uid = BuildUniqueEffectUidWithExists(
+            safe.path,
+            [&list](const std::string& uid) {
+                return std::any_of(list.begin(), list.end(), [&uid](const VstEffectSlot& slot) {
+                    return slot.uid == uid;
+                });
+            });
         list.push_back(safe);
         SanitizeEffectList(list);
         UpdateAllSlotStatusesForUi(settings_, false);

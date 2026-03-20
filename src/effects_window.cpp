@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <exception>
@@ -21,6 +22,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "micmix_core.h"
@@ -149,6 +151,8 @@ uint64_t g_lastStatusSampleMs = 0;
 VstHostStatus g_cachedHostStatus{};
 size_t g_cachedMusicEffectsCount = 0;
 size_t g_cachedMicEffectsCount = 0;
+std::unordered_map<std::string, uint32_t> g_effectDisplayIdByUid;
+uint32_t g_nextEffectDisplayId = 1;
 
 enum class InlineAction {
     None = 0,
@@ -212,17 +216,15 @@ constexpr int kEffectsMicMeterTopOffsetPx = 66;
 constexpr int kEffectsMicClipTopOffsetPx = 96;
 constexpr int kEffectsAudioMeterLabelTopPx = 20;
 constexpr int kEffectsMicMeterLabelTopPx = 68;
-constexpr int kEffectsListWidthPx = 458;
-constexpr int kEffectsListHeightPx = 104;
-constexpr int kEffectsListButtonsLeftOffsetPx = 468;
+constexpr int kEffectsListHeightPx = 184;
+constexpr int kEffectsListColumnsGapPx = 12;
 constexpr int kEffectsListSectionTopOffsetPx = 10;
 constexpr int kEffectsListHeaderOffsetPx = 12;
 constexpr int kEffectsListTopOffsetPx = 30;
-constexpr int kEffectsListSpacingPx = 10;
-constexpr int kEffectsSecondListTopGapPx = 18;
-constexpr int kEffectsListButtonAddWidthPx = 86;
-constexpr int kEffectsListButtonSmallWidthPx = 40;
-constexpr int kEffectsListButtonSecondRowTopPx = 32;
+constexpr int kEffectsListButtonTopGapPx = 8;
+constexpr int kEffectsListButtonGapPx = 6;
+constexpr int kEffectsListButtonAddWidthPx = 122;
+constexpr int kEffectsListButtonSmallWidthPx = 82;
 constexpr uint64_t kEffectsStatusHeavySampleMs = 250;
 constexpr uint64_t kEffectsListInteractionHoldMs = 900;
 constexpr wchar_t kRepoUrl[] = L"https://github.com/dabinuss/MicMix";
@@ -283,12 +285,18 @@ void MarkListInteraction(EffectListUiState& state) {
 }
 
 std::wstring BuildIdText(const VstEffectSlot& slot, size_t index) {
+    (void)index;
     if (slot.uid.empty()) {
-        return L"ID " + std::to_wstring(index + 1);
+        return L"#000";
     }
-    const std::wstring uid = Utf8ToWide(slot.uid);
-    const size_t keep = std::min<size_t>(8, uid.size());
-    return L"ID " + uid.substr(0, keep);
+    auto it = g_effectDisplayIdByUid.find(slot.uid);
+    if (it == g_effectDisplayIdByUid.end()) {
+        const uint32_t next = std::max<uint32_t>(1U, g_nextEffectDisplayId++);
+        it = g_effectDisplayIdByUid.emplace(slot.uid, next).first;
+    }
+    wchar_t idBuf[16]{};
+    swprintf_s(idBuf, L"#%03u", static_cast<unsigned int>(it->second));
+    return idBuf;
 }
 
 std::wstring BuildDisplayName(const VstEffectSlot& slot) {
@@ -800,13 +808,16 @@ EffectRowLayout ComputeEffectRowLayout(const RECT& itemRect) {
     EffectRowLayout layout{};
     RECT inner = itemRect;
     InflateRect(&inner, -S(6), -S(4));
-    const int gap = S(6);
-    const int buttonH = S(20);
+    const bool compact = (inner.right - inner.left) <= S(320);
+    const int gap = S(compact ? 3 : 6);
+    const int buttonH = S(compact ? 17 : 20);
     const int buttonY = static_cast<int>(inner.top) + std::max(0, static_cast<int>(((inner.bottom - inner.top) - buttonH) / 2));
 
-    const int removeW = S(56);
-    const int bypassW = S(58);
-    const int enableW = S(58);
+    const int removeW = S(compact ? 22 : 56);
+    const int bypassW = S(compact ? 36 : 58);
+    const int enableW = S(compact ? 36 : 58);
+    const int handleW = S(compact ? 12 : 14);
+    const int idW = S(compact ? 30 : 78);
     int right = inner.right;
     layout.removeRect = { right - removeW, buttonY, right, buttonY + buttonH };
     right = layout.removeRect.left - gap;
@@ -814,9 +825,10 @@ EffectRowLayout ComputeEffectRowLayout(const RECT& itemRect) {
     right = layout.bypassRect.left - gap;
     layout.enableRect = { right - enableW, buttonY, right, buttonY + buttonH };
 
-    layout.handleRect = { inner.left, inner.top + S(4), inner.left + S(14), inner.bottom - S(4) };
-    layout.idRect = { layout.handleRect.right + gap, inner.top + S(3), layout.handleRect.right + gap + S(78), inner.bottom - S(3) };
-    const int textLeft = layout.idRect.right + gap;
+    layout.handleRect = { inner.left, inner.top + S(4), inner.left + handleW, inner.bottom - S(4) };
+    layout.idRect = { layout.handleRect.right + gap, inner.top + S(3), layout.handleRect.right + gap + idW, inner.bottom - S(3) };
+    const int idToNameGap = S(compact ? 1 : 6);
+    const int textLeft = layout.idRect.right + idToNameGap;
     const int textRight = std::max(textLeft, static_cast<int>(layout.enableRect.left - gap));
     const int midY = inner.top + ((inner.bottom - inner.top) / 2);
     layout.nameRect = { textLeft, inner.top, textRight, midY };
@@ -1170,6 +1182,7 @@ void DrawEffectListItem(const DRAWITEMSTRUCT* dis) {
         return;
     }
     const EffectRowView& row = ui.rows[dis->itemID];
+    const bool compactRow = (dis->rcItem.right - dis->rcItem.left) <= S(320);
     const bool selected = (dis->itemState & ODS_SELECTED) != 0;
     const bool focused = (dis->itemState & ODS_FOCUS) != 0;
     const bool draggingThis = ui.dragging && (static_cast<int>(dis->itemID) == ui.dragSource);
@@ -1191,25 +1204,17 @@ void DrawEffectListItem(const DRAWITEMSTRUCT* dis) {
 
     const EffectRowLayout layout = ComputeEffectRowLayout(rc);
 
-    HBRUSH idBrush = CreateSolidBrush(RGB(236, 241, 248));
-    HPEN idPen = CreatePen(PS_SOLID, 1, RGB(188, 202, 224));
-    HGDIOBJ oldBrush = SelectObject(dis->hDC, idBrush);
-    HGDIOBJ oldPen = SelectObject(dis->hDC, idPen);
-    RoundRect(dis->hDC, layout.idRect.left, layout.idRect.top, layout.idRect.right, layout.idRect.bottom, S(8), S(8));
-    SelectObject(dis->hDC, oldPen);
-    SelectObject(dis->hDC, oldBrush);
-    DeleteObject(idPen);
-    DeleteObject(idBrush);
-
     SetBkMode(dis->hDC, TRANSPARENT);
-    SetTextColor(dis->hDC, RGB(72, 84, 101));
+    SetTextColor(dis->hDC, RGB(92, 102, 118));
     SelectObject(dis->hDC, g_fontTiny ? g_fontTiny : g_fontSmall);
     RECT idTextRect = layout.idRect;
-    DrawTextW(dis->hDC, row.idText.c_str(), -1, &idTextRect, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS);
+    DrawTextW(dis->hDC, row.idText.c_str(), -1, &idTextRect, DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
 
-    const int dotW = S(4);
-    const int dotH = S(4);
-    const int dotGap = S(3);
+    const int handleW = std::max(1, static_cast<int>(layout.handleRect.right - layout.handleRect.left));
+    const bool compactHandle = handleW <= S(12);
+    const int dotW = S(compactHandle ? 3 : 4);
+    const int dotH = S(compactHandle ? 3 : 4);
+    const int dotGap = S(compactHandle ? 2 : 3);
     const int handleCenterY = layout.handleRect.top + ((layout.handleRect.bottom - layout.handleRect.top) / 2);
     const int firstDotY = handleCenterY - dotH - (dotGap / 2);
     for (int col = 0; col < 2; ++col) {
@@ -1232,8 +1237,13 @@ void DrawEffectListItem(const DRAWITEMSTRUCT* dis) {
     DrawTextW(dis->hDC, row.displayName.c_str(), -1, &nameRect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
     SetTextColor(dis->hDC, g_theme.muted);
     SelectObject(dis->hDC, g_fontTiny ? g_fontTiny : g_fontSmall);
+    std::wstring statusText = row.statusText;
+    if (compactRow) {
+        statusText = row.enabled ? L"ON" : L"OFF";
+        statusText += row.bypass ? L"  |  BYP ON" : L"  |  BYP OFF";
+    }
     RECT statusRect = layout.statusRect;
-    DrawTextW(dis->hDC, row.statusText.c_str(), -1, &statusRect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    DrawTextW(dis->hDC, statusText.c_str(), -1, &statusRect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
     const bool hoverEnable = (ui.hoverItem == static_cast<int>(dis->itemID) && ui.hoverAction == InlineAction::ToggleEnabled);
     const bool hoverBypass = (ui.hoverItem == static_cast<int>(dis->itemID) && ui.hoverAction == InlineAction::ToggleBypass);
@@ -1241,10 +1251,14 @@ void DrawEffectListItem(const DRAWITEMSTRUCT* dis) {
     const bool pressedEnable = (ui.pressedItem == static_cast<int>(dis->itemID) && ui.pressedAction == InlineAction::ToggleEnabled);
     const bool pressedBypass = (ui.pressedItem == static_cast<int>(dis->itemID) && ui.pressedAction == InlineAction::ToggleBypass);
     const bool pressedRemove = (ui.pressedItem == static_cast<int>(dis->itemID) && ui.pressedAction == InlineAction::Remove);
+    const wchar_t* enableLabel = row.enabled ? L"On" : L"Off";
+    const wchar_t* bypassLabel = L"Byp";
+    const wchar_t* removeLabel = compactRow ? L"X" : L"Remove";
+    HFONT buttonFont = compactRow ? (g_fontTiny ? g_fontTiny : g_fontSmall) : g_fontSmall;
 
-    DrawInlineButton(dis->hDC, layout.enableRect, row.enabled ? L"On" : L"Off", row.enabled, hoverEnable, pressedEnable, g_fontSmall);
-    DrawInlineButton(dis->hDC, layout.bypassRect, row.bypass ? L"Byp" : L"Act", row.bypass, hoverBypass, pressedBypass, g_fontSmall);
-    DrawInlineButton(dis->hDC, layout.removeRect, L"Remove", false, hoverRemove, pressedRemove, g_fontSmall);
+    DrawInlineButton(dis->hDC, layout.enableRect, enableLabel, row.enabled, hoverEnable, pressedEnable, buttonFont);
+    DrawInlineButton(dis->hDC, layout.bypassRect, bypassLabel, row.bypass, hoverBypass, pressedBypass, buttonFont);
+    DrawInlineButton(dis->hDC, layout.removeRect, removeLabel, false, hoverRemove, pressedRemove, buttonFont);
 
     const int count = static_cast<int>(ui.rows.size());
     if (ui.dragging && ui.dragInsertIndex >= 0) {
@@ -1477,6 +1491,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_cachedHostStatus = {};
         g_cachedMusicEffectsCount = 0;
         g_cachedMicEffectsCount = 0;
+        g_effectDisplayIdByUid.clear();
+        g_nextEffectDisplayId = 1;
         ResetListPointerState(g_musicListUi);
         ResetListPointerState(g_micListUi);
         g_musicListUi.rows.clear();
@@ -1541,51 +1557,56 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, meterStatusX, g_rcMicClip.top, meterStatusW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_CLIP_EVENTS), nullptr, nullptr);
 
         const int effectsLeft = g_rcMic.left + S(kCardInnerPaddingPx);
+        const int effectsRight = g_rcMic.right - S(kCardInnerPaddingPx);
         const int effectsTop = g_rcMic.top + S(kEffectsListSectionTopOffsetPx);
-        const int listW = S(kEffectsListWidthPx);
         const int listH = S(kEffectsListHeightPx);
-        const int audioEffectsLabelY = effectsTop + S(kEffectsListHeaderOffsetPx);
-        const int audioListTop = effectsTop + S(kEffectsListTopOffsetPx);
-        const int audioBtnX = effectsLeft + S(kEffectsListButtonsLeftOffsetPx);
-        CreateWindowW(L"STATIC", L"Audio Effects", WS_CHILD | WS_VISIBLE, effectsLeft, audioEffectsLabelY, S(160), S(20), hwnd, nullptr, nullptr, nullptr);
+        const int colGap = S(kEffectsListColumnsGapPx);
+        const int colW = std::max(S(220), ((effectsRight - effectsLeft) - colGap) / 2);
+        const int leftColX = effectsLeft;
+        const int rightColX = leftColX + colW + colGap;
+        const int effectsLabelY = effectsTop + S(kEffectsListHeaderOffsetPx);
+        const int listTop = effectsTop + S(kEffectsListTopOffsetPx);
+        const int buttonsTop = listTop + listH + S(kEffectsListButtonTopGapPx);
+        const int buttonGap = S(kEffectsListButtonGapPx);
+        const int addBtnW = S(kEffectsListButtonAddWidthPx);
+        const int smallBtnW = S(kEffectsListButtonSmallWidthPx);
+
+        CreateWindowW(L"STATIC", L"Audio Effects", WS_CHILD | WS_VISIBLE, leftColX, effectsLabelY, S(160), S(20), hwnd, nullptr, nullptr, nullptr);
         HWND musicList = CreateWindowW(
             L"LISTBOX",
             L"",
             WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
-            effectsLeft,
-            audioListTop,
-            listW,
+            leftColX,
+            listTop,
+            colW,
             listH,
             hwnd,
             reinterpret_cast<HMENU>(IDC_MUSIC_LIST),
             nullptr,
             nullptr);
-        CreateWindowW(L"BUTTON", L"Add", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, audioBtnX, audioListTop, S(kEffectsListButtonAddWidthPx), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_ADD), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, audioBtnX, audioListTop + S(kEffectsListButtonSecondRowTopPx), S(kEffectsListButtonSmallWidthPx), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_UP), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Down", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, audioBtnX + S(46), audioListTop + S(kEffectsListButtonSecondRowTopPx), S(kEffectsListButtonSmallWidthPx), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_DOWN), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Add", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, leftColX, buttonsTop, addBtnW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_ADD), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, leftColX + addBtnW + buttonGap, buttonsTop, smallBtnW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_UP), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Down", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, leftColX + addBtnW + buttonGap + smallBtnW + buttonGap, buttonsTop, smallBtnW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_DOWN), nullptr, nullptr);
         if (musicList) {
             SetWindowSubclass(musicList, EffectListSubclassProc, kMusicListSubclassId, static_cast<DWORD_PTR>(IDC_MUSIC_LIST));
         }
 
-        const int micEffectsLabelY = audioListTop + listH + S(kEffectsListSpacingPx);
-        const int micListTop = micEffectsLabelY + S(kEffectsSecondListTopGapPx);
-        const int micBtnX = effectsLeft + S(kEffectsListButtonsLeftOffsetPx);
-        CreateWindowW(L"STATIC", L"Mic Effects", WS_CHILD | WS_VISIBLE, effectsLeft, micEffectsLabelY, S(160), S(20), hwnd, nullptr, nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Mic Effects", WS_CHILD | WS_VISIBLE, rightColX, effectsLabelY, S(160), S(20), hwnd, nullptr, nullptr, nullptr);
         HWND micList = CreateWindowW(
             L"LISTBOX",
             L"",
             WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
-            effectsLeft,
-            micListTop,
-            listW,
+            rightColX,
+            listTop,
+            colW,
             listH,
             hwnd,
             reinterpret_cast<HMENU>(IDC_MIC_LIST),
             nullptr,
             nullptr);
-        CreateWindowW(L"BUTTON", L"Add", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX, micListTop, S(kEffectsListButtonAddWidthPx), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_ADD), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX, micListTop + S(kEffectsListButtonSecondRowTopPx), S(kEffectsListButtonSmallWidthPx), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_UP), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Down", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX + S(46), micListTop + S(kEffectsListButtonSecondRowTopPx), S(kEffectsListButtonSmallWidthPx), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_DOWN), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Add", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, rightColX, buttonsTop, addBtnW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_ADD), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, rightColX + addBtnW + buttonGap, buttonsTop, smallBtnW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_UP), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Down", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, rightColX + addBtnW + buttonGap + smallBtnW + buttonGap, buttonsTop, smallBtnW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_DOWN), nullptr, nullptr);
         if (micList) {
             SetWindowSubclass(micList, EffectListSubclassProc, kMicListSubclassId, static_cast<DWORD_PTR>(IDC_MIC_LIST));
         }
