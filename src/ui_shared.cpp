@@ -128,15 +128,16 @@ std::string WideToUtf8(const std::wstring& text) {
     return out;
 }
 
+namespace {
+void FillSolidRect(HDC hdc, const RECT& rc, COLORREF color);
+void DrawRectOutline(HDC hdc, const RECT& rc, COLORREF color);
+void DrawLine(HDC hdc, int x1, int y1, int x2, int y2, COLORREF color);
+void DrawRoundRectFilled(HDC hdc, const RECT& rc, int ellipseW, int ellipseH, COLORREF fill, COLORREF border);
+} // namespace
+
 void DrawFlatCardFrame(HDC dc, const RECT& rc, HBRUSH fillBrush, COLORREF borderColor) {
     FillRect(dc, &rc, fillBrush);
-    HPEN pen = CreatePen(PS_SOLID, 1, borderColor);
-    HGDIOBJ oldPen = SelectObject(dc, pen);
-    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
-    Rectangle(dc, rc.left, rc.top, rc.right, rc.bottom);
-    SelectObject(dc, oldBrush);
-    SelectObject(dc, oldPen);
-    DeleteObject(pen);
+    DrawRectOutline(dc, rc, borderColor);
 }
 
 void DrawHeaderBadge(
@@ -150,22 +151,13 @@ void DrawHeaderBadge(
         return;
     }
 
-    HPEN pen = CreatePen(PS_SOLID, 1, visual.border);
-    HBRUSH brush = CreateSolidBrush(visual.bg);
-    HGDIOBJ oldPen = SelectObject(dc, pen);
-    HGDIOBJ oldBrush = SelectObject(dc, brush);
-    RoundRect(
+    DrawRoundRectFilled(
         dc,
-        rc.left,
-        rc.top,
-        rc.right,
-        rc.bottom,
+        rc,
         ScaleByDpi(10, dpi),
-        ScaleByDpi(10, dpi));
-    SelectObject(dc, oldBrush);
-    SelectObject(dc, oldPen);
-    DeleteObject(brush);
-    DeleteObject(pen);
+        ScaleByDpi(10, dpi),
+        visual.bg,
+        visual.border);
 
     const int dotSize = ScaleByDpi(6, dpi);
     const int dotInsetX = ScaleByDpi(8, dpi);
@@ -177,15 +169,19 @@ void DrawHeaderBadge(
         dotY + dotSize
     };
 
-    HPEN dotPen = CreatePen(PS_SOLID, 1, visual.dot);
-    HBRUSH dotBrush = CreateSolidBrush(visual.dot);
-    HGDIOBJ oldDotPen = SelectObject(dc, dotPen);
-    HGDIOBJ oldDotBrush = SelectObject(dc, dotBrush);
+    const COLORREF oldDotPenColor = SetDCPenColor(dc, visual.dot);
+    const COLORREF oldDotBrushColor = SetDCBrushColor(dc, visual.dot);
+    HGDIOBJ oldDotPen = SelectObject(dc, GetStockObject(DC_PEN));
+    HGDIOBJ oldDotBrush = SelectObject(dc, GetStockObject(DC_BRUSH));
     Ellipse(dc, dotRc.left, dotRc.top, dotRc.right, dotRc.bottom);
     SelectObject(dc, oldDotBrush);
     SelectObject(dc, oldDotPen);
-    DeleteObject(dotBrush);
-    DeleteObject(dotPen);
+    if (oldDotBrushColor != CLR_INVALID) {
+        SetDCBrushColor(dc, oldDotBrushColor);
+    }
+    if (oldDotPenColor != CLR_INVALID) {
+        SetDCPenColor(dc, oldDotPenColor);
+    }
 
     RECT textRc = rc;
     textRc.left += ScaleByDpi(12, dpi);
@@ -271,10 +267,6 @@ void DrawSectionHeadings(
     SelectObject(dc, oldFont);
 }
 
-namespace {
-void FillSolidRect(HDC hdc, const RECT& rc, COLORREF color);
-}
-
 void DrawOwnerCheckboxShared(
     const DRAWITEMSTRUCT* dis,
     bool checked,
@@ -300,13 +292,7 @@ void DrawOwnerCheckboxShared(
 
     FillSolidRect(dis->hDC, box, RGB(252, 253, 255));
     const COLORREF borderColor = disabled ? GetSysColor(COLOR_GRAYTEXT) : GetSysColor(COLOR_BTNSHADOW);
-    HPEN border = CreatePen(PS_SOLID, 1, borderColor);
-    HGDIOBJ oldPen = SelectObject(dis->hDC, border);
-    HGDIOBJ oldBrush = SelectObject(dis->hDC, GetStockObject(HOLLOW_BRUSH));
-    Rectangle(dis->hDC, box.left, box.top, box.right, box.bottom);
-    SelectObject(dis->hDC, oldBrush);
-    SelectObject(dis->hDC, oldPen);
-    DeleteObject(border);
+    DrawRectOutline(dis->hDC, box, borderColor);
 
     if (checked) {
         HPEN markPen = CreatePen(PS_SOLID, std::max(1, ScaleByDpi(2, dpi)), disabled ? RGB(130, 136, 148) : RGB(54, 68, 92));
@@ -351,9 +337,58 @@ int ClipLitSegmentsFromDb(float dbfs, int segments) {
 namespace {
 
 void FillSolidRect(HDC hdc, const RECT& rc, COLORREF color) {
-    HBRUSH brush = CreateSolidBrush(color);
-    FillRect(hdc, &rc, brush);
-    DeleteObject(brush);
+    const COLORREF oldColor = SetDCBrushColor(hdc, color);
+    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(DC_BRUSH));
+    FillRect(hdc, &rc, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+    SelectObject(hdc, oldBrush);
+    if (oldColor != CLR_INVALID) {
+        SetDCBrushColor(hdc, oldColor);
+    }
+}
+
+void DrawRectOutline(HDC hdc, const RECT& rc, COLORREF color) {
+    const COLORREF oldPenColor = SetDCPenColor(hdc, color);
+    HGDIOBJ oldPen = SelectObject(hdc, GetStockObject(DC_PEN));
+    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
+    Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    if (oldPenColor != CLR_INVALID) {
+        SetDCPenColor(hdc, oldPenColor);
+    }
+}
+
+void DrawLine(HDC hdc, int x1, int y1, int x2, int y2, COLORREF color) {
+    const COLORREF oldPenColor = SetDCPenColor(hdc, color);
+    HGDIOBJ oldPen = SelectObject(hdc, GetStockObject(DC_PEN));
+    MoveToEx(hdc, x1, y1, nullptr);
+    LineTo(hdc, x2, y2);
+    SelectObject(hdc, oldPen);
+    if (oldPenColor != CLR_INVALID) {
+        SetDCPenColor(hdc, oldPenColor);
+    }
+}
+
+void DrawRoundRectFilled(
+    HDC hdc,
+    const RECT& rc,
+    int ellipseW,
+    int ellipseH,
+    COLORREF fill,
+    COLORREF border) {
+    const COLORREF oldPenColor = SetDCPenColor(hdc, border);
+    const COLORREF oldBrushColor = SetDCBrushColor(hdc, fill);
+    HGDIOBJ oldPen = SelectObject(hdc, GetStockObject(DC_PEN));
+    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(DC_BRUSH));
+    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, ellipseW, ellipseH);
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    if (oldBrushColor != CLR_INVALID) {
+        SetDCBrushColor(hdc, oldBrushColor);
+    }
+    if (oldPenColor != CLR_INVALID) {
+        SetDCPenColor(hdc, oldPenColor);
+    }
 }
 
 } // namespace
@@ -436,12 +471,7 @@ void DrawLevelMeterShared(
             : (db == -12 || db == 0)
             ? RGB(198, 130, 124)
             : RGB(206, 214, 225);
-        HPEN guidePen = CreatePen(PS_SOLID, 1, guideColor);
-        HGDIOBJ oldGuidePen = SelectObject(drawDc, guidePen);
-        MoveToEx(drawDc, x, barRc.top, nullptr);
-        LineTo(drawDc, x, barRc.bottom);
-        SelectObject(drawDc, oldGuidePen);
-        DeleteObject(guidePen);
+        DrawLine(drawDc, x, barRc.top, x, barRc.bottom, guideColor);
 
         RECT tickRc{ x, scaleRc.bottom - ScaleByDpi(3, dpi), x + 1, scaleRc.bottom };
         FillSolidRect(drawDc, tickRc, RGB(162, 171, 184));
@@ -487,21 +517,10 @@ void DrawLevelMeterShared(
             if (seg.right > seg.left) FillSolidRect(drawDc, seg, RGB(214, 75, 63));
         }
 
-        HPEN holdPen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
-        HGDIOBJ oldPen = SelectObject(drawDc, holdPen);
-        MoveToEx(drawDc, barRc.left + holdPx, barRc.top, nullptr);
-        LineTo(drawDc, barRc.left + holdPx, barRc.bottom);
-        SelectObject(drawDc, oldPen);
-        DeleteObject(holdPen);
+        DrawLine(drawDc, barRc.left + holdPx, barRc.top, barRc.left + holdPx, barRc.bottom, RGB(255, 255, 255));
     }
 
-    HPEN border = CreatePen(PS_SOLID, 1, RGB(184, 193, 207));
-    HGDIOBJ oldPen = SelectObject(drawDc, border);
-    HGDIOBJ oldBrush = SelectObject(drawDc, GetStockObject(HOLLOW_BRUSH));
-    Rectangle(drawDc, rc.left, rc.top, rc.right, rc.bottom);
-    SelectObject(drawDc, oldBrush);
-    SelectObject(drawDc, oldPen);
-    DeleteObject(border);
+    DrawRectOutline(drawDc, rc, RGB(184, 193, 207));
 
     if (buffered) {
         BitBlt(
@@ -590,13 +609,7 @@ void DrawClipStripShared(
         FillSolidRect(drawDc, seg, color);
     }
 
-    HPEN border = CreatePen(PS_SOLID, 1, clipRecent ? RGB(208, 72, 60) : RGB(188, 197, 210));
-    HGDIOBJ oldPen = SelectObject(drawDc, border);
-    HGDIOBJ oldBrush = SelectObject(drawDc, GetStockObject(HOLLOW_BRUSH));
-    Rectangle(drawDc, rc.left, rc.top, rc.right, rc.bottom);
-    SelectObject(drawDc, oldBrush);
-    SelectObject(drawDc, oldPen);
-    DeleteObject(border);
+    DrawRectOutline(drawDc, rc, clipRecent ? RGB(208, 72, 60) : RGB(188, 197, 210));
 
     SetBkMode(drawDc, TRANSPARENT);
     SetTextColor(drawDc, clipRecent ? RGB(132, 24, 24) : RGB(112, 120, 132));

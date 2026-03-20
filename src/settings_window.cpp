@@ -1215,9 +1215,13 @@ void DrawCard(HDC hdc, const RECT& rc) {
 }
 
 void FillSolidRect(HDC hdc, const RECT& rc, COLORREF color) {
-    HBRUSH b = CreateSolidBrush(color);
-    FillRect(hdc, &rc, b);
-    DeleteObject(b);
+    const COLORREF oldColor = SetDCBrushColor(hdc, color);
+    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(DC_BRUSH));
+    FillRect(hdc, &rc, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+    SelectObject(hdc, oldBrush);
+    if (oldColor != CLR_INVALID) {
+        SetDCBrushColor(hdc, oldColor);
+    }
 }
 
 void DrawHeaderStatusBadge(HDC hdc) {
@@ -1271,13 +1275,15 @@ LRESULT DrawGainSliderCustom(const NMCUSTOMDRAW* cd) {
         RECT thumb = rc;
         FillSolidRect(cd->hdc, thumb, RGB(245, 248, 252));
         const COLORREF borderColor = GetSysColor(COLOR_BTNSHADOW);
-        HPEN border = CreatePen(PS_SOLID, 1, borderColor);
-        HGDIOBJ oldPen = SelectObject(cd->hdc, border);
+        const COLORREF oldPenColor = SetDCPenColor(cd->hdc, borderColor);
+        HGDIOBJ oldPen = SelectObject(cd->hdc, GetStockObject(DC_PEN));
         HGDIOBJ oldBrush = SelectObject(cd->hdc, GetStockObject(HOLLOW_BRUSH));
         Rectangle(cd->hdc, thumb.left, thumb.top, thumb.right, thumb.bottom);
         SelectObject(cd->hdc, oldBrush);
         SelectObject(cd->hdc, oldPen);
-        DeleteObject(border);
+        if (oldPenColor != CLR_INVALID) {
+            SetDCPenColor(cd->hdc, oldPenColor);
+        }
         return CDRF_SKIPDEFAULT;
     }
     return CDRF_DODEFAULT;

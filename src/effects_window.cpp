@@ -143,6 +143,12 @@ std::wstring g_lastMusicMeterText;
 std::wstring g_lastMicMeterText;
 std::wstring g_lastMusicClipEventsText;
 std::wstring g_lastMicClipEventsText;
+bool g_windowTitleStateValid = false;
+bool g_windowTitleEffectsEnabled = false;
+uint64_t g_lastStatusSampleMs = 0;
+VstHostStatus g_cachedHostStatus{};
+size_t g_cachedMusicEffectsCount = 0;
+size_t g_cachedMicEffectsCount = 0;
 
 enum class InlineAction {
     None = 0,
@@ -180,6 +186,7 @@ struct EffectListUiState {
     int dragSource = -1;
     int dragInsertIndex = -1;
     POINT dragStart{ 0, 0 };
+    uint64_t lastInteractionMs = 0;
 };
 
 EffectListUiState g_musicListUi{};
@@ -193,6 +200,31 @@ constexpr int kCardInnerPaddingPx = kUiCardInnerPaddingPx;
 constexpr UINT kTimerStatus = 1;
 constexpr UINT kTimerMs = 40;
 constexpr int kListItemHeightPx = 34;
+constexpr int kEffectsTopCardHeightPx = 128;
+constexpr int kEffectsMetersCardHeightPx = 146;
+constexpr int kEffectsListsCardHeightPx = 282;
+constexpr int kEffectsStatusCardHeightPx = 84;
+constexpr int kEffectsMeterSectionTopOffsetPx = 10;
+constexpr int kEffectsMeterLeftOffsetPx = 144;
+constexpr int kEffectsMusicMeterTopOffsetPx = 18;
+constexpr int kEffectsMusicClipTopOffsetPx = 48;
+constexpr int kEffectsMicMeterTopOffsetPx = 66;
+constexpr int kEffectsMicClipTopOffsetPx = 96;
+constexpr int kEffectsAudioMeterLabelTopPx = 20;
+constexpr int kEffectsMicMeterLabelTopPx = 68;
+constexpr int kEffectsListWidthPx = 458;
+constexpr int kEffectsListHeightPx = 104;
+constexpr int kEffectsListButtonsLeftOffsetPx = 468;
+constexpr int kEffectsListSectionTopOffsetPx = 10;
+constexpr int kEffectsListHeaderOffsetPx = 12;
+constexpr int kEffectsListTopOffsetPx = 30;
+constexpr int kEffectsListSpacingPx = 10;
+constexpr int kEffectsSecondListTopGapPx = 18;
+constexpr int kEffectsListButtonAddWidthPx = 86;
+constexpr int kEffectsListButtonSmallWidthPx = 40;
+constexpr int kEffectsListButtonSecondRowTopPx = 32;
+constexpr uint64_t kEffectsStatusHeavySampleMs = 250;
+constexpr uint64_t kEffectsListInteractionHoldMs = 900;
 constexpr wchar_t kRepoUrl[] = L"https://github.com/dabinuss/MicMix";
 constexpr wchar_t kEffectsHeaderTitle[] = L"MicMix - Audio Effects";
 constexpr wchar_t kEffectsSectionTopTitle[] = L"EFFECTS SETTINGS";
@@ -224,10 +256,6 @@ bool IsHandCursorControlId(int id) {
     }
 }
 
-bool IsEffectListId(int id) {
-    return id == IDC_MUSIC_LIST || id == IDC_MIC_LIST;
-}
-
 EffectChain ChainFromListId(int listId) {
     return (listId == IDC_MIC_LIST) ? EffectChain::Mic : EffectChain::Music;
 }
@@ -247,6 +275,11 @@ void ResetListPointerState(EffectListUiState& state) {
     state.dragSource = -1;
     state.dragInsertIndex = -1;
     state.dragStart = { 0, 0 };
+    state.lastInteractionMs = 0;
+}
+
+void MarkListInteraction(EffectListUiState& state) {
+    state.lastInteractionMs = GetTickCount64();
 }
 
 std::wstring BuildIdText(const VstEffectSlot& slot, size_t index) {
@@ -286,8 +319,13 @@ bool AnyListDragging() {
 }
 
 bool IsListInteracting(HWND hwnd) {
+    const uint64_t nowMs = GetTickCount64();
     HWND focus = GetFocus();
     if (focus && (focus == GetDlgItem(hwnd, IDC_MUSIC_LIST) || focus == GetDlgItem(hwnd, IDC_MIC_LIST))) {
+        return true;
+    }
+    if ((nowMs <= (g_musicListUi.lastInteractionMs + kEffectsListInteractionHoldMs)) ||
+        (nowMs <= (g_micListUi.lastInteractionMs + kEffectsListInteractionHoldMs))) {
         return true;
     }
     return AnyListDragging();
@@ -321,6 +359,18 @@ void SetStatusText(HWND hwnd, const std::wstring& text, uint64_t holdMs = 0) {
 void SetTransientStatusText(HWND hwnd, const std::wstring& text) {
     constexpr uint64_t kStatusHoldMs = 2400ULL;
     SetStatusText(hwnd, text, kStatusHoldMs);
+}
+
+void UpdateWindowTitleState(HWND hwnd, bool effectsEnabled) {
+    if (!hwnd) {
+        return;
+    }
+    if (g_windowTitleStateValid && g_windowTitleEffectsEnabled == effectsEnabled) {
+        return;
+    }
+    g_windowTitleStateValid = true;
+    g_windowTitleEffectsEnabled = effectsEnabled;
+    SetWindowTextW(hwnd, effectsEnabled ? L"MicMix Effects - ACTIVE" : L"MicMix Effects - OFF");
 }
 
 HeaderBadgeState ResolveBadgeState() {
@@ -367,13 +417,13 @@ void ComputeLayout(HWND hwnd) {
     const int right = S(kClientWidthPx - kCardMarginPx);
     const int cardW = right - left;
     const int topY = S(kUiTopCardYpx);
-    const int topH = S(128);
+    const int topH = S(kEffectsTopCardHeightPx);
     const int musicY = topY + topH + S(kCardGapPx);
-    const int musicH = S(146);  // Shared meter card (audio + mic)
+    const int musicH = S(kEffectsMetersCardHeightPx);
     const int micY = musicY + musicH + S(kCardGapPx);
-    const int micH = S(282);    // Shared effects card (audio list + mic list)
+    const int micH = S(kEffectsListsCardHeightPx);
     const int statusY = micY + micH + S(kCardGapPx);
-    const int statusH = S(84);
+    const int statusH = S(kEffectsStatusCardHeightPx);
     g_rcTop = { left, topY, left + cardW, topY + topH };
     g_rcMusic = { left, musicY, left + cardW, musicY + musicH };
     g_rcMic = { left, micY, left + cardW, micY + micH };
@@ -381,13 +431,13 @@ void ComputeLayout(HWND hwnd) {
 
     const int meterWidth = S(340);
     const int sectionPad = S(kCardInnerPaddingPx);
-    const int meterSectionTop = g_rcMusic.top + S(10);
+    const int meterSectionTop = g_rcMusic.top + S(kEffectsMeterSectionTopOffsetPx);
     const int meterSectionLeft = g_rcMusic.left + sectionPad;
-    const int meterLeft = meterSectionLeft + S(144);
-    g_rcMusicMeter = { meterLeft, meterSectionTop + S(18), meterLeft + meterWidth, meterSectionTop + S(18) + S(28) };
-    g_rcMusicClip = { meterLeft, meterSectionTop + S(48), meterLeft + meterWidth, meterSectionTop + S(48) + S(12) };
-    g_rcMicMeter = { meterLeft, meterSectionTop + S(66), meterLeft + meterWidth, meterSectionTop + S(66) + S(28) };
-    g_rcMicClip = { meterLeft, meterSectionTop + S(96), meterLeft + meterWidth, meterSectionTop + S(96) + S(12) };
+    const int meterLeft = meterSectionLeft + S(kEffectsMeterLeftOffsetPx);
+    g_rcMusicMeter = { meterLeft, meterSectionTop + S(kEffectsMusicMeterTopOffsetPx), meterLeft + meterWidth, meterSectionTop + S(kEffectsMusicMeterTopOffsetPx) + S(28) };
+    g_rcMusicClip = { meterLeft, meterSectionTop + S(kEffectsMusicClipTopOffsetPx), meterLeft + meterWidth, meterSectionTop + S(kEffectsMusicClipTopOffsetPx) + S(12) };
+    g_rcMicMeter = { meterLeft, meterSectionTop + S(kEffectsMicMeterTopOffsetPx), meterLeft + meterWidth, meterSectionTop + S(kEffectsMicMeterTopOffsetPx) + S(28) };
+    g_rcMicClip = { meterLeft, meterSectionTop + S(kEffectsMicClipTopOffsetPx), meterLeft + meterWidth, meterSectionTop + S(kEffectsMicClipTopOffsetPx) + S(12) };
 
     const int contentLeft = S(kCardMarginPx + kCardInnerPaddingPx);
     const int titleY = S(10);
@@ -513,9 +563,11 @@ void ApplyActionResult(HWND hwnd, bool ok, const std::string& error, const wchar
     if (ok) {
         SetTransientStatusText(hwnd, successText ? successText : L"Done.");
         ReloadAllLists(hwnd);
+        g_lastStatusSampleMs = 0;
         return;
     }
     SetTransientStatusText(hwnd, Utf8ToWide(error.empty() ? "Operation failed" : error));
+    g_lastStatusSampleMs = 0;
 }
 
 void SetStaticTextIfChanged(HWND ctl, std::wstring& cache, const std::wstring& nextText) {
@@ -679,13 +731,18 @@ void HandleOpenEditor(HWND hwnd, EffectChain chain, int listId) {
     }).detach();
 }
 
-void RefreshStatus(HWND hwnd) {
+void RefreshStatus(HWND hwnd, bool force) {
     const MicMixSettings settings = MicMixApp::Instance().GetSettings();
     const bool effectsEnabled = settings.vstEffectsEnabled;
     const bool hostAutostart = settings.vstHostAutostart;
-    const VstHostStatus host = MicMixApp::Instance().GetVstHostStatus();
-    const auto music = MicMixApp::Instance().GetEffects(EffectChain::Music);
-    const auto mic = MicMixApp::Instance().GetEffects(EffectChain::Mic);
+    const uint64_t nowMs = GetTickCount64();
+    if (force || nowMs >= (g_lastStatusSampleMs + kEffectsStatusHeavySampleMs)) {
+        g_cachedHostStatus = MicMixApp::Instance().GetVstHostStatus();
+        g_cachedMusicEffectsCount = MicMixApp::Instance().GetEffects(EffectChain::Music).size();
+        g_cachedMicEffectsCount = MicMixApp::Instance().GetEffects(EffectChain::Mic).size();
+        g_lastStatusSampleMs = nowMs;
+    }
+    const VstHostStatus& host = g_cachedHostStatus;
     std::wstring line1 = L"Effects: ";
     line1 += effectsEnabled ? L"On" : L"Off";
     line1 += L"  |  Host: ";
@@ -693,13 +750,12 @@ void RefreshStatus(HWND hwnd) {
     if (host.pid != 0) {
         line1 += L" (pid=" + std::to_wstring(host.pid) + L")";
     }
-    std::wstring line2 = L"Music plugins=" + std::to_wstring(music.size()) +
-                         L"  |  Mic plugins=" + std::to_wstring(mic.size()) +
+    std::wstring line2 = L"Music plugins=" + std::to_wstring(g_cachedMusicEffectsCount) +
+                         L"  |  Mic plugins=" + std::to_wstring(g_cachedMicEffectsCount) +
                          L"  |  Monitor=" + std::wstring(MicMixApp::Instance().IsMonitorEnabled() ? L"On" : L"Off") +
                          L"  |  Host autostart=" + std::wstring(hostAutostart ? L"On" : L"Off");
     std::wstring line3 = Utf8ToWide(host.message.empty() ? "host_status=idle" : ("host_status=" + host.message));
     const uint64_t holdUntil = g_statusHoldUntilMs.load(std::memory_order_acquire);
-    const uint64_t nowMs = GetTickCount64();
     if (holdUntil == 0 || nowMs >= holdUntil) {
         SetStatusText(hwnd, line1 + L"\r\n" + line2 + L"\r\n" + line3);
     }
@@ -709,7 +765,7 @@ void RefreshStatus(HWND hwnd) {
         g_headerBadgeStateValid = true;
         InvalidateRect(hwnd, &g_rcHeaderBadge, FALSE);
     }
-    SetWindowTextW(hwnd, effectsEnabled ? L"MicMix Effects - ACTIVE" : L"MicMix Effects - OFF");
+    UpdateWindowTitleState(hwnd, effectsEnabled);
     if (g_ownerVstAutostartChecked != hostAutostart) {
         g_ownerVstAutostartChecked = hostAutostart;
         InvalidateRect(GetDlgItem(hwnd, IDC_VST_AUTOSTART), nullptr, TRUE);
@@ -916,6 +972,12 @@ LRESULT CALLBACK EffectListSubclassProc(
     HWND parent = GetParent(list);
 
     switch (msg) {
+    case WM_SETFOCUS:
+    case WM_MOUSEWHEEL:
+    case WM_VSCROLL:
+    case WM_KEYDOWN:
+        MarkListInteraction(ui);
+        break;
     case WM_MOUSELEAVE: {
         const int oldHoverItem = ui.hoverItem;
         ui.trackingMouse = false;
@@ -925,6 +987,7 @@ LRESULT CALLBACK EffectListSubclassProc(
         return 0;
     }
     case WM_MOUSEMOVE: {
+        MarkListInteraction(ui);
         POINT pt{
             static_cast<int>(static_cast<short>(LOWORD(lParam))),
             static_cast<int>(static_cast<short>(HIWORD(lParam)))
@@ -985,6 +1048,7 @@ LRESULT CALLBACK EffectListSubclassProc(
         break;
     }
     case WM_LBUTTONDOWN: {
+        MarkListInteraction(ui);
         POINT pt{
             static_cast<int>(static_cast<short>(LOWORD(lParam))),
             static_cast<int>(static_cast<short>(HIWORD(lParam)))
@@ -1013,6 +1077,7 @@ LRESULT CALLBACK EffectListSubclassProc(
         break;
     }
     case WM_LBUTTONUP: {
+        MarkListInteraction(ui);
         POINT pt{
             static_cast<int>(static_cast<short>(LOWORD(lParam))),
             static_cast<int>(static_cast<short>(HIWORD(lParam)))
@@ -1062,6 +1127,7 @@ LRESULT CALLBACK EffectListSubclassProc(
         break;
     }
     case WM_CAPTURECHANGED:
+        MarkListInteraction(ui);
         InvalidateListItem(list, ui.pressedItem);
         InvalidateInsertMarker(list, ui.dragInsertIndex);
         ui.pressedItem = -1;
@@ -1405,6 +1471,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_lastMicMeterText.clear();
         g_lastMusicClipEventsText.clear();
         g_lastMicClipEventsText.clear();
+        g_windowTitleStateValid = false;
+        g_windowTitleEffectsEnabled = false;
+        g_lastStatusSampleMs = 0;
+        g_cachedHostStatus = {};
+        g_cachedMusicEffectsCount = 0;
+        g_cachedMicEffectsCount = 0;
         ResetListPointerState(g_musicListUi);
         ResetListPointerState(g_micListUi);
         g_musicListUi.rows.clear();
@@ -1458,23 +1530,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         CreateWindowW(L"BUTTON", L"VST Host autostart", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, topLeft, g_rcTop.top + S(kUiTopCardCheckboxOffsetYpx), autostartCheckboxW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_VST_AUTOSTART), nullptr, nullptr);
 
         const int meterLeft = g_rcMusic.left + S(kCardInnerPaddingPx);
-        const int meterTop = g_rcMusic.top + S(10);
+        const int meterTop = g_rcMusic.top + S(kEffectsMeterSectionTopOffsetPx);
         const int meterStatusX = g_rcMusicMeter.right + S(4);
         const int meterStatusW = std::max(0, static_cast<int>((g_rcMusic.right - S(kCardInnerPaddingPx)) - meterStatusX));
-        CreateWindowW(L"STATIC", L"Audio Meter", WS_CHILD | WS_VISIBLE, meterLeft, meterTop + S(20), S(130), S(24), hwnd, reinterpret_cast<HMENU>(IDC_AUDIO_METER_LABEL), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Audio Meter", WS_CHILD | WS_VISIBLE, meterLeft, meterTop + S(kEffectsAudioMeterLabelTopPx), S(130), S(24), hwnd, reinterpret_cast<HMENU>(IDC_AUDIO_METER_LABEL), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, meterStatusX, g_rcMusicMeter.top + S(2), meterStatusW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_AUDIO_METER_TEXT), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, meterStatusX, g_rcMusicClip.top, meterStatusW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_AUDIO_CLIP_EVENTS), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"Mic Meter", WS_CHILD | WS_VISIBLE, meterLeft, meterTop + S(68), S(130), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_LABEL), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Mic Meter", WS_CHILD | WS_VISIBLE, meterLeft, meterTop + S(kEffectsMicMeterLabelTopPx), S(130), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_LABEL), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, meterStatusX, g_rcMicMeter.top + S(2), meterStatusW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_TEXT), nullptr, nullptr);
         CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, meterStatusX, g_rcMicClip.top, meterStatusW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_CLIP_EVENTS), nullptr, nullptr);
 
         const int effectsLeft = g_rcMic.left + S(kCardInnerPaddingPx);
-        const int effectsTop = g_rcMic.top + S(10);
-        const int listW = S(458);
-        const int listH = S(104);
-        const int audioEffectsLabelY = effectsTop + S(12);
-        const int audioListTop = effectsTop + S(30);
-        const int audioBtnX = effectsLeft + S(468);
+        const int effectsTop = g_rcMic.top + S(kEffectsListSectionTopOffsetPx);
+        const int listW = S(kEffectsListWidthPx);
+        const int listH = S(kEffectsListHeightPx);
+        const int audioEffectsLabelY = effectsTop + S(kEffectsListHeaderOffsetPx);
+        const int audioListTop = effectsTop + S(kEffectsListTopOffsetPx);
+        const int audioBtnX = effectsLeft + S(kEffectsListButtonsLeftOffsetPx);
         CreateWindowW(L"STATIC", L"Audio Effects", WS_CHILD | WS_VISIBLE, effectsLeft, audioEffectsLabelY, S(160), S(20), hwnd, nullptr, nullptr, nullptr);
         HWND musicList = CreateWindowW(
             L"LISTBOX",
@@ -1488,16 +1560,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             reinterpret_cast<HMENU>(IDC_MUSIC_LIST),
             nullptr,
             nullptr);
-        CreateWindowW(L"BUTTON", L"Add", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, audioBtnX, audioListTop, S(86), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_ADD), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, audioBtnX, audioListTop + S(32), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_UP), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Down", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, audioBtnX + S(46), audioListTop + S(32), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_DOWN), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Add", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, audioBtnX, audioListTop, S(kEffectsListButtonAddWidthPx), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_ADD), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, audioBtnX, audioListTop + S(kEffectsListButtonSecondRowTopPx), S(kEffectsListButtonSmallWidthPx), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_UP), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Down", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, audioBtnX + S(46), audioListTop + S(kEffectsListButtonSecondRowTopPx), S(kEffectsListButtonSmallWidthPx), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_DOWN), nullptr, nullptr);
         if (musicList) {
             SetWindowSubclass(musicList, EffectListSubclassProc, kMusicListSubclassId, static_cast<DWORD_PTR>(IDC_MUSIC_LIST));
         }
 
-        const int micEffectsLabelY = audioListTop + listH + S(10);
-        const int micListTop = micEffectsLabelY + S(18);
-        const int micBtnX = effectsLeft + S(468);
+        const int micEffectsLabelY = audioListTop + listH + S(kEffectsListSpacingPx);
+        const int micListTop = micEffectsLabelY + S(kEffectsSecondListTopGapPx);
+        const int micBtnX = effectsLeft + S(kEffectsListButtonsLeftOffsetPx);
         CreateWindowW(L"STATIC", L"Mic Effects", WS_CHILD | WS_VISIBLE, effectsLeft, micEffectsLabelY, S(160), S(20), hwnd, nullptr, nullptr, nullptr);
         HWND micList = CreateWindowW(
             L"LISTBOX",
@@ -1511,9 +1583,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             reinterpret_cast<HMENU>(IDC_MIC_LIST),
             nullptr,
             nullptr);
-        CreateWindowW(L"BUTTON", L"Add", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX, micListTop, S(86), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_ADD), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX, micListTop + S(32), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_UP), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Down", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX + S(46), micListTop + S(32), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_DOWN), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Add", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX, micListTop, S(kEffectsListButtonAddWidthPx), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_ADD), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX, micListTop + S(kEffectsListButtonSecondRowTopPx), S(kEffectsListButtonSmallWidthPx), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_UP), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Down", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX + S(46), micListTop + S(kEffectsListButtonSecondRowTopPx), S(kEffectsListButtonSmallWidthPx), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_DOWN), nullptr, nullptr);
         if (micList) {
             SetWindowSubclass(micList, EffectListSubclassProc, kMicListSubclassId, static_cast<DWORD_PTR>(IDC_MIC_LIST));
         }
@@ -1523,7 +1595,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         ApplyControlTheme(hwnd);
         ApplyFonts(hwnd);
         ReloadAllLists(hwnd);
-        RefreshStatus(hwnd);
+        RefreshStatus(hwnd, true);
         UpdateMeterVisuals(hwnd);
         SetTimer(hwnd, kTimerStatus, kTimerMs, nullptr);
         return 0;
@@ -1561,7 +1633,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ReloadAllLists(hwnd);
                 g_lastListRefreshTickMs = nowMs;
             }
-            RefreshStatus(hwnd);
+            RefreshStatus(hwnd, false);
             UpdateMeterVisuals(hwnd);
             return 0;
         }
@@ -1575,16 +1647,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         case IDC_ENABLE_EFFECTS:
             MicMixApp::Instance().SetEffectsEnabled(true, true);
-            RefreshStatus(hwnd);
+            RefreshStatus(hwnd, true);
             return 0;
         case IDC_DISABLE_EFFECTS:
             MicMixApp::Instance().SetEffectsEnabled(false, true);
-            RefreshStatus(hwnd);
+            RefreshStatus(hwnd, true);
             return 0;
         case IDC_MONITOR:
             MicMixApp::Instance().ToggleMonitor();
             UpdateMonitorButton(hwnd);
-            RefreshStatus(hwnd);
+            RefreshStatus(hwnd, true);
             return 0;
         case IDC_VST_AUTOSTART:
             if (HIWORD(wParam) == BN_CLICKED) {
@@ -1596,14 +1668,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     settings.vstHostAutostart = autostartEnabled;
                     MicMixApp::Instance().ApplySettings(settings, false, true);
                 }
-                RefreshStatus(hwnd);
+                RefreshStatus(hwnd, true);
             }
             return 0;
         case IDC_MUSIC_ADD:
             HandleAddEffect(hwnd, EffectChain::Music);
-            return 0;
-        case IDC_MUSIC_REMOVE:
-            HandleRemoveEffect(hwnd, EffectChain::Music, IDC_MUSIC_LIST);
             return 0;
         case IDC_MUSIC_UP:
             HandleMoveEffect(hwnd, EffectChain::Music, IDC_MUSIC_LIST, -1);
@@ -1611,35 +1680,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_MUSIC_DOWN:
             HandleMoveEffect(hwnd, EffectChain::Music, IDC_MUSIC_LIST, 1);
             return 0;
-        case IDC_MUSIC_BYPASS:
-            HandleBypassEffect(hwnd, EffectChain::Music, IDC_MUSIC_LIST);
-            return 0;
-        case IDC_MUSIC_ENABLE:
-            HandleToggleEnabledEffect(hwnd, EffectChain::Music, IDC_MUSIC_LIST);
-            return 0;
-        case IDC_MUSIC_EDITOR:
-            HandleOpenEditor(hwnd, EffectChain::Music, IDC_MUSIC_LIST);
-            return 0;
         case IDC_MIC_ADD:
             HandleAddEffect(hwnd, EffectChain::Mic);
-            return 0;
-        case IDC_MIC_REMOVE:
-            HandleRemoveEffect(hwnd, EffectChain::Mic, IDC_MIC_LIST);
             return 0;
         case IDC_MIC_UP:
             HandleMoveEffect(hwnd, EffectChain::Mic, IDC_MIC_LIST, -1);
             return 0;
         case IDC_MIC_DOWN:
             HandleMoveEffect(hwnd, EffectChain::Mic, IDC_MIC_LIST, 1);
-            return 0;
-        case IDC_MIC_BYPASS:
-            HandleBypassEffect(hwnd, EffectChain::Mic, IDC_MIC_LIST);
-            return 0;
-        case IDC_MIC_ENABLE:
-            HandleToggleEnabledEffect(hwnd, EffectChain::Mic, IDC_MIC_LIST);
-            return 0;
-        case IDC_MIC_EDITOR:
-            HandleOpenEditor(hwnd, EffectChain::Mic, IDC_MIC_LIST);
             return 0;
         default:
             break;
@@ -1652,7 +1700,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetTransientStatusText(hwnd, result->message);
             if (result->ok) {
                 ReloadAllLists(hwnd);
-                RefreshStatus(hwnd);
+                RefreshStatus(hwnd, true);
             }
         }
         return 0;
