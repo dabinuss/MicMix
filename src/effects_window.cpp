@@ -144,6 +144,47 @@ std::wstring g_lastMicMeterText;
 std::wstring g_lastMusicClipEventsText;
 std::wstring g_lastMicClipEventsText;
 
+enum class InlineAction {
+    None = 0,
+    ToggleEnabled,
+    ToggleBypass,
+    Remove,
+    Drag,
+};
+
+struct EffectRowView {
+    std::wstring displayName;
+    std::wstring statusText;
+    std::wstring idText;
+    bool enabled = true;
+    bool bypass = false;
+};
+
+bool operator==(const EffectRowView& a, const EffectRowView& b) {
+    return a.displayName == b.displayName &&
+           a.statusText == b.statusText &&
+           a.idText == b.idText &&
+           a.enabled == b.enabled &&
+           a.bypass == b.bypass;
+}
+
+struct EffectListUiState {
+    std::vector<EffectRowView> rows;
+    int hoverItem = -1;
+    InlineAction hoverAction = InlineAction::None;
+    int pressedItem = -1;
+    InlineAction pressedAction = InlineAction::None;
+    bool trackingMouse = false;
+    bool dragArmed = false;
+    bool dragging = false;
+    int dragSource = -1;
+    int dragInsertIndex = -1;
+    POINT dragStart{ 0, 0 };
+};
+
+EffectListUiState g_musicListUi{};
+EffectListUiState g_micListUi{};
+
 constexpr int kClientWidthPx = kUiClientWidthPx;
 constexpr int kClientHeightPx = kUiClientHeightPx;
 constexpr int kCardMarginPx = kUiCardMarginPx;
@@ -151,12 +192,14 @@ constexpr int kCardGapPx = kUiCardGapPx;
 constexpr int kCardInnerPaddingPx = kUiCardInnerPaddingPx;
 constexpr UINT kTimerStatus = 1;
 constexpr UINT kTimerMs = 40;
-constexpr int kListItemHeightPx = 22;
+constexpr int kListItemHeightPx = 34;
 constexpr wchar_t kRepoUrl[] = L"https://github.com/dabinuss/MicMix";
 constexpr wchar_t kEffectsHeaderTitle[] = L"MicMix - Audio Effects";
 constexpr wchar_t kEffectsSectionTopTitle[] = L"EFFECTS SETTINGS";
-constexpr wchar_t kEffectsSectionMusicTitle[] = L"AUDIO EFFECTS";
-constexpr wchar_t kEffectsSectionMicTitle[] = L"MIC EFFECTS";
+constexpr wchar_t kEffectsSectionMusicTitle[] = L"METERS";
+constexpr wchar_t kEffectsSectionMicTitle[] = L"EFFECTS";
+constexpr UINT_PTR kMusicListSubclassId = 1001;
+constexpr UINT_PTR kMicListSubclassId = 1002;
 
 int S(int px) {
     return MulDiv(px, g_dpi, 96);
@@ -169,29 +212,100 @@ bool IsHandCursorControlId(int id) {
     case IDC_DISABLE_EFFECTS:
     case IDC_MONITOR:
     case IDC_VST_AUTOSTART:
-    case IDC_MUSIC_LIST:
     case IDC_MUSIC_ADD:
-    case IDC_MUSIC_REMOVE:
     case IDC_MUSIC_UP:
     case IDC_MUSIC_DOWN:
-    case IDC_MUSIC_ENABLE:
-    case IDC_MUSIC_BYPASS:
-    case IDC_MUSIC_EDITOR:
-    case IDC_MIC_LIST:
     case IDC_MIC_ADD:
-    case IDC_MIC_REMOVE:
     case IDC_MIC_UP:
     case IDC_MIC_DOWN:
-    case IDC_MIC_ENABLE:
-    case IDC_MIC_BYPASS:
-    case IDC_MIC_EDITOR:
         return true;
     default:
         return false;
     }
 }
 
+bool IsEffectListId(int id) {
+    return id == IDC_MUSIC_LIST || id == IDC_MIC_LIST;
+}
+
+EffectChain ChainFromListId(int listId) {
+    return (listId == IDC_MIC_LIST) ? EffectChain::Mic : EffectChain::Music;
+}
+
+EffectListUiState& ListUiStateFromListId(int listId) {
+    return (listId == IDC_MIC_LIST) ? g_micListUi : g_musicListUi;
+}
+
+void ResetListPointerState(EffectListUiState& state) {
+    state.hoverItem = -1;
+    state.hoverAction = InlineAction::None;
+    state.pressedItem = -1;
+    state.pressedAction = InlineAction::None;
+    state.trackingMouse = false;
+    state.dragArmed = false;
+    state.dragging = false;
+    state.dragSource = -1;
+    state.dragInsertIndex = -1;
+    state.dragStart = { 0, 0 };
+}
+
+std::wstring BuildIdText(const VstEffectSlot& slot, size_t index) {
+    if (slot.uid.empty()) {
+        return L"ID " + std::to_wstring(index + 1);
+    }
+    const std::wstring uid = Utf8ToWide(slot.uid);
+    const size_t keep = std::min<size_t>(8, uid.size());
+    return L"ID " + uid.substr(0, keep);
+}
+
+std::wstring BuildDisplayName(const VstEffectSlot& slot) {
+    if (!slot.name.empty()) {
+        return Utf8ToWide(slot.name);
+    }
+    const std::wstring path = Utf8ToWide(slot.path);
+    std::filesystem::path p(path);
+    if (!p.stem().wstring().empty()) {
+        return p.stem().wstring();
+    }
+    return path.empty() ? L"(unnamed effect)" : path;
+}
+
+std::wstring BuildStatusText(const VstEffectSlot& slot) {
+    std::wstring status = slot.enabled ? L"ON" : L"OFF";
+    status += L"  |  ";
+    status += slot.bypass ? L"BYPASS" : L"ACTIVE";
+    if (!slot.lastStatus.empty()) {
+        status += L"  |  ";
+        status += Utf8ToWide(slot.lastStatus);
+    }
+    return status;
+}
+
+bool AnyListDragging() {
+    return g_musicListUi.dragging || g_micListUi.dragging;
+}
+
+bool IsListInteracting(HWND hwnd) {
+    HWND focus = GetFocus();
+    if (focus && (focus == GetDlgItem(hwnd, IDC_MUSIC_LIST) || focus == GetDlgItem(hwnd, IDC_MIC_LIST))) {
+        return true;
+    }
+    return AnyListDragging();
+}
+
+void InvalidateListItem(HWND list, int itemIndex) {
+    if (!list || itemIndex < 0) {
+        return;
+    }
+    RECT itemRect{};
+    if (SendMessageW(list, LB_GETITEMRECT, static_cast<WPARAM>(itemIndex), reinterpret_cast<LPARAM>(&itemRect)) == LB_ERR) {
+        return;
+    }
+    InvalidateRect(list, &itemRect, FALSE);
+}
+
 void SetStatusText(HWND hwnd, const std::wstring& text, uint64_t holdMs = 0) {
+    const bool changed = (g_statusText != text);
     g_statusText = text;
     if (holdMs > 0) {
         g_statusHoldUntilMs.store(GetTickCount64() + holdMs, std::memory_order_release);
@@ -199,7 +313,7 @@ void SetStatusText(HWND hwnd, const std::wstring& text, uint64_t holdMs = 0) {
         g_statusHoldUntilMs.store(0, std::memory_order_release);
     }
     HWND ctl = GetDlgItem(hwnd, IDC_STATUS);
-    if (ctl) {
+    if (ctl && changed) {
         SetWindowTextW(ctl, g_statusText.c_str());
     }
 }
@@ -255,9 +369,9 @@ void ComputeLayout(HWND hwnd) {
     const int topY = S(kUiTopCardYpx);
     const int topH = S(128);
     const int musicY = topY + topH + S(kCardGapPx);
-    const int musicH = S(214);
+    const int musicH = S(146);  // Shared meter card (audio + mic)
     const int micY = musicY + musicH + S(kCardGapPx);
-    const int micH = S(214);
+    const int micH = S(282);    // Shared effects card (audio list + mic list)
     const int statusY = micY + micH + S(kCardGapPx);
     const int statusH = S(84);
     g_rcTop = { left, topY, left + cardW, topY + topH };
@@ -267,17 +381,13 @@ void ComputeLayout(HWND hwnd) {
 
     const int meterWidth = S(340);
     const int sectionPad = S(kCardInnerPaddingPx);
-    const int musicSectionTop = g_rcMusic.top + sectionPad;
-    const int musicSectionLeft = g_rcMusic.left + sectionPad;
-    const int musicMeterLeft = musicSectionLeft + S(144);
-    g_rcMusicMeter = { musicMeterLeft, musicSectionTop + S(32), musicMeterLeft + meterWidth, musicSectionTop + S(32) + S(28) };
-    g_rcMusicClip = { musicMeterLeft, musicSectionTop + S(62), musicMeterLeft + meterWidth, musicSectionTop + S(62) + S(12) };
-
-    const int micSectionTop = g_rcMic.top + sectionPad;
-    const int micSectionLeft = g_rcMic.left + sectionPad;
-    const int micMeterLeft = micSectionLeft + S(144);
-    g_rcMicMeter = { micMeterLeft, micSectionTop + S(32), micMeterLeft + meterWidth, micSectionTop + S(32) + S(28) };
-    g_rcMicClip = { micMeterLeft, micSectionTop + S(62), micMeterLeft + meterWidth, micSectionTop + S(62) + S(12) };
+    const int meterSectionTop = g_rcMusic.top + S(10);
+    const int meterSectionLeft = g_rcMusic.left + sectionPad;
+    const int meterLeft = meterSectionLeft + S(144);
+    g_rcMusicMeter = { meterLeft, meterSectionTop + S(18), meterLeft + meterWidth, meterSectionTop + S(18) + S(28) };
+    g_rcMusicClip = { meterLeft, meterSectionTop + S(48), meterLeft + meterWidth, meterSectionTop + S(48) + S(12) };
+    g_rcMicMeter = { meterLeft, meterSectionTop + S(66), meterLeft + meterWidth, meterSectionTop + S(66) + S(28) };
+    g_rcMicClip = { meterLeft, meterSectionTop + S(96), meterLeft + meterWidth, meterSectionTop + S(96) + S(12) };
 
     const int contentLeft = S(kCardMarginPx + kCardInnerPaddingPx);
     const int titleY = S(10);
@@ -324,39 +434,69 @@ void UpdateMonitorButton(HWND hwnd) {
     SetMonitorButtonText(hwnd, IDC_MONITOR, enabled);
 }
 
-std::wstring BuildEffectRow(const VstEffectSlot& slot) {
-    std::wstring row = L"[";
-    row += slot.enabled ? L"ON" : L"OFF";
-    row += L"] [";
-    row += slot.bypass ? L"BYP" : L"ACT";
-    row += L"] ";
-    if (!slot.lastStatus.empty()) {
-        row += L"{";
-        row += Utf8ToWide(slot.lastStatus);
-        row += L"} ";
-    }
-    row += Utf8ToWide(slot.name.empty() ? slot.path : slot.name);
-    return row;
-}
-
 void ReloadEffectList(HWND hwnd, EffectChain chain, int listId) {
     HWND list = GetDlgItem(hwnd, listId);
     if (!list) {
         return;
     }
+    EffectListUiState& ui = ListUiStateFromListId(listId);
     const int previousSel = static_cast<int>(SendMessageW(list, LB_GETCURSEL, 0, 0));
+    const int previousTop = static_cast<int>(SendMessageW(list, LB_GETTOPINDEX, 0, 0));
     const std::vector<VstEffectSlot> slots = MicMixApp::Instance().GetEffects(chain);
-    SendMessageW(list, LB_RESETCONTENT, 0, 0);
-    for (const auto& slot : slots) {
-        const std::wstring row = BuildEffectRow(slot);
-        SendMessageW(list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(row.c_str()));
+
+    std::vector<EffectRowView> nextRows;
+    nextRows.reserve(slots.size());
+    for (size_t i = 0; i < slots.size(); ++i) {
+        const auto& slot = slots[i];
+        EffectRowView row{};
+        row.displayName = BuildDisplayName(slot);
+        row.statusText = BuildStatusText(slot);
+        row.idText = BuildIdText(slot, i);
+        row.enabled = slot.enabled;
+        row.bypass = slot.bypass;
+        nextRows.push_back(std::move(row));
     }
-    if (!slots.empty()) {
-        int sel = previousSel;
-        if (sel < 0 || sel >= static_cast<int>(slots.size())) {
-            sel = static_cast<int>(slots.size() - 1);
+
+    const int currentCount = static_cast<int>(SendMessageW(list, LB_GETCOUNT, 0, 0));
+    const int nextCount = static_cast<int>(nextRows.size());
+    const bool countChanged = currentCount != nextCount;
+    const bool rowsChanged = ui.rows != nextRows;
+
+    if (countChanged) {
+        SendMessageW(list, LB_RESETCONTENT, 0, 0);
+        for (int i = 0; i < nextCount; ++i) {
+            SendMessageW(list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L" "));
         }
-        SendMessageW(list, LB_SETCURSEL, static_cast<WPARAM>(sel), 0);
+    }
+
+    ui.rows = std::move(nextRows);
+
+    if (nextCount > 0) {
+        int sel = previousSel;
+        if (sel < 0 || sel >= nextCount) {
+            sel = nextCount - 1;
+        }
+        const int currentSel = static_cast<int>(SendMessageW(list, LB_GETCURSEL, 0, 0));
+        if (currentSel != sel) {
+            SendMessageW(list, LB_SETCURSEL, static_cast<WPARAM>(sel), 0);
+        }
+    } else {
+        SendMessageW(list, LB_SETCURSEL, static_cast<WPARAM>(-1), 0);
+    }
+
+    if (previousTop >= 0 && nextCount > 0) {
+        const int top = std::clamp(previousTop, 0, std::max(0, nextCount - 1));
+        SendMessageW(list, LB_SETTOPINDEX, static_cast<WPARAM>(top), 0);
+    }
+
+    if (ui.dragSource >= static_cast<int>(slots.size())) {
+        ui.dragSource = -1;
+    }
+    if (ui.dragInsertIndex > static_cast<int>(slots.size())) {
+        ui.dragInsertIndex = static_cast<int>(slots.size());
+    }
+    if (countChanged || rowsChanged) {
+        InvalidateRect(list, nullptr, FALSE);
     }
 }
 
@@ -453,6 +593,27 @@ void HandleMoveEffect(HWND hwnd, EffectChain chain, int listId, int direction) {
     ApplyActionResult(hwnd, ok, error, L"Effect order updated.");
     if (ok) {
         SendMessageW(GetDlgItem(hwnd, listId), LB_SETCURSEL, static_cast<WPARAM>(target), 0);
+    }
+}
+
+void HandleMoveEffectToIndex(HWND hwnd, EffectChain chain, int listId, int fromIndex, int toIndex) {
+    if (fromIndex < 0 || toIndex < 0) {
+        return;
+    }
+    const std::vector<VstEffectSlot> slots = MicMixApp::Instance().GetEffects(chain);
+    if (static_cast<size_t>(fromIndex) >= slots.size() || static_cast<size_t>(toIndex) >= slots.size()) {
+        SetTransientStatusText(hwnd, L"Invalid move target.");
+        return;
+    }
+    if (fromIndex == toIndex) {
+        return;
+    }
+    std::string error;
+    const bool ok = MicMixApp::Instance().MoveEffect(
+        chain, static_cast<size_t>(fromIndex), static_cast<size_t>(toIndex), error);
+    ApplyActionResult(hwnd, ok, error, L"Effect order updated.");
+    if (ok) {
+        SendMessageW(GetDlgItem(hwnd, listId), LB_SETCURSEL, static_cast<WPARAM>(toIndex), 0);
     }
 }
 
@@ -569,46 +730,484 @@ void ApplyControlTheme(HWND hwnd) {
         static_cast<int>(std::size(unthemeOwnerDrawIds)));
 }
 
+struct EffectRowLayout {
+    RECT handleRect{};
+    RECT idRect{};
+    RECT nameRect{};
+    RECT statusRect{};
+    RECT enableRect{};
+    RECT bypassRect{};
+    RECT removeRect{};
+};
+
+EffectRowLayout ComputeEffectRowLayout(const RECT& itemRect) {
+    EffectRowLayout layout{};
+    RECT inner = itemRect;
+    InflateRect(&inner, -S(6), -S(4));
+    const int gap = S(6);
+    const int buttonH = S(20);
+    const int buttonY = static_cast<int>(inner.top) + std::max(0, static_cast<int>(((inner.bottom - inner.top) - buttonH) / 2));
+
+    const int removeW = S(56);
+    const int bypassW = S(58);
+    const int enableW = S(58);
+    int right = inner.right;
+    layout.removeRect = { right - removeW, buttonY, right, buttonY + buttonH };
+    right = layout.removeRect.left - gap;
+    layout.bypassRect = { right - bypassW, buttonY, right, buttonY + buttonH };
+    right = layout.bypassRect.left - gap;
+    layout.enableRect = { right - enableW, buttonY, right, buttonY + buttonH };
+
+    layout.handleRect = { inner.left, inner.top + S(4), inner.left + S(14), inner.bottom - S(4) };
+    layout.idRect = { layout.handleRect.right + gap, inner.top + S(3), layout.handleRect.right + gap + S(78), inner.bottom - S(3) };
+    const int textLeft = layout.idRect.right + gap;
+    const int textRight = std::max(textLeft, static_cast<int>(layout.enableRect.left - gap));
+    const int midY = inner.top + ((inner.bottom - inner.top) / 2);
+    layout.nameRect = { textLeft, inner.top, textRight, midY };
+    layout.statusRect = { textLeft, midY - S(1), textRight, inner.bottom };
+    return layout;
+}
+
+int HitTestListItem(HWND list, const POINT& clientPt) {
+    const DWORD hit = static_cast<DWORD>(SendMessageW(list, LB_ITEMFROMPOINT, 0, MAKELPARAM(clientPt.x, clientPt.y)));
+    const int item = static_cast<short>(LOWORD(hit));
+    const bool outside = HIWORD(hit) != 0;
+    if (outside || item < 0) {
+        return -1;
+    }
+    return item;
+}
+
+InlineAction HitTestInlineAction(HWND list, int item, const POINT& clientPt) {
+    if (item < 0) {
+        return InlineAction::None;
+    }
+    RECT rowRect{};
+    if (SendMessageW(list, LB_GETITEMRECT, static_cast<WPARAM>(item), reinterpret_cast<LPARAM>(&rowRect)) == LB_ERR) {
+        return InlineAction::None;
+    }
+    const EffectRowLayout layout = ComputeEffectRowLayout(rowRect);
+    if (PtInRect(&layout.enableRect, clientPt)) {
+        return InlineAction::ToggleEnabled;
+    }
+    if (PtInRect(&layout.bypassRect, clientPt)) {
+        return InlineAction::ToggleBypass;
+    }
+    if (PtInRect(&layout.removeRect, clientPt)) {
+        return InlineAction::Remove;
+    }
+    if (PtInRect(&layout.handleRect, clientPt)) {
+        return InlineAction::Drag;
+    }
+    return InlineAction::None;
+}
+
+int ComputeInsertIndexFromPoint(HWND list, const POINT& clientPt) {
+    const int count = static_cast<int>(SendMessageW(list, LB_GETCOUNT, 0, 0));
+    if (count <= 0) {
+        return -1;
+    }
+    if (clientPt.y <= 0) {
+        return 0;
+    }
+    RECT lastRect{};
+    if (SendMessageW(list, LB_GETITEMRECT, static_cast<WPARAM>(count - 1), reinterpret_cast<LPARAM>(&lastRect)) != LB_ERR) {
+        if (clientPt.y >= lastRect.bottom) {
+            return count;
+        }
+    }
+    const int hitItem = HitTestListItem(list, clientPt);
+    if (hitItem < 0) {
+        return count;
+    }
+    RECT hitRect{};
+    if (SendMessageW(list, LB_GETITEMRECT, static_cast<WPARAM>(hitItem), reinterpret_cast<LPARAM>(&hitRect)) == LB_ERR) {
+        return hitItem;
+    }
+    const int mid = hitRect.top + ((hitRect.bottom - hitRect.top) / 2);
+    return (clientPt.y < mid) ? hitItem : (hitItem + 1);
+}
+
+void InvalidateInsertMarker(HWND list, int insertIndex) {
+    if (!list || insertIndex < 0) {
+        return;
+    }
+    const int count = static_cast<int>(SendMessageW(list, LB_GETCOUNT, 0, 0));
+    if (count <= 0) {
+        InvalidateRect(list, nullptr, FALSE);
+        return;
+    }
+    if (insertIndex >= count) {
+        InvalidateListItem(list, count - 1);
+    } else {
+        InvalidateListItem(list, insertIndex);
+    }
+}
+
+void DrawInlineButton(
+    HDC dc,
+    const RECT& rc,
+    const wchar_t* label,
+    bool emphasized,
+    bool hover,
+    bool pressed,
+    HFONT textFont) {
+    COLORREF bg = emphasized ? RGB(226, 240, 255) : RGB(242, 245, 249);
+    COLORREF border = emphasized ? RGB(129, 165, 214) : RGB(196, 206, 221);
+    COLORREF text = emphasized ? RGB(34, 74, 132) : RGB(77, 87, 104);
+    if (hover) {
+        bg = emphasized ? RGB(213, 232, 255) : RGB(232, 238, 246);
+    }
+    if (pressed) {
+        bg = emphasized ? RGB(193, 220, 252) : RGB(216, 227, 239);
+        border = RGB(114, 139, 173);
+    }
+
+    HBRUSH fill = CreateSolidBrush(bg);
+    HPEN pen = CreatePen(PS_SOLID, 1, border);
+    HGDIOBJ oldBrush = SelectObject(dc, fill);
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, S(8), S(8));
+    SelectObject(dc, oldPen);
+    SelectObject(dc, oldBrush);
+    DeleteObject(pen);
+    DeleteObject(fill);
+
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, text);
+    SelectObject(dc, textFont ? textFont : g_fontBody);
+    RECT textRect = rc;
+    DrawTextW(dc, label, -1, &textRect, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS);
+}
+
+void InvokeInlineListAction(HWND parent, int listId, int item, InlineAction action) {
+    if (!parent || item < 0) {
+        return;
+    }
+    HWND list = GetDlgItem(parent, listId);
+    if (list) {
+        SendMessageW(list, LB_SETCURSEL, static_cast<WPARAM>(item), 0);
+    }
+    const EffectChain chain = ChainFromListId(listId);
+    switch (action) {
+    case InlineAction::ToggleEnabled:
+        HandleToggleEnabledEffect(parent, chain, listId);
+        break;
+    case InlineAction::ToggleBypass:
+        HandleBypassEffect(parent, chain, listId);
+        break;
+    case InlineAction::Remove:
+        HandleRemoveEffect(parent, chain, listId);
+        break;
+    default:
+        break;
+    }
+}
+
+LRESULT CALLBACK EffectListSubclassProc(
+    HWND list,
+    UINT msg,
+    WPARAM wParam,
+    LPARAM lParam,
+    UINT_PTR /*subclassId*/,
+    DWORD_PTR refData) {
+    const int listId = static_cast<int>(refData);
+    EffectListUiState& ui = ListUiStateFromListId(listId);
+    HWND parent = GetParent(list);
+
+    switch (msg) {
+    case WM_MOUSELEAVE: {
+        const int oldHoverItem = ui.hoverItem;
+        ui.trackingMouse = false;
+        ui.hoverItem = -1;
+        ui.hoverAction = InlineAction::None;
+        InvalidateListItem(list, oldHoverItem);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        POINT pt{
+            static_cast<int>(static_cast<short>(LOWORD(lParam))),
+            static_cast<int>(static_cast<short>(HIWORD(lParam)))
+        };
+        if (!ui.trackingMouse) {
+            TRACKMOUSEEVENT tme{};
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = list;
+            TrackMouseEvent(&tme);
+            ui.trackingMouse = true;
+        }
+
+        if (ui.dragArmed && !ui.dragging) {
+            const int dx = std::abs(pt.x - ui.dragStart.x);
+            const int dy = std::abs(pt.y - ui.dragStart.y);
+            if (dx >= S(3) || dy >= S(3)) {
+                ui.dragging = true;
+                ui.dragInsertIndex = ComputeInsertIndexFromPoint(list, pt);
+            }
+        }
+
+        if (ui.dragging) {
+            const RECT clientRect = [] (HWND h) {
+                RECT rc{};
+                GetClientRect(h, &rc);
+                return rc;
+            }(list);
+            if (pt.y < clientRect.top + S(8)) {
+                SendMessageW(list, WM_VSCROLL, SB_LINEUP, 0);
+            } else if (pt.y > clientRect.bottom - S(8)) {
+                SendMessageW(list, WM_VSCROLL, SB_LINEDOWN, 0);
+            }
+            const int nextInsert = ComputeInsertIndexFromPoint(list, pt);
+            if (nextInsert != ui.dragInsertIndex) {
+                const int oldInsert = ui.dragInsertIndex;
+                ui.dragInsertIndex = nextInsert;
+                InvalidateInsertMarker(list, oldInsert);
+                InvalidateInsertMarker(list, nextInsert);
+            }
+            SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+            return 0;
+        }
+
+        const int item = HitTestListItem(list, pt);
+        const InlineAction action = HitTestInlineAction(list, item, pt);
+        if (item != ui.hoverItem || action != ui.hoverAction) {
+            const int oldItem = ui.hoverItem;
+            ui.hoverItem = item;
+            ui.hoverAction = action;
+            InvalidateListItem(list, oldItem);
+            InvalidateListItem(list, item);
+        }
+        if (action != InlineAction::None) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return 0;
+        }
+        break;
+    }
+    case WM_LBUTTONDOWN: {
+        POINT pt{
+            static_cast<int>(static_cast<short>(LOWORD(lParam))),
+            static_cast<int>(static_cast<short>(HIWORD(lParam)))
+        };
+        const int item = HitTestListItem(list, pt);
+        const InlineAction action = HitTestInlineAction(list, item, pt);
+        if (item >= 0) {
+            const int oldPressedItem = ui.pressedItem;
+            SendMessageW(list, LB_SETCURSEL, static_cast<WPARAM>(item), 0);
+            if (action == InlineAction::ToggleEnabled ||
+                action == InlineAction::ToggleBypass ||
+                action == InlineAction::Remove) {
+                ui.pressedItem = item;
+                ui.pressedAction = action;
+            } else {
+                ui.dragArmed = true;
+                ui.dragSource = item;
+                ui.dragStart = pt;
+                ui.dragInsertIndex = item;
+            }
+            SetCapture(list);
+            InvalidateListItem(list, oldPressedItem);
+            InvalidateListItem(list, item);
+            return 0;
+        }
+        break;
+    }
+    case WM_LBUTTONUP: {
+        POINT pt{
+            static_cast<int>(static_cast<short>(LOWORD(lParam))),
+            static_cast<int>(static_cast<short>(HIWORD(lParam)))
+        };
+        const int pressedItem = ui.pressedItem;
+        const InlineAction pressedAction = ui.pressedAction;
+        const bool wasDragging = ui.dragging;
+        const int dragSource = ui.dragSource;
+        const int dragInsert = ui.dragInsertIndex;
+
+        ui.pressedItem = -1;
+        ui.pressedAction = InlineAction::None;
+        ui.dragArmed = false;
+        ui.dragging = false;
+        ui.dragSource = -1;
+        ui.dragInsertIndex = -1;
+        if (GetCapture() == list) {
+            ReleaseCapture();
+        }
+
+        if (pressedItem >= 0 && pressedAction != InlineAction::None) {
+            const int hitItem = HitTestListItem(list, pt);
+            const InlineAction hitAction = HitTestInlineAction(list, hitItem, pt);
+            if (pressedItem == hitItem && pressedAction == hitAction) {
+                InvokeInlineListAction(parent, listId, pressedItem, pressedAction);
+            }
+            InvalidateListItem(list, pressedItem);
+            return 0;
+        }
+
+        if (wasDragging && dragSource >= 0) {
+            const int count = static_cast<int>(SendMessageW(list, LB_GETCOUNT, 0, 0));
+            if (count > 0 && dragInsert >= 0) {
+                int target = dragInsert;
+                if (target > dragSource) {
+                    target -= 1;
+                }
+                target = std::clamp(target, 0, count - 1);
+                if (target != dragSource) {
+                    HandleMoveEffectToIndex(parent, ChainFromListId(listId), listId, dragSource, target);
+                }
+            }
+            InvalidateInsertMarker(list, dragInsert);
+            InvalidateListItem(list, dragSource);
+            return 0;
+        }
+        break;
+    }
+    case WM_CAPTURECHANGED:
+        InvalidateListItem(list, ui.pressedItem);
+        InvalidateInsertMarker(list, ui.dragInsertIndex);
+        ui.pressedItem = -1;
+        ui.pressedAction = InlineAction::None;
+        ui.dragArmed = false;
+        ui.dragging = false;
+        ui.dragSource = -1;
+        ui.dragInsertIndex = -1;
+        break;
+    case WM_LBUTTONDBLCLK: {
+        POINT pt{
+            static_cast<int>(static_cast<short>(LOWORD(lParam))),
+            static_cast<int>(static_cast<short>(HIWORD(lParam)))
+        };
+        const int item = HitTestListItem(list, pt);
+        const InlineAction action = HitTestInlineAction(list, item, pt);
+        if (action != InlineAction::None) {
+            return 0;
+        }
+        if (item >= 0 && parent) {
+            SendMessageW(list, LB_SETCURSEL, static_cast<WPARAM>(item), 0);
+            HandleOpenEditor(parent, ChainFromListId(listId), listId);
+            return 0;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    return DefSubclassProc(list, msg, wParam, lParam);
+}
+
 void DrawEffectListItem(const DRAWITEMSTRUCT* dis) {
     if (!dis || dis->itemID == static_cast<UINT>(-1)) {
         return;
     }
-    RECT rc = dis->rcItem;
+    const int listId = GetDlgCtrlID(dis->hwndItem);
+    EffectListUiState& ui = ListUiStateFromListId(listId);
+    if (dis->itemID >= ui.rows.size()) {
+        return;
+    }
+    const EffectRowView& row = ui.rows[dis->itemID];
     const bool selected = (dis->itemState & ODS_SELECTED) != 0;
     const bool focused = (dis->itemState & ODS_FOCUS) != 0;
-    COLORREF bg = selected ? RGB(218, 234, 255) : RGB(255, 255, 255);
-    COLORREF text = g_theme.text;
+    const bool draggingThis = ui.dragging && (static_cast<int>(dis->itemID) == ui.dragSource);
+    const bool hoveredItem = (ui.hoverItem == static_cast<int>(dis->itemID));
+
+    RECT rc = dis->rcItem;
+    COLORREF bg = RGB(252, 253, 255);
+    if (selected) {
+        bg = RGB(226, 238, 255);
+    } else if (hoveredItem) {
+        bg = RGB(245, 249, 255);
+    }
+    if (draggingThis) {
+        bg = RGB(236, 244, 255);
+    }
     HBRUSH bgBrush = CreateSolidBrush(bg);
     FillRect(dis->hDC, &rc, bgBrush);
     DeleteObject(bgBrush);
 
-    std::wstring itemText;
-    const LRESULT textLen = SendMessageW(dis->hwndItem, LB_GETTEXTLEN, dis->itemID, 0);
-    if (textLen > 0 && textLen != LB_ERR) {
-        std::vector<wchar_t> buffer(static_cast<size_t>(textLen) + 1U, L'\0');
-        const LRESULT copied = SendMessageW(dis->hwndItem, LB_GETTEXT, dis->itemID, reinterpret_cast<LPARAM>(buffer.data()));
-        if (copied == LB_ERR) {
-            itemText.clear();
-        } else {
-            itemText.assign(buffer.data());
+    const EffectRowLayout layout = ComputeEffectRowLayout(rc);
+
+    HBRUSH idBrush = CreateSolidBrush(RGB(236, 241, 248));
+    HPEN idPen = CreatePen(PS_SOLID, 1, RGB(188, 202, 224));
+    HGDIOBJ oldBrush = SelectObject(dis->hDC, idBrush);
+    HGDIOBJ oldPen = SelectObject(dis->hDC, idPen);
+    RoundRect(dis->hDC, layout.idRect.left, layout.idRect.top, layout.idRect.right, layout.idRect.bottom, S(8), S(8));
+    SelectObject(dis->hDC, oldPen);
+    SelectObject(dis->hDC, oldBrush);
+    DeleteObject(idPen);
+    DeleteObject(idBrush);
+
+    SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, RGB(72, 84, 101));
+    SelectObject(dis->hDC, g_fontTiny ? g_fontTiny : g_fontSmall);
+    RECT idTextRect = layout.idRect;
+    DrawTextW(dis->hDC, row.idText.c_str(), -1, &idTextRect, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS);
+
+    const int dotW = S(4);
+    const int dotH = S(4);
+    const int dotGap = S(3);
+    const int handleCenterY = layout.handleRect.top + ((layout.handleRect.bottom - layout.handleRect.top) / 2);
+    const int firstDotY = handleCenterY - dotH - (dotGap / 2);
+    for (int col = 0; col < 2; ++col) {
+        for (int rowDot = 0; rowDot < 3; ++rowDot) {
+            RECT dot{
+                layout.handleRect.left + col * (dotW + dotGap),
+                firstDotY + rowDot * (dotH + dotGap),
+                layout.handleRect.left + col * (dotW + dotGap) + dotW,
+                firstDotY + rowDot * (dotH + dotGap) + dotH
+            };
+            HBRUSH dotBrush = CreateSolidBrush(RGB(157, 171, 194));
+            FillRect(dis->hDC, &dot, dotBrush);
+            DeleteObject(dotBrush);
         }
     }
-    if (itemText.empty()) {
-        itemText = L"(empty)";
-    }
-    rc.left += S(8);
-    rc.right -= S(6);
-    SetBkMode(dis->hDC, TRANSPARENT);
-    SetTextColor(dis->hDC, text);
+
+    SetTextColor(dis->hDC, g_theme.text);
     SelectObject(dis->hDC, g_fontBody ? g_fontBody : g_fontSmall);
-    DrawTextW(dis->hDC, itemText.c_str(), -1, &rc, DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    RECT nameRect = layout.nameRect;
+    DrawTextW(dis->hDC, row.displayName.c_str(), -1, &nameRect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    SetTextColor(dis->hDC, g_theme.muted);
+    SelectObject(dis->hDC, g_fontTiny ? g_fontTiny : g_fontSmall);
+    RECT statusRect = layout.statusRect;
+    DrawTextW(dis->hDC, row.statusText.c_str(), -1, &statusRect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+
+    const bool hoverEnable = (ui.hoverItem == static_cast<int>(dis->itemID) && ui.hoverAction == InlineAction::ToggleEnabled);
+    const bool hoverBypass = (ui.hoverItem == static_cast<int>(dis->itemID) && ui.hoverAction == InlineAction::ToggleBypass);
+    const bool hoverRemove = (ui.hoverItem == static_cast<int>(dis->itemID) && ui.hoverAction == InlineAction::Remove);
+    const bool pressedEnable = (ui.pressedItem == static_cast<int>(dis->itemID) && ui.pressedAction == InlineAction::ToggleEnabled);
+    const bool pressedBypass = (ui.pressedItem == static_cast<int>(dis->itemID) && ui.pressedAction == InlineAction::ToggleBypass);
+    const bool pressedRemove = (ui.pressedItem == static_cast<int>(dis->itemID) && ui.pressedAction == InlineAction::Remove);
+
+    DrawInlineButton(dis->hDC, layout.enableRect, row.enabled ? L"On" : L"Off", row.enabled, hoverEnable, pressedEnable, g_fontSmall);
+    DrawInlineButton(dis->hDC, layout.bypassRect, row.bypass ? L"Byp" : L"Act", row.bypass, hoverBypass, pressedBypass, g_fontSmall);
+    DrawInlineButton(dis->hDC, layout.removeRect, L"Remove", false, hoverRemove, pressedRemove, g_fontSmall);
+
+    const int count = static_cast<int>(ui.rows.size());
+    if (ui.dragging && ui.dragInsertIndex >= 0) {
+        HPEN linePen = CreatePen(PS_SOLID, std::max(1, S(2)), g_theme.accent);
+        HGDIOBJ oldLinePen = SelectObject(dis->hDC, linePen);
+        if (ui.dragInsertIndex == static_cast<int>(dis->itemID)) {
+            MoveToEx(dis->hDC, rc.left + S(2), rc.top + 1, nullptr);
+            LineTo(dis->hDC, rc.right - S(2), rc.top + 1);
+        } else if (ui.dragInsertIndex == count && static_cast<int>(dis->itemID) == count - 1) {
+            MoveToEx(dis->hDC, rc.left + S(2), rc.bottom - 1, nullptr);
+            LineTo(dis->hDC, rc.right - S(2), rc.bottom - 1);
+        }
+        SelectObject(dis->hDC, oldLinePen);
+        DeleteObject(linePen);
+    }
+
+    HPEN dividerPen = CreatePen(PS_SOLID, 1, RGB(225, 231, 240));
+    HGDIOBJ oldDivider = SelectObject(dis->hDC, dividerPen);
+    MoveToEx(dis->hDC, rc.left + S(2), rc.bottom - 1, nullptr);
+    LineTo(dis->hDC, rc.right - S(2), rc.bottom - 1);
+    SelectObject(dis->hDC, oldDivider);
+    DeleteObject(dividerPen);
 
     if (focused) {
         RECT focusRc = dis->rcItem;
-        focusRc.left += 1;
-        focusRc.right -= 1;
-        focusRc.top += 1;
-        focusRc.bottom -= 1;
+        focusRc.left += S(2);
+        focusRc.right -= S(2);
+        focusRc.top += S(2);
+        focusRc.bottom -= S(2);
         DrawFocusRect(dis->hDC, &focusRc);
     }
 }
@@ -806,6 +1405,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_lastMicMeterText.clear();
         g_lastMusicClipEventsText.clear();
         g_lastMicClipEventsText.clear();
+        ResetListPointerState(g_musicListUi);
+        ResetListPointerState(g_micListUi);
+        g_musicListUi.rows.clear();
+        g_micListUi.rows.clear();
         g_lastListRefreshTickMs = 0;
         g_ownerVstAutostartChecked = MicMixApp::Instance().GetSettings().vstHostAutostart;
 
@@ -854,43 +1457,66 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         CreateWindowW(L"STATIC", L"Shared with MicMix monitor path", WS_CHILD | WS_VISIBLE, topLeft + (actionButtonW + controlGap) * 2, topY + S(kUiTopCardHintOffsetYpx), S(220), S(18), hwnd, reinterpret_cast<HMENU>(IDC_MONITOR_HINT), nullptr, nullptr);
         CreateWindowW(L"BUTTON", L"VST Host autostart", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP, topLeft, g_rcTop.top + S(kUiTopCardCheckboxOffsetYpx), autostartCheckboxW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_VST_AUTOSTART), nullptr, nullptr);
 
-        const int sectionLeft = g_rcMusic.left + S(kCardInnerPaddingPx);
-        const int sectionTop = g_rcMusic.top + S(kCardInnerPaddingPx);
-        const int musicListTop = sectionTop + S(kUiSectionListTopOffsetYpx);
-        const int musicStatusX = g_rcMusicMeter.right + S(4);
-        const int musicStatusW = std::max(0, static_cast<int>((g_rcMusic.right - S(kCardInnerPaddingPx)) - musicStatusX));
-        CreateWindowW(L"STATIC", L"Audio Meter", WS_CHILD | WS_VISIBLE, sectionLeft, sectionTop + S(kUiSectionMeterLabelOffsetYpx), S(130), S(24), hwnd, reinterpret_cast<HMENU>(IDC_AUDIO_METER_LABEL), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, musicStatusX, g_rcMusicMeter.top + S(2), musicStatusW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_AUDIO_METER_TEXT), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, musicStatusX, g_rcMusicClip.top, musicStatusW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_AUDIO_CLIP_EVENTS), nullptr, nullptr);
-        CreateWindowW(L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
-            sectionLeft, musicListTop, S(458), S(90), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_LIST), nullptr, nullptr);
-        const int musicBtnX = sectionLeft + S(468);
-        CreateWindowW(L"BUTTON", L"Add", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, musicBtnX, musicListTop, S(86), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_ADD), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Remove", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, musicBtnX, musicListTop + S(30), S(86), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_REMOVE), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, musicBtnX, musicListTop + S(60), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_UP), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Down", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, musicBtnX + S(46), musicListTop + S(60), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_DOWN), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"On", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, musicBtnX, musicListTop + S(90), S(26), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_ENABLE), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Byp", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, musicBtnX + S(30), musicListTop + S(90), S(26), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_BYPASS), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Ed", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, musicBtnX + S(60), musicListTop + S(90), S(26), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_EDITOR), nullptr, nullptr);
+        const int meterLeft = g_rcMusic.left + S(kCardInnerPaddingPx);
+        const int meterTop = g_rcMusic.top + S(10);
+        const int meterStatusX = g_rcMusicMeter.right + S(4);
+        const int meterStatusW = std::max(0, static_cast<int>((g_rcMusic.right - S(kCardInnerPaddingPx)) - meterStatusX));
+        CreateWindowW(L"STATIC", L"Audio Meter", WS_CHILD | WS_VISIBLE, meterLeft, meterTop + S(20), S(130), S(24), hwnd, reinterpret_cast<HMENU>(IDC_AUDIO_METER_LABEL), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, meterStatusX, g_rcMusicMeter.top + S(2), meterStatusW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_AUDIO_METER_TEXT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, meterStatusX, g_rcMusicClip.top, meterStatusW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_AUDIO_CLIP_EVENTS), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"Mic Meter", WS_CHILD | WS_VISIBLE, meterLeft, meterTop + S(68), S(130), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_LABEL), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, meterStatusX, g_rcMicMeter.top + S(2), meterStatusW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_TEXT), nullptr, nullptr);
+        CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, meterStatusX, g_rcMicClip.top, meterStatusW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_CLIP_EVENTS), nullptr, nullptr);
 
-        const int micLeft = g_rcMic.left + S(kCardInnerPaddingPx);
-        const int micTop = g_rcMic.top + S(kCardInnerPaddingPx);
-        const int micListTop = micTop + S(kUiSectionListTopOffsetYpx);
-        const int micStatusX = g_rcMicMeter.right + S(4);
-        const int micStatusW = std::max(0, static_cast<int>((g_rcMic.right - S(kCardInnerPaddingPx)) - micStatusX));
-        CreateWindowW(L"STATIC", L"Mic Meter", WS_CHILD | WS_VISIBLE, micLeft, micTop + S(kUiSectionMeterLabelOffsetYpx), S(130), S(24), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_LABEL), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"No signal", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, micStatusX, g_rcMicMeter.top + S(2), micStatusW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_METER_TEXT), nullptr, nullptr);
-        CreateWindowW(L"STATIC", L"CLIP Events: 0", WS_CHILD | WS_VISIBLE, micStatusX, g_rcMicClip.top, micStatusW, S(18), hwnd, reinterpret_cast<HMENU>(IDC_MIC_CLIP_EVENTS), nullptr, nullptr);
-        CreateWindowW(L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
-            micLeft, micListTop, S(458), S(90), hwnd, reinterpret_cast<HMENU>(IDC_MIC_LIST), nullptr, nullptr);
-        const int micBtnX = micLeft + S(468);
+        const int effectsLeft = g_rcMic.left + S(kCardInnerPaddingPx);
+        const int effectsTop = g_rcMic.top + S(10);
+        const int listW = S(458);
+        const int listH = S(104);
+        const int audioEffectsLabelY = effectsTop + S(12);
+        const int audioListTop = effectsTop + S(30);
+        const int audioBtnX = effectsLeft + S(468);
+        CreateWindowW(L"STATIC", L"Audio Effects", WS_CHILD | WS_VISIBLE, effectsLeft, audioEffectsLabelY, S(160), S(20), hwnd, nullptr, nullptr, nullptr);
+        HWND musicList = CreateWindowW(
+            L"LISTBOX",
+            L"",
+            WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
+            effectsLeft,
+            audioListTop,
+            listW,
+            listH,
+            hwnd,
+            reinterpret_cast<HMENU>(IDC_MUSIC_LIST),
+            nullptr,
+            nullptr);
+        CreateWindowW(L"BUTTON", L"Add", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, audioBtnX, audioListTop, S(86), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_ADD), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, audioBtnX, audioListTop + S(32), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_UP), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Down", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, audioBtnX + S(46), audioListTop + S(32), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_DOWN), nullptr, nullptr);
+        if (musicList) {
+            SetWindowSubclass(musicList, EffectListSubclassProc, kMusicListSubclassId, static_cast<DWORD_PTR>(IDC_MUSIC_LIST));
+        }
+
+        const int micEffectsLabelY = audioListTop + listH + S(10);
+        const int micListTop = micEffectsLabelY + S(18);
+        const int micBtnX = effectsLeft + S(468);
+        CreateWindowW(L"STATIC", L"Mic Effects", WS_CHILD | WS_VISIBLE, effectsLeft, micEffectsLabelY, S(160), S(20), hwnd, nullptr, nullptr, nullptr);
+        HWND micList = CreateWindowW(
+            L"LISTBOX",
+            L"",
+            WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
+            effectsLeft,
+            micListTop,
+            listW,
+            listH,
+            hwnd,
+            reinterpret_cast<HMENU>(IDC_MIC_LIST),
+            nullptr,
+            nullptr);
         CreateWindowW(L"BUTTON", L"Add", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX, micListTop, S(86), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_ADD), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Remove", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX, micListTop + S(30), S(86), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_REMOVE), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX, micListTop + S(60), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_UP), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Down", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX + S(46), micListTop + S(60), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_DOWN), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"On", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX, micListTop + S(90), S(26), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_ENABLE), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Byp", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX + S(30), micListTop + S(90), S(26), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_BYPASS), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Ed", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX + S(60), micListTop + S(90), S(26), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_EDITOR), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX, micListTop + S(32), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_UP), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Down", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, micBtnX + S(46), micListTop + S(32), S(40), S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_DOWN), nullptr, nullptr);
+        if (micList) {
+            SetWindowSubclass(micList, EffectListSubclassProc, kMicListSubclassId, static_cast<DWORD_PTR>(IDC_MIC_LIST));
+        }
 
         CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT, g_rcStatus.left + S(kCardInnerPaddingPx), g_rcStatus.top + S(14), (g_rcStatus.right - g_rcStatus.left) - S(kCardInnerPaddingPx * 2), g_rcStatus.bottom - g_rcStatus.top - S(18), hwnd, reinterpret_cast<HMENU>(IDC_STATUS), nullptr, nullptr);
 
@@ -931,7 +1557,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_TIMER:
         if (wParam == kTimerStatus) {
             const uint64_t nowMs = GetTickCount64();
-            if (nowMs > (g_lastListRefreshTickMs + 1000ULL)) {
+            if (!IsListInteracting(hwnd) && nowMs > (g_lastListRefreshTickMs + 1000ULL)) {
                 ReloadAllLists(hwnd);
                 g_lastListRefreshTickMs = nowMs;
             }
@@ -941,18 +1567,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         break;
     case WM_COMMAND:
-        if (HIWORD(wParam) == LBN_DBLCLK) {
-            switch (LOWORD(wParam)) {
-            case IDC_MUSIC_LIST:
-                HandleOpenEditor(hwnd, EffectChain::Music, IDC_MUSIC_LIST);
-                return 0;
-            case IDC_MIC_LIST:
-                HandleOpenEditor(hwnd, EffectChain::Mic, IDC_MIC_LIST);
-                return 0;
-            default:
-                break;
-            }
-        }
         switch (LOWORD(wParam)) {
         case IDC_REPO_LINK:
             if (HIWORD(wParam) == STN_CLICKED) {
@@ -1161,6 +1775,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     case WM_DESTROY:
         KillTimer(hwnd, kTimerStatus);
+        if (HWND musicList = GetDlgItem(hwnd, IDC_MUSIC_LIST)) {
+            RemoveWindowSubclass(musicList, EffectListSubclassProc, kMusicListSubclassId);
+        }
+        if (HWND micList = GetDlgItem(hwnd, IDC_MIC_LIST)) {
+            RemoveWindowSubclass(micList, EffectListSubclassProc, kMicListSubclassId);
+        }
+        ResetListPointerState(g_musicListUi);
+        ResetListPointerState(g_micListUi);
         g_editorOpenPending.store(false, std::memory_order_release);
         g_hwnd.store(nullptr, std::memory_order_release);
         PostQuitMessage(0);
