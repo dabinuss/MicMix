@@ -6,6 +6,7 @@
 #include <endpointvolume.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <Shlwapi.h>
+#include <bcrypt.h>
 #include <tlhelp32.h>
 #include <mmsystem.h>
 #include <wrl/client.h>
@@ -26,7 +27,6 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
-#include <random>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -63,10 +63,12 @@ constexpr size_t kMaxEffectUidLen = 96;
 constexpr size_t kMaxEffectStateBlobLen = 4096;
 constexpr size_t kMaxEffectStatusLen = 64;
 constexpr wchar_t kVstHostPipeName[] = L"micmix_vst_host";
+constexpr wchar_t kVstAudioShmPrefix[] = L"Local\\MicMixVstAudioV2";
 constexpr size_t kVstHostMaxPipeMessageBytes = 64U * 1024U;
 constexpr size_t kVstHostSyncPayloadMaxBytes = 28U * 1024U;
 constexpr uint64_t kVstOutputWaitMinUs = 6000ULL;
 constexpr uint64_t kVstOutputWaitMaxUs = 24000ULL;
+constexpr uint64_t kVstMicOutputWaitMaxUs = 2000ULL;
 constexpr size_t kVstPendingPacketLimit = 128;
 
 uint64_t ComputeVstOutputWaitUs(uint32_t frames) {
@@ -648,16 +650,30 @@ std::string BuildEffectUid(const std::string& normalizedPath) {
 
 std::string GenerateHexToken(size_t byteCount) {
     static constexpr char kHex[] = "0123456789abcdef";
-    std::random_device rd;
-    std::mt19937_64 rng(
-        (static_cast<uint64_t>(rd()) << 32) ^
-        static_cast<uint64_t>(rd()) ^
-        static_cast<uint64_t>(GetTickCount64()));
-    std::uniform_int_distribution<uint32_t> dist(0U, 255U);
+    std::string bytes;
+    bytes.resize(byteCount);
+    NTSTATUS status = BCryptGenRandom(
+        nullptr,
+        reinterpret_cast<PUCHAR>(bytes.data()),
+        static_cast<ULONG>(bytes.size()),
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (!BCRYPT_SUCCESS(status)) {
+        BCRYPT_ALG_HANDLE rng = nullptr;
+        if (BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&rng, BCRYPT_RNG_ALGORITHM, nullptr, 0))) {
+            status = BCryptGenRandom(
+                rng,
+                reinterpret_cast<PUCHAR>(bytes.data()),
+                static_cast<ULONG>(bytes.size()),
+                0);
+            BCryptCloseAlgorithmProvider(rng, 0);
+        }
+    }
+    if (!BCRYPT_SUCCESS(status)) {
+        return {};
+    }
     std::string out;
     out.reserve(byteCount * 2U);
-    for (size_t i = 0; i < byteCount; ++i) {
-        const unsigned char b = static_cast<unsigned char>(dist(rng));
+    for (unsigned char b : bytes) {
         out.push_back(kHex[(b >> 4) & 0x0F]);
         out.push_back(kHex[b & 0x0F]);
     }
@@ -665,12 +681,30 @@ std::string GenerateHexToken(size_t byteCount) {
 }
 
 std::wstring GenerateVstHostPipeName() {
+    const std::string token = GenerateHexToken(8);
+    if (token.empty()) {
+        return {};
+    }
     std::wostringstream ss;
     ss << kVstHostPipeName << L"_"
        << std::hex << std::nouppercase
        << static_cast<unsigned long>(GetCurrentProcessId())
        << L"_"
-       << Utf8ToWide(GenerateHexToken(8));
+       << Utf8ToWide(token);
+    return ss.str();
+}
+
+std::wstring GenerateVstAudioShmName() {
+    const std::string token = GenerateHexToken(8);
+    if (token.empty()) {
+        return {};
+    }
+    std::wostringstream ss;
+    ss << kVstAudioShmPrefix << L"_"
+       << std::hex << std::nouppercase
+       << static_cast<unsigned long>(GetCurrentProcessId())
+       << L"_"
+       << Utf8ToWide(token);
     return ss.str();
 }
 
@@ -4066,13 +4100,19 @@ bool MicMixApp::EnsureVstAudioIpc() {
     if (vstAudioShared_.load(std::memory_order_acquire) != nullptr) {
         return true;
     }
+    if (vstAudioShmName_.empty()) {
+        vstAudioShmName_ = GenerateVstAudioShmName();
+    }
+    if (vstAudioShmName_.empty()) {
+        return false;
+    }
     HANDLE map = CreateFileMappingW(
         INVALID_HANDLE_VALUE,
         nullptr,
         PAGE_READWRITE,
         0,
         static_cast<DWORD>(sizeof(micmix::vstipc::SharedMemory)),
-        micmix::vstipc::kSharedMemoryName);
+        vstAudioShmName_.c_str());
     if (!map) {
         return false;
     }
@@ -4207,8 +4247,35 @@ bool MicMixApp::StartVstHostProcess(std::string& error) {
     if (vstHostPipeName_.empty()) {
         vstHostPipeName_ = GenerateVstHostPipeName();
     }
+    if (vstHostPipeName_.empty()) {
+        error = "vst host pipe token generation failed";
+        std::lock_guard<std::mutex> lock(vstHostMutex_);
+        vstHostMessage_ = error;
+        return false;
+    }
     if (vstHostAuthToken_.empty()) {
         vstHostAuthToken_ = GenerateHexToken(16);
+    }
+    if (vstHostAuthToken_.empty()) {
+        error = "vst host auth token generation failed";
+        std::lock_guard<std::mutex> lock(vstHostMutex_);
+        vstHostMessage_ = error;
+        return false;
+    }
+    if (vstAudioShmName_.empty()) {
+        vstAudioShmName_ = GenerateVstAudioShmName();
+    }
+    if (vstAudioShmName_.empty()) {
+        error = "vst shared memory token generation failed";
+        std::lock_guard<std::mutex> lock(vstHostMutex_);
+        vstHostMessage_ = error;
+        return false;
+    }
+    if (!EnsureVstAudioIpc()) {
+        error = "vst audio shared memory init failed";
+        std::lock_guard<std::mutex> lock(vstHostMutex_);
+        vstHostMessage_ = error;
+        return false;
     }
 
     std::wstring cmdLine = L"\"";
@@ -4217,6 +4284,8 @@ bool MicMixApp::StartVstHostProcess(std::string& error) {
     cmdLine += vstHostPipeName_;
     cmdLine += L" --auth ";
     cmdLine += Utf8ToWide(vstHostAuthToken_);
+    cmdLine += L" --shm ";
+    cmdLine += vstAudioShmName_;
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
@@ -5705,6 +5774,7 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
         shutdownRequested_.store(false, std::memory_order_release);
         captureCallbacksInFlight_.store(0, std::memory_order_release);
         vstHostPipeName_ = GenerateVstHostPipeName();
+        vstAudioShmName_ = GenerateVstAudioShmName();
         vstHostAuthToken_ = GenerateHexToken(16);
         {
             std::lock_guard<std::mutex> lock(musicMetaMutex_);
@@ -5834,6 +5904,7 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
     }
     vstEffectsEnabledCached_.store(false, std::memory_order_release);
     vstHostPipeName_.clear();
+    vstAudioShmName_.clear();
     vstHostAuthToken_.clear();
     configStore_.reset();
     initialized_.store(false, std::memory_order_release);
@@ -5888,6 +5959,7 @@ void MicMixApp::Shutdown() {
     }
     vstEffectsEnabledCached_.store(false, std::memory_order_release);
     vstHostPipeName_.clear();
+    vstAudioShmName_.clear();
     vstHostAuthToken_.clear();
     configStore_.reset();
 }
@@ -6121,8 +6193,16 @@ void MicMixApp::ProcessMicInputWithVst(short* samples, int sampleCount, int chan
     if (!samples || sampleCount <= 0 || channels <= 0) {
         return;
     }
-    static std::mutex micVstIpcMutex;
-    std::lock_guard<std::mutex> ipcLock(micVstIpcMutex);
+    static std::atomic_flag micVstIpcBusy = ATOMIC_FLAG_INIT;
+    if (micVstIpcBusy.test_and_set(std::memory_order_acquire)) {
+        return;
+    }
+    struct MicIpcBusyGuard {
+        std::atomic_flag& flag;
+        ~MicIpcBusyGuard() {
+            flag.clear(std::memory_order_release);
+        }
+    } busyGuard{micVstIpcBusy};
     thread_local PendingVstPackets pendingMicPackets;
     thread_local uint32_t lastMicSeq = 0;
     thread_local float micWetMix = 1.0f;
@@ -6175,7 +6255,7 @@ void MicMixApp::ProcessMicInputWithVst(short* samples, int sampleCount, int chan
         bool processed = false;
         micmix::vstipc::AudioPacket out{};
         if (micmix::vstipc::RingPush(shm->micIn, packet)) {
-            const uint64_t waitUs = std::min<uint64_t>(12000ULL, ComputeVstOutputWaitUs(frames));
+            const uint64_t waitUs = std::min<uint64_t>(kVstMicOutputWaitMaxUs, ComputeVstOutputWaitUs(frames));
             processed = TryReadMatchingVstPacket(
                 shm->micOut,
                 packet.seq,

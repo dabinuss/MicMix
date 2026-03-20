@@ -484,6 +484,7 @@ private:
     HANDLE vstAudioMap_ = nullptr;
     std::atomic<micmix::vstipc::SharedMemory*> vstAudioShared_{nullptr};
     std::wstring vstHostPipeName_;
+    std::wstring vstAudioShmName_;
     std::string vstHostAuthToken_;
     std::string vstHostMessage_;
     std::atomic<uint32_t> vstMusicSeq_{1};

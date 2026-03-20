@@ -95,6 +95,7 @@ endif()
 
 target_link_libraries(micmix PRIVATE
   speexdsp_resampler
+  bcrypt
   ole32
   uuid
   avrt
@@ -178,6 +179,7 @@ if(MICMIX_BUILD_TESTS)
 
   target_link_libraries(micmix_config_store_tests PRIVATE
     speexdsp_resampler
+    bcrypt
     ole32
     uuid
     avrt

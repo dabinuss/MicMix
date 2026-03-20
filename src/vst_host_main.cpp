@@ -1666,6 +1666,7 @@ std::string HandleEditorClose(const std::string& args, HostState& state) {
 
 int wmain(int argc, wchar_t** argv) {
     std::wstring pipeName = L"micmix_vst_host";
+    std::wstring shmName = micmix::vstipc::kSharedMemoryName;
     std::string authToken;
     for (int i = 1; i + 1 < argc; ++i) {
         if (_wcsicmp(argv[i], L"--pipe") == 0) {
@@ -1678,28 +1679,43 @@ int wmain(int argc, wchar_t** argv) {
             ++i;
             continue;
         }
+        if (_wcsicmp(argv[i], L"--shm") == 0) {
+            shmName = argv[i + 1];
+            ++i;
+            continue;
+        }
     }
     const std::wstring pipePath = std::wstring(L"\\\\.\\pipe\\") + pipeName;
 
     HostState state{};
     state.hostContext = new HostApplication();
 
-    state.shmMap = CreateFileMappingW(
-        INVALID_HANDLE_VALUE,
-        nullptr,
-        PAGE_READWRITE,
-        0,
-        static_cast<DWORD>(sizeof(micmix::vstipc::SharedMemory)),
-        micmix::vstipc::kSharedMemoryName);
-    if (state.shmMap) {
-        void* view = MapViewOfFile(state.shmMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(micmix::vstipc::SharedMemory));
-        state.shm = reinterpret_cast<micmix::vstipc::SharedMemory*>(view);
-        if (state.shm &&
-            (state.shm->magic != micmix::vstipc::kMagic || state.shm->version != micmix::vstipc::kVersion)) {
-            micmix::vstipc::InitializeSharedMemory(*state.shm);
-        }
-        ResetAudioRings(state);
+    state.shmMap = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, shmName.c_str());
+    if (!state.shmMap) {
+        HostLog("shared memory open failed name=" + WideToUtf8(shmName) +
+                " err=" + std::to_string(GetLastError()));
+        delete state.hostContext;
+        return 2;
     }
+    void* view = MapViewOfFile(state.shmMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(micmix::vstipc::SharedMemory));
+    state.shm = reinterpret_cast<micmix::vstipc::SharedMemory*>(view);
+    if (!state.shm) {
+        HostLog("shared memory map failed name=" + WideToUtf8(shmName) +
+                " err=" + std::to_string(GetLastError()));
+        CloseHandle(state.shmMap);
+        delete state.hostContext;
+        return 3;
+    }
+    if (state.shm->magic != micmix::vstipc::kMagic || state.shm->version != micmix::vstipc::kVersion) {
+        HostLog("shared memory header invalid");
+        UnmapViewOfFile(state.shm);
+        state.shm = nullptr;
+        CloseHandle(state.shmMap);
+        state.shmMap = nullptr;
+        delete state.hostContext;
+        return 4;
+    }
+    ResetAudioRings(state);
 
     state.uiCmdThread = std::thread([&state]() { UiCommandMain(&state); });
     state.worker = std::thread([&state]() { WorkerMain(&state); });
