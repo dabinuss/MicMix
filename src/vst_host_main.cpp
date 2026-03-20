@@ -73,6 +73,7 @@ using Steinberg::Vst::kSample32;
 constexpr size_t kMaxEffectsPerChain = 64;
 constexpr size_t kMaxPipeMessageBytes = 64U * 1024U;
 constexpr uint32_t kProcessTimeoutMs = 30U;
+constexpr uint32_t kRebuildCrossfadeSamples = 384U;
 constexpr UINT kMsgUiWake = WM_APP + 201U;
 
 struct EffectSlot {
@@ -1130,6 +1131,12 @@ struct HostState {
     std::vector<int> micSlotToLoaded;
     std::vector<std::unique_ptr<LoadedVst>> musicChain;
     std::vector<std::unique_ptr<LoadedVst>> micChain;
+    float musicLastOut = 0.0f;
+    float micLastOut = 0.0f;
+    float musicTransitionAnchor = 0.0f;
+    float micTransitionAnchor = 0.0f;
+    uint32_t musicTransitionRemaining = 0;
+    uint32_t micTransitionRemaining = 0;
     std::mutex chainMutex;
     std::string status = "idle";
     uint32_t blocked = 0;
@@ -1221,8 +1228,10 @@ void RebuildChains(HostState& state) {
     for (size_t i = 0; i < state.micSlots.size(); ++i) {
         loadOne(state.micSlots[i], i, state.micSlotToLoaded, state.micChain);
     }
-
-    ResetAudioRings(state);
+    state.musicTransitionAnchor = state.musicLastOut;
+    state.micTransitionAnchor = state.micLastOut;
+    state.musicTransitionRemaining = kRebuildCrossfadeSamples;
+    state.micTransitionRemaining = kRebuildCrossfadeSamples;
 }
 
 bool ProcessPacketChain(HostState& state, bool isMusic, micmix::vstipc::AudioPacket& packet) {
@@ -1232,26 +1241,44 @@ bool ProcessPacketChain(HostState& state, bool isMusic, micmix::vstipc::AudioPac
     }
 
     std::lock_guard<std::mutex> lock(state.chainMutex);
-    if (!state.effectsEnabled) {
-        return true;
-    }
     const auto& chain = isMusic ? state.musicChain : state.micChain;
-    for (const auto& plugin : chain) {
-        if (!plugin.get()) {
-            continue;
-        }
-        const auto started = std::chrono::steady_clock::now();
-        if (!plugin->Process(packet.samples, packet.frames)) {
-            state.status = "degraded_bypass";
-            return false;
-        }
-        const auto elapsedMs = static_cast<uint32_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count());
-        if (elapsedMs > kProcessTimeoutMs) {
-            state.status = "timeout_bypass";
-            return false;
+    if (state.effectsEnabled) {
+        for (const auto& plugin : chain) {
+            if (!plugin.get()) {
+                continue;
+            }
+            const auto started = std::chrono::steady_clock::now();
+            if (!plugin->Process(packet.samples, packet.frames)) {
+                state.status = "degraded_bypass";
+                break;
+            }
+            const auto elapsedMs = static_cast<uint32_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count());
+            if (elapsedMs > kProcessTimeoutMs) {
+                state.status = "timeout_bypass";
+                break;
+            }
         }
     }
+
+    float& lastOut = isMusic ? state.musicLastOut : state.micLastOut;
+    float& transitionAnchor = isMusic ? state.musicTransitionAnchor : state.micTransitionAnchor;
+    uint32_t& transitionRemaining = isMusic ? state.musicTransitionRemaining : state.micTransitionRemaining;
+    if (transitionRemaining > 0) {
+        const uint32_t total = std::max<uint32_t>(1U, kRebuildCrossfadeSamples);
+        for (uint32_t i = 0; i < packet.frames; ++i) {
+            if (transitionRemaining == 0) {
+                break;
+            }
+            const float alpha = 1.0f - (static_cast<float>(transitionRemaining) / static_cast<float>(total));
+            const float target = packet.samples[i];
+            const float blended = transitionAnchor + ((target - transitionAnchor) * alpha);
+            packet.samples[i] = blended;
+            transitionAnchor = blended;
+            --transitionRemaining;
+        }
+    }
+    lastOut = packet.samples[packet.frames - 1U];
     return true;
 }
 

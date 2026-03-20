@@ -68,7 +68,9 @@ constexpr size_t kVstHostMaxPipeMessageBytes = 64U * 1024U;
 constexpr size_t kVstHostSyncPayloadMaxBytes = 28U * 1024U;
 constexpr uint64_t kVstOutputWaitMinUs = 6000ULL;
 constexpr uint64_t kVstOutputWaitMaxUs = 24000ULL;
-constexpr uint64_t kVstMicOutputWaitMaxUs = 2000ULL;
+constexpr uint64_t kVstMicIpcAcquireSpinUs = 600ULL;
+constexpr uint64_t kVstMicOutputWaitMinUs = 3000ULL;
+constexpr uint64_t kVstMicOutputWaitMaxUs = 8000ULL;
 constexpr size_t kVstPendingPacketLimit = 128;
 
 uint64_t ComputeVstOutputWaitUs(uint32_t frames) {
@@ -6193,8 +6195,24 @@ void MicMixApp::ProcessMicInputWithVst(short* samples, int sampleCount, int chan
     if (!samples || sampleCount <= 0 || channels <= 0) {
         return;
     }
+    thread_local PendingVstPackets pendingMicPackets;
+    thread_local uint32_t lastMicSeq = 0;
+    thread_local float micWetMix = 1.0f;
     static std::atomic_flag micVstIpcBusy = ATOMIC_FLAG_INIT;
-    if (micVstIpcBusy.test_and_set(std::memory_order_acquire)) {
+    bool acquired = !micVstIpcBusy.test_and_set(std::memory_order_acquire);
+    if (!acquired) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(kVstMicIpcAcquireSpinUs);
+        while (std::chrono::steady_clock::now() < deadline) {
+            SwitchToThread();
+            if (!micVstIpcBusy.test_and_set(std::memory_order_acquire)) {
+                acquired = true;
+                break;
+            }
+        }
+    }
+    if (!acquired) {
+        pendingMicPackets.Clear();
+        micWetMix = 0.0f;
         return;
     }
     struct MicIpcBusyGuard {
@@ -6203,9 +6221,6 @@ void MicMixApp::ProcessMicInputWithVst(short* samples, int sampleCount, int chan
             flag.clear(std::memory_order_release);
         }
     } busyGuard{micVstIpcBusy};
-    thread_local PendingVstPackets pendingMicPackets;
-    thread_local uint32_t lastMicSeq = 0;
-    thread_local float micWetMix = 1.0f;
     constexpr float kVstMixTransitionMs = 4.0f;
     constexpr float kVstMixTransitionSamples = (static_cast<float>(kTargetRate) * kVstMixTransitionMs) / 1000.0f;
     constexpr float kVstMixStep = 1.0f / kVstMixTransitionSamples;
@@ -6255,7 +6270,10 @@ void MicMixApp::ProcessMicInputWithVst(short* samples, int sampleCount, int chan
         bool processed = false;
         micmix::vstipc::AudioPacket out{};
         if (micmix::vstipc::RingPush(shm->micIn, packet)) {
-            const uint64_t waitUs = std::min<uint64_t>(kVstMicOutputWaitMaxUs, ComputeVstOutputWaitUs(frames));
+            const uint64_t waitUs = std::clamp<uint64_t>(
+                ComputeVstOutputWaitUs(frames),
+                kVstMicOutputWaitMinUs,
+                kVstMicOutputWaitMaxUs);
             processed = TryReadMatchingVstPacket(
                 shm->micOut,
                 packet.seq,
