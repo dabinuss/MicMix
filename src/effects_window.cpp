@@ -677,6 +677,72 @@ void HandleMoveEffectToIndex(HWND hwnd, EffectChain chain, int listId, int fromI
     }
 }
 
+int OtherListId(int listId) {
+    return (listId == IDC_MIC_LIST) ? IDC_MUSIC_LIST : IDC_MIC_LIST;
+}
+
+bool ScreenPointToListClient(HWND parent, const POINT& screenPt, int& outListId, POINT& outClientPt) {
+    const int candidateIds[] = { IDC_MUSIC_LIST, IDC_MIC_LIST };
+    for (int id : candidateIds) {
+        HWND list = GetDlgItem(parent, id);
+        if (!list) {
+            continue;
+        }
+        RECT rcClient{};
+        GetClientRect(list, &rcClient);
+        POINT clientPt = screenPt;
+        if (!ScreenToClient(list, &clientPt)) {
+            continue;
+        }
+        if (PtInRect(&rcClient, clientPt)) {
+            outListId = id;
+            outClientPt = clientPt;
+            return true;
+        }
+    }
+    return false;
+}
+
+void HandleMoveEffectBetweenLists(HWND hwnd, int fromListId, int fromIndex, int toListId, int toInsertIndex) {
+    if (fromListId != IDC_MUSIC_LIST && fromListId != IDC_MIC_LIST) {
+        return;
+    }
+    if (toListId != IDC_MUSIC_LIST && toListId != IDC_MIC_LIST) {
+        return;
+    }
+    if (fromIndex < 0) {
+        return;
+    }
+    const EffectChain fromChain = ChainFromListId(fromListId);
+    const EffectChain toChain = ChainFromListId(toListId);
+
+    HWND targetList = GetDlgItem(hwnd, toListId);
+    const int targetCount = targetList ? static_cast<int>(SendMessageW(targetList, LB_GETCOUNT, 0, 0)) : 0;
+    const int insertIndex = std::clamp(toInsertIndex, 0, std::max(0, targetCount));
+
+    std::string error;
+    const bool ok = MicMixApp::Instance().MoveEffectBetweenChains(
+        fromChain,
+        static_cast<size_t>(fromIndex),
+        toChain,
+        static_cast<size_t>(insertIndex),
+        error);
+    ApplyActionResult(hwnd, ok, error, L"Effect moved.");
+    if (!ok) {
+        return;
+    }
+
+    HWND reloadedTarget = GetDlgItem(hwnd, toListId);
+    if (reloadedTarget) {
+        const int reloadedCount = static_cast<int>(SendMessageW(reloadedTarget, LB_GETCOUNT, 0, 0));
+        if (reloadedCount > 0) {
+            const int sel = std::clamp(insertIndex, 0, reloadedCount - 1);
+            SendMessageW(reloadedTarget, LB_SETCURSEL, static_cast<WPARAM>(sel), 0);
+            MarkListInteraction(ListUiStateFromListId(toListId));
+        }
+    }
+}
+
 void HandleBypassEffect(HWND hwnd, EffectChain chain, int listId) {
     const int idx = GetSelectedIndex(hwnd, listId);
     if (idx < 0) {
@@ -1023,22 +1089,44 @@ LRESULT CALLBACK EffectListSubclassProc(
         }
 
         if (ui.dragging) {
-            const RECT clientRect = [] (HWND h) {
-                RECT rc{};
-                GetClientRect(h, &rc);
-                return rc;
-            }(list);
-            if (pt.y < clientRect.top + S(8)) {
-                SendMessageW(list, WM_VSCROLL, SB_LINEUP, 0);
-            } else if (pt.y > clientRect.bottom - S(8)) {
-                SendMessageW(list, WM_VSCROLL, SB_LINEDOWN, 0);
+            POINT screenPt = pt;
+            ClientToScreen(list, &screenPt);
+            int dropListId = listId;
+            POINT dropClientPt = pt;
+            if (parent) {
+                int hitListId = listId;
+                POINT hitClientPt = pt;
+                if (ScreenPointToListClient(parent, screenPt, hitListId, hitClientPt)) {
+                    dropListId = hitListId;
+                    dropClientPt = hitClientPt;
+                }
             }
-            const int nextInsert = ComputeInsertIndexFromPoint(list, pt);
-            if (nextInsert != ui.dragInsertIndex) {
-                const int oldInsert = ui.dragInsertIndex;
-                ui.dragInsertIndex = nextInsert;
-                InvalidateInsertMarker(list, oldInsert);
-                InvalidateInsertMarker(list, nextInsert);
+
+            if (dropListId == listId) {
+                const RECT clientRect = [] (HWND h) {
+                    RECT rc{};
+                    GetClientRect(h, &rc);
+                    return rc;
+                }(list);
+                if (pt.y < clientRect.top + S(8)) {
+                    SendMessageW(list, WM_VSCROLL, SB_LINEUP, 0);
+                } else if (pt.y > clientRect.bottom - S(8)) {
+                    SendMessageW(list, WM_VSCROLL, SB_LINEDOWN, 0);
+                }
+                const int nextInsert = ComputeInsertIndexFromPoint(list, pt);
+                if (nextInsert != ui.dragInsertIndex) {
+                    const int oldInsert = ui.dragInsertIndex;
+                    ui.dragInsertIndex = nextInsert;
+                    InvalidateInsertMarker(list, oldInsert);
+                    InvalidateInsertMarker(list, nextInsert);
+                }
+            } else {
+                if (ui.dragInsertIndex >= 0) {
+                    const int oldInsert = ui.dragInsertIndex;
+                    ui.dragInsertIndex = -1;
+                    InvalidateInsertMarker(list, oldInsert);
+                }
+                MarkListInteraction(ListUiStateFromListId(dropListId));
             }
             SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
             return 0;
@@ -1121,16 +1209,41 @@ LRESULT CALLBACK EffectListSubclassProc(
         }
 
         if (wasDragging && dragSource >= 0) {
-            const int count = static_cast<int>(SendMessageW(list, LB_GETCOUNT, 0, 0));
-            if (count > 0 && dragInsert >= 0) {
-                int target = dragInsert;
-                if (target > dragSource) {
-                    target -= 1;
+            int dropListId = listId;
+            POINT dropClientPt = pt;
+            POINT screenPt = pt;
+            ClientToScreen(list, &screenPt);
+            if (parent) {
+                int hitListId = listId;
+                POINT hitClientPt = pt;
+                if (ScreenPointToListClient(parent, screenPt, hitListId, hitClientPt)) {
+                    dropListId = hitListId;
+                    dropClientPt = hitClientPt;
                 }
-                target = std::clamp(target, 0, count - 1);
-                if (target != dragSource) {
-                    HandleMoveEffectToIndex(parent, ChainFromListId(listId), listId, dragSource, target);
+            }
+
+            if (dropListId == listId) {
+                const int count = static_cast<int>(SendMessageW(list, LB_GETCOUNT, 0, 0));
+                if (count > 0 && dragInsert >= 0) {
+                    int target = dragInsert;
+                    if (target > dragSource) {
+                        target -= 1;
+                    }
+                    target = std::clamp(target, 0, count - 1);
+                    if (target != dragSource) {
+                        HandleMoveEffectToIndex(parent, ChainFromListId(listId), listId, dragSource, target);
+                    }
                 }
+            } else if (parent) {
+                HWND dropList = GetDlgItem(parent, dropListId);
+                int dropInsertIndex = 0;
+                if (dropList) {
+                    dropInsertIndex = ComputeInsertIndexFromPoint(dropList, dropClientPt);
+                    if (dropInsertIndex < 0) {
+                        dropInsertIndex = static_cast<int>(SendMessageW(dropList, LB_GETCOUNT, 0, 0));
+                    }
+                }
+                HandleMoveEffectBetweenLists(parent, listId, dragSource, dropListId, dropInsertIndex);
             }
             InvalidateInsertMarker(list, dragInsert);
             InvalidateListItem(list, dragSource);

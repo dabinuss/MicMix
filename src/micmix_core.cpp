@@ -819,6 +819,29 @@ bool IsDigitsOnly(const std::string& value) {
     });
 }
 
+void EnsureUniqueEffectUidsAcrossChains(MicMixSettings& settings) {
+    std::unordered_set<std::string> usedUids;
+    usedUids.reserve((settings.musicEffects.size() + settings.micEffects.size()) * 2U);
+
+    auto ensureChain = [&usedUids](std::vector<VstEffectSlot>& chain) {
+        for (auto& slot : chain) {
+            if (slot.path.empty()) {
+                continue;
+            }
+            if (slot.uid.empty() || usedUids.find(slot.uid) != usedUids.end()) {
+                const std::string uidSeed = !slot.path.empty() ? slot.path : slot.uid;
+                slot.uid = BuildUniqueEffectUidWithExists(
+                    uidSeed,
+                    [&usedUids](const std::string& uid) { return usedUids.find(uid) != usedUids.end(); });
+            }
+            usedUids.insert(slot.uid);
+        }
+    };
+
+    ensureChain(settings.musicEffects);
+    ensureChain(settings.micEffects);
+}
+
 void SanitizeSettings(MicMixSettings& s) {
     s.configVersion = std::clamp(s.configVersion, 1, 8);
     if (!std::isfinite(s.musicGainDb)) { s.musicGainDb = -15.0f; }
@@ -858,6 +881,7 @@ void SanitizeSettings(MicMixSettings& s) {
 
     MicMixApp::SanitizeEffectList(s.musicEffects);
     MicMixApp::SanitizeEffectList(s.micEffects);
+    EnsureUniqueEffectUidsAcrossChains(s);
 }
 
 void UpdateSlotStatusForUi(VstEffectSlot& slot, bool hostSynchronized) {
@@ -1037,10 +1061,9 @@ bool HexDecode(const std::string& hex, std::string& out) {
 bool NormalizeAndValidateEffectPath(const std::string& rawPath, std::string& normalizedPath, std::string& error);
 
 std::string BuildHostSyncPayload(const MicMixSettings& settings) {
-    auto sanitizeChain = [](const std::vector<VstEffectSlot>& slots) {
+    auto sanitizeChain = [](const std::vector<VstEffectSlot>& slots, std::unordered_set<std::string>& usedUids) {
         std::vector<VstEffectSlot> sanitized;
         sanitized.reserve(slots.size());
-        std::unordered_set<std::string> usedUids;
         for (const auto& slot : slots) {
             std::string normalizedPath;
             std::string pathError;
@@ -1064,8 +1087,10 @@ std::string BuildHostSyncPayload(const MicMixSettings& settings) {
         return sanitized;
     };
 
-    const auto safeMusic = sanitizeChain(settings.musicEffects);
-    const auto safeMic = sanitizeChain(settings.micEffects);
+    std::unordered_set<std::string> usedUids;
+    usedUids.reserve((settings.musicEffects.size() + settings.micEffects.size()) * 2U);
+    const auto safeMusic = sanitizeChain(settings.musicEffects, usedUids);
+    const auto safeMic = sanitizeChain(settings.micEffects, usedUids);
 
     std::ostringstream ss;
     ss << "effects_enabled=" << (settings.vstEffectsEnabled ? 1 : 0) << "\n";
@@ -4746,13 +4771,17 @@ bool MicMixApp::AddEffect(EffectChain chain, const VstEffectSlot& slot, std::str
         }
         safe.uid = BuildUniqueEffectUidWithExists(
             safe.path,
-            [&list](const std::string& uid) {
-                return std::any_of(list.begin(), list.end(), [&uid](const VstEffectSlot& slot) {
-                    return slot.uid == uid;
-                });
+            [this](const std::string& uid) {
+                const auto hasUid = [&uid](const std::vector<VstEffectSlot>& slots) {
+                    return std::any_of(slots.begin(), slots.end(), [&uid](const VstEffectSlot& slot) {
+                        return slot.uid == uid;
+                    });
+                };
+                return hasUid(settings_.musicEffects) || hasUid(settings_.micEffects);
             });
         list.push_back(safe);
         SanitizeEffectList(list);
+        EnsureUniqueEffectUidsAcrossChains(settings_);
         UpdateAllSlotStatusesForUi(settings_, false);
         snapshot = settings_;
     }
@@ -4812,6 +4841,56 @@ bool MicMixApp::MoveEffect(EffectChain chain, size_t fromIndex, size_t toIndex, 
         VstEffectSlot moved = list[fromIndex];
         list.erase(list.begin() + static_cast<std::ptrdiff_t>(fromIndex));
         list.insert(list.begin() + static_cast<std::ptrdiff_t>(toIndex), std::move(moved));
+        UpdateAllSlotStatusesForUi(settings_, false);
+        snapshot = settings_;
+    }
+    if (snapshot.vstEffectsEnabled || snapshot.vstHostAutostart) {
+        vstHostStopPending_.store(false, std::memory_order_release);
+        vstHostSyncPending_.store(true, std::memory_order_release);
+    }
+    if (configStore_) {
+        std::string saveErr;
+        if (!configStore_->Save(snapshot, saveErr) && !saveErr.empty()) {
+            LogError("Config save failed: " + saveErr);
+        }
+    }
+    return true;
+}
+
+bool MicMixApp::MoveEffectBetweenChains(
+    EffectChain fromChain,
+    size_t fromIndex,
+    EffectChain toChain,
+    size_t toIndex,
+    std::string& error) {
+    error.clear();
+    if (fromChain == toChain) {
+        return MoveEffect(fromChain, fromIndex, toIndex, error);
+    }
+
+    MicMixSettings snapshot;
+    {
+        std::lock_guard<std::mutex> lock(settingsMutex_);
+        auto& sourceList = (fromChain == EffectChain::Music) ? settings_.musicEffects : settings_.micEffects;
+        auto& targetList = (toChain == EffectChain::Music) ? settings_.musicEffects : settings_.micEffects;
+        if (fromIndex >= sourceList.size()) {
+            error = "invalid source index";
+            return false;
+        }
+        if (targetList.size() >= kMaxEffectsPerChain) {
+            error = "effect limit reached";
+            return false;
+        }
+
+        VstEffectSlot moved = sourceList[fromIndex];
+        sourceList.erase(sourceList.begin() + static_cast<std::ptrdiff_t>(fromIndex));
+
+        const size_t insertIndex = std::min(toIndex, targetList.size());
+        targetList.insert(targetList.begin() + static_cast<std::ptrdiff_t>(insertIndex), std::move(moved));
+
+        SanitizeEffectList(sourceList);
+        SanitizeEffectList(targetList);
+        EnsureUniqueEffectUidsAcrossChains(settings_);
         UpdateAllSlotStatusesForUi(settings_, false);
         snapshot = settings_;
     }

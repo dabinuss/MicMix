@@ -399,6 +399,7 @@ public:
     bool AddEffect(EffectChain chain, const VstEffectSlot& slot, std::string& error);
     bool RemoveEffect(EffectChain chain, size_t index, std::string& error);
     bool MoveEffect(EffectChain chain, size_t fromIndex, size_t toIndex, std::string& error);
+    bool MoveEffectBetweenChains(EffectChain fromChain, size_t fromIndex, EffectChain toChain, size_t toIndex, std::string& error);
     bool SetEffectBypass(EffectChain chain, size_t index, bool bypass, std::string& error);
     bool SetEffectEnabled(EffectChain chain, size_t index, bool enabled, std::string& error);
     bool OpenEffectEditor(EffectChain chain, size_t index, std::string& error);
