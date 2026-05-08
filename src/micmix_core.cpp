@@ -3796,6 +3796,7 @@ bool AudioSourceManager::Start() {
 void AudioSourceManager::Stop() {
     std::unique_ptr<IAudioSource> sourceToStop;
     StatusFn callback;
+    bool notifyStopped = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!running_ && !source_) {
@@ -3809,13 +3810,14 @@ void AudioSourceManager::Stop() {
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        notifyStopped = (status_.state != SourceState::Stopped);
         status_.state = SourceState::Stopped;
         status_.code = "stopped";
         status_.message = "Source stopped";
         status_.detail.clear();
         callback = statusFn_;
     }
-    if (callback) {
+    if (notifyStopped && callback) {
         callback(SourceState::Stopped, "stopped", "Source stopped", "");
     }
 }
@@ -5542,7 +5544,7 @@ void MicMixApp::ReleaseForcedVoiceTx(uint64 schidHint) {
     forceTxHoldUntilMs_.store(0ULL, std::memory_order_release);
     engine_.SetTalkState(true);
 
-    if (!g_ts3Functions.setPreProcessorConfigValue || !g_ts3Functions.flushClientSelfUpdates) {
+    if (!g_ts3Functions.setPreProcessorConfigValue) {
         return;
     }
 
@@ -5563,15 +5565,20 @@ void MicMixApp::ReleaseForcedVoiceTx(uint64 schidHint) {
     const unsigned int errVad = g_ts3Functions.setPreProcessorConfigValue(schid, "vad", "true");
     const unsigned int errContinous = g_ts3Functions.setPreProcessorConfigValue(schid, "continous_transmission", "false");
     const unsigned int errContinuous = g_ts3Functions.setPreProcessorConfigValue(schid, "continuous_transmission", "false");
-    const unsigned int errFlush = g_ts3Functions.flushClientSelfUpdates(schid, nullptr);
     const bool okVad = (errVad == ERROR_ok || errVad == ERROR_ok_no_update);
-    const bool okFlush = (errFlush == ERROR_ok || errFlush == ERROR_ok_no_update);
+    const bool okContinous = (errContinous == ERROR_ok ||
+                              errContinous == ERROR_ok_no_update ||
+                              errContinous == ERROR_not_implemented ||
+                              errContinous == ERROR_sound_internal_preprocessor);
+    const bool okContinuous = (errContinuous == ERROR_ok ||
+                               errContinuous == ERROR_ok_no_update ||
+                               errContinuous == ERROR_not_implemented ||
+                               errContinuous == ERROR_sound_internal_preprocessor);
     LogInfo("talk_mode forced release schid=" + std::to_string(schid) +
             " vad_err=" + std::to_string(errVad) +
             " continous_err=" + std::to_string(errContinous) +
-            " continuous_err=" + std::to_string(errContinuous) +
-            " flush_err=" + std::to_string(errFlush));
-    if (!(okVad && okFlush)) {
+            " continuous_err=" + std::to_string(errContinuous));
+    if (!(okVad && okContinous && okContinuous)) {
         LogWarn("talk_mode forced release incomplete schid=" + std::to_string(schid));
     }
 }
