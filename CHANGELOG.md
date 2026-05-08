@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.2.11] - 2026-05-08
+
+### Changed
+
+- Improved forced transmission cleanup when stopping MicMix so TeamSpeak voice activation is released more predictably.
+- Extended shutdown waiting for in-flight capture callbacks to reduce teardown race risk.
+- Reduced duplicate source-stop notifications and related cleanup churn.
+
+### Fixed
+
+- Temporarily disables TeamSpeak automatic gain control while MicMix keeps transmission open, preventing microphone volume from randomly rising and falling during long music streams.
+- Fixed cases where stopping MicMix could leave TeamSpeak in a continuous transmit-like state.
+- Hardened TeamSpeak shutdown by suppressing late TeamSpeak API restore calls during client teardown.
+- Fixed misleading forced-transmission release warnings caused by unsupported TeamSpeak preprocessor keys or unnecessary flush handling.
+
 ## [1.2.10] - 2026-03-19
 
 ### Changed
