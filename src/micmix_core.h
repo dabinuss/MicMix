@@ -419,6 +419,9 @@ private:
     void StartVoiceTxThread();
     void StopVoiceTxThread();
     void VoiceTxThreadMain();
+    void StartVstMaintenanceThread();
+    void StopVstMaintenanceThread();
+    void VstMaintenanceThreadMain();
     void SetVoiceRecordingState(bool active, uint64 schid);
     void ReleaseForcedVoiceTx(uint64 schidHint);
     void RefreshVoiceTxControl(uint64 schidHint);
@@ -441,8 +444,11 @@ private:
     std::atomic<bool> ownTalkStatusActive_{false};
     std::atomic_uint64_t ownTalkStatusTickMs_{0};
     std::thread voiceTxThread_;
+    std::thread vstMaintenanceThread_;
     std::atomic<bool> voiceTxStop_{false};
     std::atomic<bool> voiceTxThreadRunning_{false};
+    std::atomic<bool> vstMaintenanceStop_{false};
+    std::atomic<bool> vstMaintenanceThreadRunning_{false};
     std::atomic<bool> voiceRecordingActive_{false};
     std::atomic<uint64> voiceRecordingSchid_{0};
     std::atomic_uint64_t voiceTxLastNudgeMs_{0};
@@ -491,6 +497,7 @@ private:
     std::string vstHostMessage_;
     std::atomic<uint32_t> vstMusicSeq_{1};
     std::atomic<uint32_t> vstMicSeq_{1};
+    std::atomic<bool> vstAudioClosePending_{false};
 
     bool TryEnterCaptureCallback();
     void LeaveCaptureCallback();

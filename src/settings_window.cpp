@@ -121,6 +121,7 @@ std::atomic<bool> g_sourceRefreshInFlight{false};
 std::atomic<bool> g_sourceRefreshPending{false};
 std::atomic<bool> g_sourceRefreshPendingReload{false};
 std::atomic<bool> g_saveDebouncePending{false};
+std::atomic<bool> g_closing{false};
 std::unordered_map<uint32_t, HICON> g_appIconsByPid;
 HICON g_loopbackFallbackIcon = nullptr;
 HICON g_appFallbackIcon = nullptr;
@@ -816,7 +817,9 @@ bool StartSourceRefreshWorker(HWND hwnd, uint64_t seq) {
                 g_pendingCaptureDevices = std::move(captureDevices);
                 g_pendingApps = std::move(apps);
             }
-            if (!PostMessageW(hwnd, kMsgSourceRefreshDone, static_cast<WPARAM>(seq), 0)) {
+            if (g_closing.load(std::memory_order_acquire) ||
+                !IsWindow(hwnd) ||
+                !PostMessageW(hwnd, kMsgSourceRefreshDone, static_cast<WPARAM>(seq), 0)) {
                 g_sourceRefreshInFlight.store(false, std::memory_order_release);
                 g_sourceRefreshActiveSeq.store(0, std::memory_order_release);
                 const HWND currentHwnd = g_hwnd.load(std::memory_order_acquire);
@@ -1968,6 +1971,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (MicMixApp::Instance().IsMonitorEnabled()) {
             MicMixApp::Instance().SetMonitorEnabled(false);
         }
+        g_closing.store(true, std::memory_order_release);
         g_hwnd.store(nullptr, std::memory_order_release);
         g_sourceRefreshInFlight.store(false, std::memory_order_release);
         g_sourceRefreshActiveSeq.store(0, std::memory_order_release);
@@ -2005,6 +2009,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 void WindowThreadMain() {
+    g_closing.store(false, std::memory_order_release);
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES };
     InitCommonControlsEx(&icc);
 
@@ -2102,6 +2107,7 @@ void SettingsWindowController::Open() {
 
 void SettingsWindowController::Close() {
     std::lock_guard<std::mutex> lock(g_mutex);
+    g_closing.store(true, std::memory_order_release);
     if (MicMixApp::Instance().IsMonitorEnabled()) {
         MicMixApp::Instance().SetMonitorEnabled(false);
     }

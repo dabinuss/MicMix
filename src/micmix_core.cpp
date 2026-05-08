@@ -4235,6 +4235,12 @@ bool MicMixApp::PingVstHost(std::string& response, std::string& error) const {
 }
 
 bool MicMixApp::EnsureVstAudioIpc() {
+    if (vstAudioClosePending_.load(std::memory_order_acquire)) {
+        CloseVstAudioIpc();
+        if (vstAudioClosePending_.load(std::memory_order_acquire)) {
+            return false;
+        }
+    }
     if (vstAudioShared_.load(std::memory_order_acquire) != nullptr) {
         return true;
     }
@@ -4275,12 +4281,14 @@ bool MicMixApp::EnsureVstAudioIpc() {
     vstAudioShared_.store(shm, std::memory_order_release);
     vstMusicSeq_.store(1U, std::memory_order_release);
     vstMicSeq_.store(1U, std::memory_order_release);
+    vstAudioClosePending_.store(false, std::memory_order_release);
     return true;
 }
 
 void MicMixApp::CloseVstAudioIpc() {
     if (!WaitForCaptureCallbacksToDrain(2000U)) {
         LogWarn("vst ipc close postponed: capture callback still active");
+        vstAudioClosePending_.store(true, std::memory_order_release);
         return;
     }
     auto* shared = vstAudioShared_.exchange(nullptr, std::memory_order_acq_rel);
@@ -4293,6 +4301,7 @@ void MicMixApp::CloseVstAudioIpc() {
     }
     vstMusicSeq_.store(1U, std::memory_order_release);
     vstMicSeq_.store(1U, std::memory_order_release);
+    vstAudioClosePending_.store(false, std::memory_order_release);
 }
 
 bool MicMixApp::SyncVstHostState(const MicMixSettings& settings, std::string& error) {
@@ -5767,15 +5776,9 @@ void MicMixApp::VoiceTxThreadMain() {
         uint64_t vadGateHoldUntilMs = 0;
         uint64_t vadAboveThresholdSinceMs = 0;
         bool vadQualifiedOpen = false;
-        uint64_t lastVstHostMaintainMs = 0;
         while (!voiceTxStop_.load(std::memory_order_acquire)) {
             if (shutdownRequested_.load(std::memory_order_acquire)) {
                 break;
-            }
-            const uint64_t nowMs = GetTickCount64();
-            if (nowMs > (lastVstHostMaintainMs + 200ULL)) {
-                MaintainVstHost(nowMs);
-                lastVstHostMaintainMs = nowMs;
             }
             uint64 schid = activeSchid_.load(std::memory_order_acquire);
             if (schid == 0 && g_ts3Functions.getCurrentServerConnectionHandlerID) {
@@ -5891,7 +5894,7 @@ void MicMixApp::VoiceTxThreadMain() {
                                 const float closeThresholdDb = vadThresholdDb - 2.5f;
                                 if (keyboardGuardEnabled) {
                                     if (candidateOpen) {
-                                        vadAboveThresholdSinceMs = nowMs;
+                                        vadAboveThresholdSinceMs = gateNowMs;
                                         vadQualifiedOpen = true;
                                     } else {
                                         if (vadQualifiedOpen) {
@@ -6017,6 +6020,49 @@ void MicMixApp::StartVoiceTxThread() {
     }
 }
 
+void MicMixApp::VstMaintenanceThreadMain() {
+    vstMaintenanceThreadRunning_.store(true, std::memory_order_release);
+    try {
+        while (!vstMaintenanceStop_.load(std::memory_order_acquire)) {
+            if (shutdownRequested_.load(std::memory_order_acquire)) {
+                break;
+            }
+            MaintainVstHost(GetTickCount64());
+            for (int i = 0; i < 5 && !vstMaintenanceStop_.load(std::memory_order_acquire); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            }
+        }
+    } catch (const std::exception& ex) {
+        LogError(std::string("vst_maintenance thread exception: ") + ex.what());
+    } catch (...) {
+        LogError("vst_maintenance thread exception: unknown");
+    }
+    vstMaintenanceThreadRunning_.store(false, std::memory_order_release);
+}
+
+void MicMixApp::StartVstMaintenanceThread() {
+    if (vstMaintenanceThread_.joinable()) {
+        return;
+    }
+    vstMaintenanceStop_.store(false, std::memory_order_release);
+    try {
+        vstMaintenanceThread_ = std::thread([this]() { VstMaintenanceThreadMain(); });
+    } catch (const std::exception& ex) {
+        vstMaintenanceStop_.store(true, std::memory_order_release);
+        LogError(std::string("vst_maintenance thread start failed: ") + ex.what());
+    } catch (...) {
+        vstMaintenanceStop_.store(true, std::memory_order_release);
+        LogError("vst_maintenance thread start failed: unknown");
+    }
+}
+
+void MicMixApp::StopVstMaintenanceThread() {
+    vstMaintenanceStop_.store(true, std::memory_order_release);
+    if (vstMaintenanceThread_.joinable()) {
+        vstMaintenanceThread_.join();
+    }
+}
+
 void MicMixApp::StopVoiceTxThread() {
     voiceTxStop_.store(true, std::memory_order_release);
     if (voiceTxThread_.joinable()) {
@@ -6127,6 +6173,7 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
                 }
             }
         }
+        StartVstMaintenanceThread();
         StartVoiceTxThread();
         LogInfo("MicMix initialized");
         return true;
@@ -6137,6 +6184,7 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
     }
 
     shutdownRequested_.store(true, std::memory_order_release);
+    StopVstMaintenanceThread();
     StopVoiceTxThread();
     if (musicMuteHotkeyManager_) musicMuteHotkeyManager_->Stop();
     if (micInputMuteHotkeyManager_) micInputMuteHotkeyManager_->Stop();
@@ -6187,6 +6235,7 @@ void MicMixApp::Shutdown() {
     EffectsWindowController::Instance().Close();
     if (musicMuteHotkeyManager_) musicMuteHotkeyManager_->Stop();
     if (micInputMuteHotkeyManager_) micInputMuteHotkeyManager_->Stop();
+    StopVstMaintenanceThread();
     StopVoiceTxThread();
     if (!WaitForCaptureCallbacksToDrain(1500U)) {
         LogWarn("capture callbacks still active during shutdown");
