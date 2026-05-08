@@ -3114,23 +3114,55 @@ void AudioSourceManager::ApplySettings(const MicMixSettings& settings) {
 }
 
 bool AudioSourceManager::Start() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (running_) return true;
-    source_ = CreateSourceLocked();
-    if (!source_) {
-        SetStatus(SourceState::Error, "create_failed", "Source creation failed", "");
-        return false;
+    StatusFn callback;
+    SourceState callbackState = SourceState::Stopped;
+    std::string callbackCode;
+    std::string callbackMessage;
+    std::string callbackDetail;
+    bool notify = false;
+    bool result = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (running_) return true;
+        source_ = CreateSourceLocked();
+        if (!source_) {
+            status_.state = SourceState::Error;
+            status_.code = "create_failed";
+            status_.message = "Source creation failed";
+            status_.detail.clear();
+            callback = statusFn_;
+            callbackState = status_.state;
+            callbackCode = status_.code;
+            callbackMessage = status_.message;
+            callbackDetail = status_.detail;
+            notify = true;
+        } else {
+            running_ = source_->Start();
+            result = running_;
+            if (!running_) {
+                source_.reset();
+                status_.state = SourceState::Error;
+                status_.code = "thread_start_failed";
+                status_.message = "Source thread start failed";
+                status_.detail.clear();
+                callback = statusFn_;
+                callbackState = status_.state;
+                callbackCode = status_.code;
+                callbackMessage = status_.message;
+                callbackDetail = status_.detail;
+                notify = true;
+            }
+        }
     }
-    running_ = source_->Start();
-    if (!running_) {
-        source_.reset();
-        SetStatus(SourceState::Error, "thread_start_failed", "Source thread start failed", "");
+    if (notify && callback) {
+        callback(callbackState, callbackCode, callbackMessage, callbackDetail);
     }
-    return running_;
+    return result;
 }
 
 void AudioSourceManager::Stop() {
     std::unique_ptr<IAudioSource> sourceToStop;
+    StatusFn callback;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!running_ && !source_) {
@@ -3144,7 +3176,14 @@ void AudioSourceManager::Stop() {
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        SetStatus(SourceState::Stopped, "stopped", "Source stopped", "");
+        status_.state = SourceState::Stopped;
+        status_.code = "stopped";
+        status_.message = "Source stopped";
+        status_.detail.clear();
+        callback = statusFn_;
+    }
+    if (callback) {
+        callback(SourceState::Stopped, "stopped", "Source stopped", "");
     }
 }
 
@@ -3727,17 +3766,23 @@ void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
     if (!sameSchid) {
         size_t keepAppliedCount = 0;
         std::string keepAppliedKeys;
-        std::string forcedFilterKeys;
+        std::string forcedOffKeys;
+        std::string forcedOnKeys;
         for (size_t i = 0; i < kMirroredPreprocessorIdents.size(); ++i) {
             if (!savedPreprocessorValuesValid_[i] || !g_ts3Functions.setPreProcessorConfigValue) {
                 continue;
             }
             std::string applyValue = savedPreprocessorValues_[i];
+            const bool isAgc = (_stricmp(kMirroredPreprocessorIdents[i], "agc") == 0);
             const bool isTypingSuppression = (_stricmp(kMirroredPreprocessorIdents[i], "typing_suppression") == 0);
             const bool isDenoise = (_stricmp(kMirroredPreprocessorIdents[i], "denoise") == 0);
+            if (isAgc && _stricmp(applyValue.c_str(), "false") != 0) {
+                applyValue = "false";
+                appendIdent(forcedOffKeys, kMirroredPreprocessorIdents[i]);
+            }
             if (forceTsFilters && (isTypingSuppression || isDenoise) && _stricmp(applyValue.c_str(), "true") != 0) {
                 applyValue = "true";
-                appendIdent(forcedFilterKeys, kMirroredPreprocessorIdents[i]);
+                appendIdent(forcedOnKeys, kMirroredPreprocessorIdents[i]);
             }
             const unsigned int err = g_ts3Functions.setPreProcessorConfigValue(
                 schid, kMirroredPreprocessorIdents[i], applyValue.c_str());
@@ -3758,9 +3803,13 @@ void MicMixApp::SetVoiceRecordingState(bool active, uint64 schid) {
                     " applied=" + std::to_string(keepAppliedCount) +
                     " keys=" + keepAppliedKeys);
         }
-        if (!forcedFilterKeys.empty()) {
+        if (!forcedOnKeys.empty()) {
             LogInfo("talk_mode forced filters schid=" + std::to_string(schid) +
-                    " keys=" + forcedFilterKeys + " value=true");
+                    " keys=" + forcedOnKeys + " value=true");
+        }
+        if (!forcedOffKeys.empty()) {
+            LogInfo("talk_mode forced filters schid=" + std::to_string(schid) +
+                    " keys=" + forcedOffKeys + " value=false");
         }
     }
     int desiredInputState = INPUT_ACTIVE;
@@ -3853,6 +3902,45 @@ void MicMixApp::RefreshVoiceTxControl(uint64 schidHint) {
         forceTxHoldUntilMs_.store(0ULL, std::memory_order_release);
     }
     SetVoiceRecordingState(shouldKeepCaptureActive, schid);
+}
+
+void MicMixApp::ReleaseForcedVoiceTx(uint64 schidHint) {
+    SetVoiceRecordingState(false, 0);
+    forceTxHoldUntilMs_.store(0ULL, std::memory_order_release);
+    engine_.SetTalkState(true);
+
+    if (!g_ts3Functions.setPreProcessorConfigValue || !g_ts3Functions.flushClientSelfUpdates) {
+        return;
+    }
+
+    uint64 schid = schidHint;
+    if (schid == 0) {
+        schid = activeSchid_.load(std::memory_order_acquire);
+    }
+    if (schid == 0 && g_ts3Functions.getCurrentServerConnectionHandlerID) {
+        schid = g_ts3Functions.getCurrentServerConnectionHandlerID();
+        if (schid != 0) {
+            activeSchid_.store(schid, std::memory_order_release);
+        }
+    }
+    if (schid == 0 || !IsConnectedForTx(schid)) {
+        return;
+    }
+
+    const unsigned int errVad = g_ts3Functions.setPreProcessorConfigValue(schid, "vad", "true");
+    const unsigned int errContinous = g_ts3Functions.setPreProcessorConfigValue(schid, "continous_transmission", "false");
+    const unsigned int errContinuous = g_ts3Functions.setPreProcessorConfigValue(schid, "continuous_transmission", "false");
+    const unsigned int errFlush = g_ts3Functions.flushClientSelfUpdates(schid, nullptr);
+    const bool okVad = (errVad == ERROR_ok || errVad == ERROR_ok_no_update);
+    const bool okFlush = (errFlush == ERROR_ok || errFlush == ERROR_ok_no_update);
+    LogInfo("talk_mode forced release schid=" + std::to_string(schid) +
+            " vad_err=" + std::to_string(errVad) +
+            " continous_err=" + std::to_string(errContinous) +
+            " continuous_err=" + std::to_string(errContinuous) +
+            " flush_err=" + std::to_string(errFlush));
+    if (!(okVad && okFlush)) {
+        LogWarn("talk_mode forced release incomplete schid=" + std::to_string(schid));
+    }
 }
 
 void MicMixApp::ApplyMicInputTransportMute(bool muted) {
@@ -4343,6 +4431,7 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
                     micInputMuted = settings_.micInputMuted;
                 }
                 ApplyMicInputTransportMute(micInputMuted);
+                RefreshVoiceTxControl(0);
                 std::string line = "source=" + SourceStateToString(st) + " code=" + code + " msg=" + msg;
                 if (!detail.empty()) line += " detail=" + detail;
                 LogInfo(line);
@@ -4460,6 +4549,11 @@ void MicMixApp::ApplySettings(const MicMixSettings& settings, bool restartSource
         sourceManager->ApplySettings(safe);
         if (restartSource && sourceManager->IsRunning()) sourceManager->Restart();
     }
+    if (!safe.forceTxEnabled || safe.musicMuted) {
+        ReleaseForcedVoiceTx(0);
+    } else {
+        RefreshVoiceTxControl(0);
+    }
     if (saveConfig && changed && configStore_) {
         std::string err;
         if (!configStore_->Save(safe, err) && !err.empty()) LogError("Config save failed: " + err);
@@ -4475,6 +4569,8 @@ void MicMixApp::StopSource() {
     if (const auto sourceManager = sourceManager_.load(std::memory_order_acquire)) {
         sourceManager->Stop();
     }
+    ReleaseForcedVoiceTx(0);
+    ApplyMicInputTransportMute(false);
 }
 
 void MicMixApp::ToggleMute() {
