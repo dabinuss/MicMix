@@ -85,6 +85,8 @@ enum class HeaderBadgeState {
 
 std::mutex g_mutex;
 std::thread g_thread;
+std::mutex g_editorOpenThreadMutex;
+std::thread g_editorOpenThread;
 std::atomic<bool> g_running{false};
 std::atomic<HWND> g_hwnd{nullptr};
 UiTheme g_theme = DefaultUiTheme();
@@ -96,6 +98,7 @@ std::atomic_uint64_t g_statusHoldUntilMs{0};
 uint64_t g_lastListRefreshTickMs = 0;
 std::atomic<bool> g_loading{false};
 std::atomic<bool> g_editorOpenPending{false};
+std::atomic<bool> g_closing{false};
 bool g_ownerVstAutostartChecked = false;
 
 constexpr UINT kMsgEditorOpenDone = WM_APP + 42;
@@ -104,6 +107,20 @@ struct EditorOpenResult {
     bool ok = false;
     std::wstring message;
 };
+
+void JoinEditorOpenThread() {
+    std::thread threadToJoin;
+    {
+        std::lock_guard<std::mutex> lock(g_editorOpenThreadMutex);
+        if (g_editorOpenThread.joinable() &&
+            g_editorOpenThread.get_id() != std::this_thread::get_id()) {
+            threadToJoin = std::move(g_editorOpenThread);
+        }
+    }
+    if (threadToJoin.joinable()) {
+        threadToJoin.join();
+    }
+}
 
 HFONT g_fontBody = nullptr;
 HFONT g_fontSmall = nullptr;
@@ -825,7 +842,8 @@ void HandleOpenEditor(HWND hwnd, EffectChain chain, int listId) {
         return;
     }
     SetTransientStatusText(hwnd, L"Opening editor...");
-    std::thread([hwnd, chain, idx]() {
+    JoinEditorOpenThread();
+    std::thread worker([hwnd, chain, idx]() {
         std::string error;
         const bool ok = MicMixApp::Instance().OpenEffectEditor(chain, static_cast<size_t>(idx), error);
         auto* result = new EditorOpenResult{};
@@ -835,11 +853,17 @@ void HandleOpenEditor(HWND hwnd, EffectChain chain, int listId) {
         } else {
             result->message = Utf8ToWide(error.empty() ? "editor open failed" : error);
         }
-        if (!PostMessageW(hwnd, kMsgEditorOpenDone, 0, reinterpret_cast<LPARAM>(result))) {
+        if (g_closing.load(std::memory_order_acquire) ||
+            !IsWindow(hwnd) ||
+            !PostMessageW(hwnd, kMsgEditorOpenDone, 0, reinterpret_cast<LPARAM>(result))) {
             delete result;
             g_editorOpenPending.store(false, std::memory_order_release);
         }
-    }).detach();
+    });
+    {
+        std::lock_guard<std::mutex> lock(g_editorOpenThreadMutex);
+        g_editorOpenThread = std::move(worker);
+    }
 }
 
 void RefreshStatus(HWND hwnd, bool force) {
@@ -2013,6 +2037,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         ResetListPointerState(g_musicListUi);
         ResetListPointerState(g_micListUi);
+        g_closing.store(true, std::memory_order_release);
         g_editorOpenPending.store(false, std::memory_order_release);
         g_hwnd.store(nullptr, std::memory_order_release);
         PostQuitMessage(0);
@@ -2027,6 +2052,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 void WindowThreadMain() {
+    g_closing.store(false, std::memory_order_release);
     HINSTANCE hInst = ResolveModuleHandleFromAddress(reinterpret_cast<const void*>(&WindowThreadMain));
     INITCOMMONCONTROLSEX icc{};
     icc.dwSize = sizeof(icc);
@@ -2113,10 +2139,12 @@ void EffectsWindowController::Open() {
 
 void EffectsWindowController::Close() {
     std::lock_guard<std::mutex> lock(g_mutex);
+    g_closing.store(true, std::memory_order_release);
     if (!g_running.load(std::memory_order_acquire)) {
         if (g_thread.joinable()) {
             g_thread.join();
         }
+        JoinEditorOpenThread();
         return;
     }
     HWND hwnd = g_hwnd.load(std::memory_order_acquire);
@@ -2126,4 +2154,5 @@ void EffectsWindowController::Close() {
     if (g_thread.joinable()) {
         g_thread.join();
     }
+    JoinEditorOpenThread();
 }
