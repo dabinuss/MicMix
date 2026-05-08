@@ -269,8 +269,61 @@ bool IsAmd64PeBinary(const std::filesystem::path& filePath) {
     return ok;
 }
 
-bool ValidateVstPath(const std::string& path, std::string& error) {
+bool ResolveVst3BundleBinaryPath(const std::filesystem::path& bundlePath, std::filesystem::path& binaryPath, std::string& error) {
+    binaryPath.clear();
+    if (_wcsicmp(bundlePath.extension().c_str(), L".vst3") != 0) {
+        error = "unsupported_extension";
+        return false;
+    }
+
+    const std::filesystem::path binaryDir = bundlePath / L"Contents" / L"x86_64-win";
+    std::error_code ec;
+    if (!std::filesystem::exists(binaryDir, ec) || ec || !std::filesystem::is_directory(binaryDir, ec)) {
+        error = "bundle_x64_binary_dir_missing";
+        return false;
+    }
+    const DWORD binaryDirAttrs = GetFileAttributesW(binaryDir.c_str());
+    if (binaryDirAttrs == INVALID_FILE_ATTRIBUTES) {
+        error = "bundle_binary_dir_attributes_unavailable";
+        return false;
+    }
+    if ((binaryDirAttrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        error = "bundle_binary_dir_reparse_path_blocked";
+        return false;
+    }
+
+    std::vector<std::filesystem::path> candidates;
+    for (const auto& entry : std::filesystem::directory_iterator(binaryDir, ec)) {
+        if (ec) {
+            break;
+        }
+        const auto& p = entry.path();
+        if (_wcsicmp(p.extension().c_str(), L".vst3") == 0 && entry.is_regular_file(ec) && !ec) {
+            candidates.push_back(p);
+        }
+        ec.clear();
+    }
+    if (ec) {
+        error = "bundle_binary_dir_unreadable";
+        return false;
+    }
+    if (candidates.empty()) {
+        error = "bundle_x64_binary_missing";
+        return false;
+    }
+
+    std::sort(candidates.begin(), candidates.end());
+    const std::wstring bundleStem = bundlePath.stem().wstring();
+    auto exact = std::find_if(candidates.begin(), candidates.end(), [&bundleStem](const std::filesystem::path& p) {
+        return _wcsicmp(p.stem().c_str(), bundleStem.c_str()) == 0;
+    });
+    binaryPath = (exact != candidates.end()) ? *exact : candidates.front();
+    return true;
+}
+
+bool ResolveValidatedVstBinaryPath(const std::string& path, std::filesystem::path& binaryPath, std::string& error) {
     error.clear();
+    binaryPath.clear();
     if (path.empty()) {
         error = "empty_path";
         return false;
@@ -296,7 +349,7 @@ bool ValidateVstPath(const std::string& path, std::string& error) {
         error = "unsupported_extension";
         return false;
     }
-    if (!std::filesystem::exists(resolved, ec) || ec || std::filesystem::is_directory(resolved, ec)) {
+    if (!std::filesystem::exists(resolved, ec) || ec) {
         error = "path_missing";
         return false;
     }
@@ -309,7 +362,22 @@ bool ValidateVstPath(const std::string& path, std::string& error) {
         error = "reparse_path_blocked";
         return false;
     }
-    if (!IsAmd64PeBinary(resolved)) {
+    binaryPath = resolved;
+    if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        if (!ResolveVst3BundleBinaryPath(resolved, binaryPath, error)) {
+            return false;
+        }
+        const DWORD binaryAttrs = GetFileAttributesW(binaryPath.c_str());
+        if (binaryAttrs == INVALID_FILE_ATTRIBUTES || (binaryAttrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            error = "bundle_binary_attributes_unavailable";
+            return false;
+        }
+        if ((binaryAttrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            error = "bundle_binary_reparse_path_blocked";
+            return false;
+        }
+    }
+    if (!IsAmd64PeBinary(binaryPath)) {
         error = "unsupported_architecture";
         return false;
     }
@@ -520,11 +588,12 @@ bool LoadedVst::Load(const std::string& path, HostApplication* hostContext, std:
     hostContext_ = hostContext;
     controllerClassIdValid_ = false;
     std::memset(controllerClassId_, 0, sizeof(controllerClassId_));
-    if (!ValidateVstPath(path, error)) {
+    std::filesystem::path binaryPath;
+    if (!ResolveValidatedVstBinaryPath(path, binaryPath, error)) {
         return false;
     }
 
-    module_ = LoadLibraryW(Utf8ToWide(path).c_str());
+    module_ = LoadLibraryW(binaryPath.c_str());
     if (!module_) {
         error = "LoadLibrary_failed";
         return false;
@@ -1436,7 +1505,8 @@ std::string HandleScan(const std::string& encodedPath) {
         return "SCAN_ERR reason=invalid_path";
     }
     std::string error;
-    if (!ValidateVstPath(decodedPath, error)) {
+    std::filesystem::path binaryPath;
+    if (!ResolveValidatedVstBinaryPath(decodedPath, binaryPath, error)) {
         return "SCAN_ERR reason=" + error;
     }
     return "SCAN_OK path=" + HexEncode(decodedPath) + " signed=unknown";

@@ -7,6 +7,7 @@
 #include <Windows.h>
 #include <CommCtrl.h>
 #include <commdlg.h>
+#include <shlobj.h>
 #include <shellapi.h>
 #include <uxtheme.h>
 
@@ -610,6 +611,33 @@ void SetStaticTextIfChanged(HWND ctl, std::wstring& cache, const std::wstring& n
 
 bool PromptEffectPath(HWND hwnd, std::string& outPath) {
     outPath.clear();
+    const int choice = MessageBoxW(
+        hwnd,
+        L"Select a VST3 plugin type.\n\nYes: .vst3 bundle folder\nNo: .vst3 file\nCancel: abort",
+        L"Add VST3 Plugin",
+        MB_ICONQUESTION | MB_YESNOCANCEL);
+    if (choice == IDCANCEL) {
+        return false;
+    }
+    if (choice == IDYES) {
+        BROWSEINFOW bi{};
+        bi.hwndOwner = hwnd;
+        bi.lpszTitle = L"Select VST3 bundle folder";
+        bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX;
+        PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
+        if (!pidl) {
+            return false;
+        }
+        wchar_t folderBuf[4096]{};
+        const BOOL ok = SHGetPathFromIDListW(pidl, folderBuf);
+        CoTaskMemFree(pidl);
+        if (!ok || folderBuf[0] == L'\0') {
+            return false;
+        }
+        outPath = WideToUtf8(folderBuf);
+        return !outPath.empty();
+    }
+
     wchar_t fileBuf[4096]{};
     OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);

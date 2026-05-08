@@ -1060,6 +1060,58 @@ bool HexDecode(const std::string& hex, std::string& out) {
 
 bool NormalizeAndValidateEffectPath(const std::string& rawPath, std::string& normalizedPath, std::string& error);
 
+bool ResolveVst3BundleBinaryPath(const std::filesystem::path& bundlePath, std::filesystem::path& binaryPath, std::string& error) {
+    binaryPath.clear();
+    if (_wcsicmp(bundlePath.extension().c_str(), L".vst3") != 0) {
+        error = "unsupported effect file extension (only .vst3)";
+        return false;
+    }
+
+    const std::filesystem::path binaryDir = bundlePath / L"Contents" / L"x86_64-win";
+    std::error_code ec;
+    if (!std::filesystem::exists(binaryDir, ec) || ec || !std::filesystem::is_directory(binaryDir, ec)) {
+        error = "vst3 bundle is missing Contents\\x86_64-win";
+        return false;
+    }
+    const DWORD binaryDirAttrs = GetFileAttributesW(binaryDir.c_str());
+    if (binaryDirAttrs == INVALID_FILE_ATTRIBUTES) {
+        error = "vst3 bundle binary directory attributes unavailable";
+        return false;
+    }
+    if ((binaryDirAttrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        error = "reparse-point plugin binary directories are blocked";
+        return false;
+    }
+
+    std::vector<std::filesystem::path> candidates;
+    for (const auto& entry : std::filesystem::directory_iterator(binaryDir, ec)) {
+        if (ec) {
+            break;
+        }
+        const auto& p = entry.path();
+        if (_wcsicmp(p.extension().c_str(), L".vst3") == 0 && entry.is_regular_file(ec) && !ec) {
+            candidates.push_back(p);
+        }
+        ec.clear();
+    }
+    if (ec) {
+        error = "vst3 bundle binary directory is unreadable";
+        return false;
+    }
+    if (candidates.empty()) {
+        error = "vst3 bundle contains no x64 plugin binary";
+        return false;
+    }
+
+    std::sort(candidates.begin(), candidates.end());
+    const std::wstring bundleStem = bundlePath.stem().wstring();
+    auto exact = std::find_if(candidates.begin(), candidates.end(), [&bundleStem](const std::filesystem::path& p) {
+        return _wcsicmp(p.stem().c_str(), bundleStem.c_str()) == 0;
+    });
+    binaryPath = (exact != candidates.end()) ? *exact : candidates.front();
+    return true;
+}
+
 std::string BuildHostSyncPayload(const MicMixSettings& settings) {
     auto sanitizeChain = [](const std::vector<VstEffectSlot>& slots, std::unordered_set<std::string>& usedUids) {
         std::vector<VstEffectSlot> sanitized;
@@ -1162,15 +1214,27 @@ bool NormalizeAndValidateEffectPath(const std::string& rawPath, std::string& nor
         error = "effect file attributes unavailable";
         return false;
     }
-    if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-        error = "effect path must point to a file";
-        return false;
-    }
     if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
         error = "reparse-point plugin paths are blocked";
         return false;
     }
-    if (!IsAmd64PeBinary(canonical)) {
+
+    std::filesystem::path binaryPath = canonical;
+    if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        if (!ResolveVst3BundleBinaryPath(canonical, binaryPath, error)) {
+            return false;
+        }
+        const DWORD binaryAttrs = GetFileAttributesW(binaryPath.c_str());
+        if (binaryAttrs == INVALID_FILE_ATTRIBUTES || (binaryAttrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            error = "vst3 bundle binary attributes unavailable";
+            return false;
+        }
+        if ((binaryAttrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            error = "reparse-point plugin binary paths are blocked";
+            return false;
+        }
+    }
+    if (!IsAmd64PeBinary(binaryPath)) {
         error = "unsupported plugin binary architecture (x64 required)";
         return false;
     }
