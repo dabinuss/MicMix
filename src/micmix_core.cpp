@@ -4425,6 +4425,9 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
                 if (st == SourceState::Reacquiring) {
                     engine_.NoteReconnect();
                 }
+                if (shutdownRequested_.load(std::memory_order_acquire)) {
+                    return;
+                }
                 bool micInputMuted = false;
                 {
                     std::lock_guard<std::mutex> lock(settingsMutex_);
@@ -4479,6 +4482,10 @@ bool MicMixApp::Initialize(const std::string& configBasePath) {
 
 void MicMixApp::Shutdown() {
     if (!initialized_.exchange(false)) return;
+    // During TeamSpeak teardown the plugin API can become unsafe before or
+    // during ts3plugin_shutdown. Stop background work without issuing further
+    // TS client/preprocessor updates from cleanup paths.
+    shutdownRequested_.store(true, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(musicMetaMutex_);
         musicMetaLastStateValid_ = false;
@@ -4487,11 +4494,7 @@ void MicMixApp::Shutdown() {
     SettingsWindowController::Instance().Close();
     if (musicMuteHotkeyManager_) musicMuteHotkeyManager_->Stop();
     if (micInputMuteHotkeyManager_) micInputMuteHotkeyManager_->Stop();
-    // Keep shutdownRequested_ clear until voice-tx cleanup is done so we can
-    // restore TeamSpeak input/VAD state before plugin teardown is finalized.
     StopVoiceTxThread();
-    ApplyMicInputTransportMute(false);
-    shutdownRequested_.store(true, std::memory_order_release);
     for (int i = 0; i < 100 && captureCallbacksInFlight_.load(std::memory_order_acquire) > 0; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
