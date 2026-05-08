@@ -189,6 +189,7 @@ struct EffectListUiState {
     bool dragging = false;
     int dragSource = -1;
     int dragInsertIndex = -1;
+    int externalDragInsertIndex = -1;
     POINT dragStart{ 0, 0 };
     uint64_t lastInteractionMs = 0;
 };
@@ -276,6 +277,7 @@ void ResetListPointerState(EffectListUiState& state) {
     state.dragging = false;
     state.dragSource = -1;
     state.dragInsertIndex = -1;
+    state.externalDragInsertIndex = -1;
     state.dragStart = { 0, 0 };
     state.lastInteractionMs = 0;
 }
@@ -553,6 +555,9 @@ void ReloadEffectList(HWND hwnd, EffectChain chain, int listId) {
     if (ui.dragInsertIndex > static_cast<int>(slots.size())) {
         ui.dragInsertIndex = static_cast<int>(slots.size());
     }
+    if (ui.externalDragInsertIndex > static_cast<int>(slots.size())) {
+        ui.externalDragInsertIndex = static_cast<int>(slots.size());
+    }
     if (countChanged || rowsChanged) {
         InvalidateRect(list, nullptr, FALSE);
     }
@@ -677,10 +682,6 @@ void HandleMoveEffectToIndex(HWND hwnd, EffectChain chain, int listId, int fromI
     }
 }
 
-int OtherListId(int listId) {
-    return (listId == IDC_MIC_LIST) ? IDC_MUSIC_LIST : IDC_MIC_LIST;
-}
-
 bool ScreenPointToListClient(HWND parent, const POINT& screenPt, int& outListId, POINT& outClientPt) {
     const int candidateIds[] = { IDC_MUSIC_LIST, IDC_MIC_LIST };
     for (int id : candidateIds) {
@@ -701,6 +702,42 @@ bool ScreenPointToListClient(HWND parent, const POINT& screenPt, int& outListId,
         }
     }
     return false;
+}
+
+void InvalidateInsertMarker(HWND list, int insertIndex);
+
+void UpdateExternalDragInsertMarker(HWND parent, int targetListId, int targetInsertIndex) {
+    if (!parent) {
+        return;
+    }
+    const int listIds[] = { IDC_MUSIC_LIST, IDC_MIC_LIST };
+    for (int id : listIds) {
+        EffectListUiState& state = ListUiStateFromListId(id);
+        const int nextInsert = (id == targetListId) ? targetInsertIndex : -1;
+        if (state.externalDragInsertIndex == nextInsert) {
+            continue;
+        }
+        const int oldInsert = state.externalDragInsertIndex;
+        state.externalDragInsertIndex = nextInsert;
+        HWND list = GetDlgItem(parent, id);
+        if (list) {
+            InvalidateInsertMarker(list, oldInsert);
+            InvalidateInsertMarker(list, nextInsert);
+        }
+    }
+}
+
+void AutoScrollListOnDrag(HWND list, const POINT& clientPt) {
+    if (!list) {
+        return;
+    }
+    RECT clientRect{};
+    GetClientRect(list, &clientRect);
+    if (clientPt.y < clientRect.top + S(8)) {
+        SendMessageW(list, WM_VSCROLL, SB_LINEUP, 0);
+    } else if (clientPt.y > clientRect.bottom - S(8)) {
+        SendMessageW(list, WM_VSCROLL, SB_LINEDOWN, 0);
+    }
 }
 
 void HandleMoveEffectBetweenLists(HWND hwnd, int fromListId, int fromIndex, int toListId, int toInsertIndex) {
@@ -1103,16 +1140,8 @@ LRESULT CALLBACK EffectListSubclassProc(
             }
 
             if (dropListId == listId) {
-                const RECT clientRect = [] (HWND h) {
-                    RECT rc{};
-                    GetClientRect(h, &rc);
-                    return rc;
-                }(list);
-                if (pt.y < clientRect.top + S(8)) {
-                    SendMessageW(list, WM_VSCROLL, SB_LINEUP, 0);
-                } else if (pt.y > clientRect.bottom - S(8)) {
-                    SendMessageW(list, WM_VSCROLL, SB_LINEDOWN, 0);
-                }
+                UpdateExternalDragInsertMarker(parent, 0, -1);
+                AutoScrollListOnDrag(list, pt);
                 const int nextInsert = ComputeInsertIndexFromPoint(list, pt);
                 if (nextInsert != ui.dragInsertIndex) {
                     const int oldInsert = ui.dragInsertIndex;
@@ -1126,6 +1155,17 @@ LRESULT CALLBACK EffectListSubclassProc(
                     ui.dragInsertIndex = -1;
                     InvalidateInsertMarker(list, oldInsert);
                 }
+                int targetInsert = -1;
+                HWND dropList = parent ? GetDlgItem(parent, dropListId) : nullptr;
+                if (dropList) {
+                    AutoScrollListOnDrag(dropList, dropClientPt);
+                    targetInsert = ComputeInsertIndexFromPoint(dropList, dropClientPt);
+                    if (targetInsert < 0) {
+                        const int count = static_cast<int>(SendMessageW(dropList, LB_GETCOUNT, 0, 0));
+                        targetInsert = std::max(0, count);
+                    }
+                }
+                UpdateExternalDragInsertMarker(parent, dropListId, targetInsert);
                 MarkListInteraction(ListUiStateFromListId(dropListId));
             }
             SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
@@ -1245,6 +1285,7 @@ LRESULT CALLBACK EffectListSubclassProc(
                 }
                 HandleMoveEffectBetweenLists(parent, listId, dragSource, dropListId, dropInsertIndex);
             }
+            UpdateExternalDragInsertMarker(parent, 0, -1);
             InvalidateInsertMarker(list, dragInsert);
             InvalidateListItem(list, dragSource);
             return 0;
@@ -1253,6 +1294,7 @@ LRESULT CALLBACK EffectListSubclassProc(
     }
     case WM_CAPTURECHANGED:
         MarkListInteraction(ui);
+        UpdateExternalDragInsertMarker(parent, 0, -1);
         InvalidateListItem(list, ui.pressedItem);
         InvalidateInsertMarker(list, ui.dragInsertIndex);
         ui.pressedItem = -1;
@@ -1374,13 +1416,19 @@ void DrawEffectListItem(const DRAWITEMSTRUCT* dis) {
     DrawInlineButton(dis->hDC, layout.removeRect, removeLabel, false, hoverRemove, pressedRemove, buttonFont);
 
     const int count = static_cast<int>(ui.rows.size());
+    int markerInsertIndex = -1;
     if (ui.dragging && ui.dragInsertIndex >= 0) {
+        markerInsertIndex = ui.dragInsertIndex;
+    } else if (ui.externalDragInsertIndex >= 0) {
+        markerInsertIndex = ui.externalDragInsertIndex;
+    }
+    if (markerInsertIndex >= 0) {
         HPEN linePen = CreatePen(PS_SOLID, std::max(1, S(2)), g_theme.accent);
         HGDIOBJ oldLinePen = SelectObject(dis->hDC, linePen);
-        if (ui.dragInsertIndex == static_cast<int>(dis->itemID)) {
+        if (markerInsertIndex == static_cast<int>(dis->itemID)) {
             MoveToEx(dis->hDC, rc.left + S(2), rc.top + 1, nullptr);
             LineTo(dis->hDC, rc.right - S(2), rc.top + 1);
-        } else if (ui.dragInsertIndex == count && static_cast<int>(dis->itemID) == count - 1) {
+        } else if (markerInsertIndex == count && static_cast<int>(dis->itemID) == count - 1) {
             MoveToEx(dis->hDC, rc.left + S(2), rc.bottom - 1, nullptr);
             LineTo(dis->hDC, rc.right - S(2), rc.bottom - 1);
         }

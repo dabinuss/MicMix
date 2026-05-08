@@ -264,6 +264,97 @@ bool TestVstEffectsSaveRoundtrip() {
     return pass;
 }
 
+bool TestCrossChainUidDedupOnLoad() {
+    const fs::path base = MakeUniqueBaseDir("vst_uid_cross_chain");
+    ConfigStore store(base.string());
+    const std::string payload =
+        "vst.effects_enabled=true\n"
+        "vst.host.autostart=false\n"
+        "vst.music.count=1\n"
+        "vst.music.0.path=C:\\\\VST\\\\Comp.vst3\n"
+        "vst.music.0.name=Compressor\n"
+        "vst.music.0.uid=shared_uid\n"
+        "vst.music.0.last_status=running\n"
+        "vst.music.0.enabled=true\n"
+        "vst.music.0.bypass=false\n"
+        "vst.mic.count=1\n"
+        "vst.mic.0.path=C:\\\\VST\\\\Gate.vst3\n"
+        "vst.mic.0.name=Gate\n"
+        "vst.mic.0.uid=shared_uid\n"
+        "vst.mic.0.last_status=running\n"
+        "vst.mic.0.enabled=true\n"
+        "vst.mic.0.bypass=false\n";
+    if (!WriteFile(store.ConfigPath(), payload)) {
+        std::cerr << "FAIL: could not write config file for vst_uid_cross_chain" << std::endl;
+        return false;
+    }
+
+    MicMixSettings settings{};
+    std::string warning;
+    const bool ok = store.Load(settings, warning);
+    bool pass = true;
+    pass &= Expect(ok, "Load(vst_uid_cross_chain) should return true");
+    pass &= Expect(settings.musicEffects.size() == 1, "music effect count should parse");
+    pass &= Expect(settings.micEffects.size() == 1, "mic effect count should parse");
+    pass &= Expect(!settings.musicEffects[0].uid.empty(), "music uid should be set");
+    pass &= Expect(!settings.micEffects[0].uid.empty(), "mic uid should be set");
+    pass &= Expect(settings.musicEffects[0].uid == "shared_uid", "first chain should keep original uid");
+    pass &= Expect(settings.micEffects[0].uid != settings.musicEffects[0].uid, "cross-chain duplicate uid should be deduplicated");
+    pass &= Expect(warning.empty(), "Valid VST config should not produce parse warnings");
+    return pass;
+}
+
+bool TestMoveEffectBetweenChains() {
+    MicMixApp& app = MicMixApp::Instance();
+    const MicMixSettings original = app.GetSettings();
+
+    MicMixSettings testSettings{};
+    testSettings.vstEffectsEnabled = false;
+    testSettings.vstHostAutostart = false;
+    VstEffectSlot musicA{};
+    musicA.path = "C:\\\\VST\\\\Comp.vst3";
+    musicA.name = "Compressor";
+    musicA.uid = "uid_comp";
+    musicA.lastStatus = "pending";
+    musicA.enabled = true;
+    musicA.bypass = false;
+    VstEffectSlot micA{};
+    micA.path = "C:\\\\VST\\\\Gate.vst3";
+    micA.name = "Gate";
+    micA.uid = "uid_gate";
+    micA.lastStatus = "pending";
+    micA.enabled = true;
+    micA.bypass = false;
+    testSettings.musicEffects = { musicA };
+    testSettings.micEffects = { micA };
+
+    app.ApplySettings(testSettings, false, false);
+
+    std::string error;
+    const bool moveOk = app.MoveEffectBetweenChains(EffectChain::Music, 0, EffectChain::Mic, 1, error);
+
+    bool pass = true;
+    pass &= Expect(moveOk, "MoveEffectBetweenChains should succeed for valid indices");
+    pass &= Expect(error.empty(), "MoveEffectBetweenChains should not return an error on success");
+
+    const std::vector<VstEffectSlot> musicAfter = app.GetEffects(EffectChain::Music);
+    const std::vector<VstEffectSlot> micAfter = app.GetEffects(EffectChain::Mic);
+    pass &= Expect(musicAfter.empty(), "music chain should be empty after moving its only effect");
+    pass &= Expect(micAfter.size() == 2, "mic chain should contain original + moved effect");
+    if (micAfter.size() == 2) {
+        pass &= Expect(micAfter[0].uid == "uid_gate", "existing mic effect should stay at index 0");
+        pass &= Expect(micAfter[1].uid == "uid_comp", "moved effect should be inserted at requested index");
+    }
+
+    error.clear();
+    const bool invalidMoveOk = app.MoveEffectBetweenChains(EffectChain::Music, 99, EffectChain::Mic, 0, error);
+    pass &= Expect(!invalidMoveOk, "MoveEffectBetweenChains should fail for invalid source index");
+    pass &= Expect(error == "invalid source index", "invalid move should report source index error");
+
+    app.ApplySettings(original, false, false);
+    return pass;
+}
+
 } // namespace
 
 int main() {
@@ -284,6 +375,12 @@ int main() {
         ++failed;
     }
     if (!TestVstEffectsSaveRoundtrip()) {
+        ++failed;
+    }
+    if (!TestCrossChainUidDedupOnLoad()) {
+        ++failed;
+    }
+    if (!TestMoveEffectBetweenChains()) {
         ++failed;
     }
     CleanupTempDirs();
