@@ -6536,6 +6536,10 @@ void MicMixApp::ProcessMicInputWithVst(short* samples, int sampleCount, int chan
         bool processed = false;
         micmix::vstipc::AudioPacket out{};
         if (micmix::vstipc::RingPush(shm->micIn, packet)) {
+            // Mic effects must consume the exact response for this packet.
+            // Time-based effects such as reverb/delay crackle if we blend in
+            // an older or newer block, because their tail no longer lines up
+            // with the dry capture block currently being written back to TS.
             const uint64_t waitUs = std::clamp<uint64_t>(
                 ComputeVstOutputWaitUs(frames),
                 kVstMicOutputWaitMinUs,
