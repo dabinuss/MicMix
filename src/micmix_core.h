@@ -420,6 +420,7 @@ private:
     void StopVoiceTxThread();
     void VoiceTxThreadMain();
     void SetVoiceRecordingState(bool active, uint64 schid);
+    void ReleaseForcedVoiceTx(uint64 schidHint);
     void RefreshVoiceTxControl(uint64 schidHint);
     void SyncMusicActivityMeta(uint64 schid, bool musicActive, bool force);
     void ApplyMicInputTransportMute(bool muted);
