@@ -6648,9 +6648,9 @@ void MicMixApp::OnSourceSamples(const float* data, size_t count) {
     }
 }
 
-void MicMixApp::ProcessMicInputWithVst(short* samples, int sampleCount, int channels) {
+bool MicMixApp::ProcessMicInputWithVst(short* samples, int sampleCount, int channels) {
     if (!samples || sampleCount <= 0 || channels <= 0) {
-        return;
+        return false;
     }
     thread_local PendingVstPackets pendingMicPackets;
     thread_local uint32_t lastMicSeq = 0;
@@ -6670,7 +6670,7 @@ void MicMixApp::ProcessMicInputWithVst(short* samples, int sampleCount, int chan
     if (!acquired) {
         pendingMicPackets.Clear();
         micWetMix = 0.0f;
-        return;
+        return false;
     }
     struct MicIpcBusyGuard {
         std::atomic_flag& flag;
@@ -6688,19 +6688,20 @@ void MicMixApp::ProcessMicInputWithVst(short* samples, int sampleCount, int chan
         !vstHostRunning_.load(std::memory_order_acquire)) {
         pendingMicPackets.Clear();
         micWetMix = 0.0f;
-        return;
+        return false;
     }
     const LONG hostHeartbeat = micmix::vstipc::AtomicLoad(&shm->hostHeartbeat);
     if (hostHeartbeat == 0 ||
         (static_cast<uint32_t>(GetTickCount()) - static_cast<uint32_t>(hostHeartbeat)) > 3000U) {
         pendingMicPackets.Clear();
         micWetMix = 0.0f;
-        return;
+        return false;
     }
 
     InterlockedExchange(&shm->pluginHeartbeat, static_cast<LONG>(GetTickCount64() & 0x7FFFFFFF));
     thread_local std::array<float, micmix::vstipc::kMaxFramesPerPacket> mono{};
 
+    bool touched = false;
     int offset = 0;
     while (offset < sampleCount) {
         const uint32_t frames = static_cast<uint32_t>(std::min<int>(
@@ -6751,18 +6752,23 @@ void MicMixApp::ProcessMicInputWithVst(short* samples, int sampleCount, int chan
             } else if (targetMix < micWetMix) {
                 micWetMix = std::max(targetMix, micWetMix - kVstMixStep);
             }
-            const float dry = mono[i];
-            const float wet = haveWet ? (std::isfinite(out.samples[i]) ? out.samples[i] : dry) : dry;
-            const float mixed = dry + ((wet - dry) * micWetMix);
-            const short s = static_cast<short>(std::lrintf(
-                std::clamp(mixed, -1.0f, 1.0f) * 32767.0f));
+            const float wet = haveWet ? (std::isfinite(out.samples[i]) ? out.samples[i] : mono[i]) : mono[i];
             for (int ch = 0; ch < channels; ++ch) {
                 const int idx = ((offset + static_cast<int>(i)) * channels) + ch;
-                samples[idx] = s;
+                const short previous = samples[idx];
+                const float dry = static_cast<float>(previous) / 32768.0f;
+                const float mixed = dry + ((wet - dry) * micWetMix);
+                const short next = static_cast<short>(std::lrintf(
+                    std::clamp(mixed, -1.0f, 1.0f) * 32767.0f));
+                if (next != previous) {
+                    touched = true;
+                    samples[idx] = next;
+                }
             }
         }
         offset += static_cast<int>(frames);
     }
+    return touched;
 }
 
 void MicMixApp::SetGlobalHotkeyCaptureBlocked(bool blocked) {
@@ -6937,7 +6943,10 @@ void MicMixApp::EditCapturedVoice(uint64 schid, short* samples, int sampleCount,
     const uint64_t nowMs = GetTickCount64();
     lastCaptureEditTickMs_.store(nowMs, std::memory_order_release);
     (void)schid;
-    ProcessMicInputWithVst(samples, sampleCount, channels);
+    const bool vstTouched = ProcessMicInputWithVst(samples, sampleCount, channels);
+    if (vstTouched && edited) {
+        *edited |= 1;
+    }
     engine_.EditCapturedVoice(samples, sampleCount, channels, edited);
     if (const auto mixMonitor = mixMonitorPlayer_.load(std::memory_order_acquire)) {
         mixMonitor->PushCaptured(samples, sampleCount, channels);

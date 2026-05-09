@@ -429,7 +429,7 @@ private:
     void SyncMusicActivityMeta(uint64 schid, bool musicActive, bool force);
     void ApplyMicInputTransportMute(bool muted);
     void OnSourceSamples(const float* data, size_t count);
-    void ProcessMicInputWithVst(short* samples, int sampleCount, int channels);
+    bool ProcessMicInputWithVst(short* samples, int sampleCount, int channels);
 
     std::atomic<bool> initialized_{false};
     std::unique_ptr<ConfigStore> configStore_;
