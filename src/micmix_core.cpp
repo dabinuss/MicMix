@@ -60,12 +60,12 @@ constexpr size_t kMaxEffectsPerChain = 64;
 constexpr size_t kMaxEffectPathLen = 1024;
 constexpr size_t kMaxEffectNameLen = 192;
 constexpr size_t kMaxEffectUidLen = 96;
-constexpr size_t kMaxEffectStateBlobLen = 4096;
+constexpr size_t kMaxEffectStateBlobLen = 32U * 1024U;
 constexpr size_t kMaxEffectStatusLen = 64;
 constexpr wchar_t kVstHostPipeName[] = L"micmix_vst_host";
 constexpr wchar_t kVstAudioShmPrefix[] = L"Local\\MicMixVstAudioV2";
-constexpr size_t kVstHostMaxPipeMessageBytes = 64U * 1024U;
-constexpr size_t kVstHostSyncPayloadMaxBytes = 28U * 1024U;
+constexpr size_t kVstHostMaxPipeMessageBytes = 256U * 1024U;
+constexpr size_t kVstHostSyncPayloadMaxBytes = 96U * 1024U;
 constexpr uint64_t kVstOutputWaitMinUs = 6000ULL;
 constexpr uint64_t kVstOutputWaitMaxUs = 24000ULL;
 constexpr uint64_t kVstMicIpcAcquireSpinUs = 600ULL;
@@ -4278,7 +4278,7 @@ bool MicMixApp::SendVstHostCommand(
         Sleep(5);
     }
 
-    std::array<char, 32768> buffer{};
+    std::vector<char> buffer(kVstHostMaxPipeMessageBytes + 1U, '\0');
     DWORD readBytes = 0;
     if (!ReadFile(pipe, buffer.data(), static_cast<DWORD>(buffer.size() - 1), &readBytes, nullptr) || readBytes == 0) {
         error = "ReadFile(pipe) failed: " + std::to_string(GetLastError());
@@ -5130,6 +5130,84 @@ bool MicMixApp::OpenEffectEditor(EffectChain chain, size_t index, std::string& e
     LogInfo("editor_open accepted chain=" + std::string(chainText) + " index=" + std::to_string(index) +
             " response=" + response);
     vstHostEditorKeepAliveUntilMs_.store(GetTickCount64() + kEditorKeepAliveMs, std::memory_order_release);
+    return true;
+}
+
+bool MicMixApp::SaveEffectState(EffectChain chain, size_t index, std::string& error) {
+    error.clear();
+    if (!initialized_.load(std::memory_order_acquire) ||
+        shutdownRequested_.load(std::memory_order_acquire)) {
+        error = "plugin shutting down";
+        return false;
+    }
+    vstHostStopPending_.store(false, std::memory_order_release);
+
+    MicMixSettings snapshot;
+    {
+        std::lock_guard<std::mutex> lock(settingsMutex_);
+        const auto& list = (chain == EffectChain::Music) ? settings_.musicEffects : settings_.micEffects;
+        if (index >= list.size()) {
+            error = "invalid index";
+            return false;
+        }
+        snapshot = settings_;
+    }
+
+    const bool hostWasRunning = vstHostRunning_.load(std::memory_order_acquire);
+    if (!hostWasRunning) {
+        std::string startError;
+        if (!StartVstHostProcess(startError)) {
+            error = startError.empty() ? "vst host start failed" : startError;
+            return false;
+        }
+        std::string syncError;
+        if (!SyncVstHostState(snapshot, syncError)) {
+            error = syncError.empty() ? "vst host sync failed" : syncError;
+            return false;
+        }
+    }
+
+    const char* chainText = (chain == EffectChain::Music) ? "music" : "mic";
+    const std::string command = std::string("STATE_GET ") + chainText + " " + std::to_string(index);
+    std::string response;
+    if (!SendVstHostCommand(command, response, 2500, error)) {
+        return false;
+    }
+    if (!StartsWithAscii(response, "STATE_OK")) {
+        error = response.empty() ? "state save failed" : response;
+        return false;
+    }
+
+    std::string stateBlob;
+    const std::string marker = "blob=";
+    const size_t markerPos = response.find(marker);
+    if (markerPos != std::string::npos) {
+        stateBlob = response.substr(markerPos + marker.size());
+    }
+    if (stateBlob.size() > kMaxEffectStateBlobLen) {
+        error = "effect state too large";
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(settingsMutex_);
+        auto& list = (chain == EffectChain::Music) ? settings_.musicEffects : settings_.micEffects;
+        if (index >= list.size()) {
+            error = "invalid index";
+            return false;
+        }
+        list[index].stateBlob = stateBlob;
+        list[index].lastStatus = "saved";
+        snapshot = settings_;
+    }
+    if (configStore_) {
+        std::string saveErr;
+        if (!configStore_->Save(snapshot, saveErr)) {
+            error = saveErr.empty() ? "config save failed" : saveErr;
+            LogError("Config save failed: " + error);
+            return false;
+        }
+    }
     return true;
 }
 

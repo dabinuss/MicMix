@@ -38,6 +38,7 @@
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 #include "pluginterfaces/vst/ivsthostapplication.h"
 #include "pluginterfaces/vst/ivstmessage.h"
+#include "public.sdk/source/vst/utility/memoryibstream.h"
 #undef INIT_CLASS_IID
 
 namespace {
@@ -71,7 +72,8 @@ using Steinberg::Vst::kRealtime;
 using Steinberg::Vst::kSample32;
 
 constexpr size_t kMaxEffectsPerChain = 64;
-constexpr size_t kMaxPipeMessageBytes = 64U * 1024U;
+constexpr size_t kMaxPipeMessageBytes = 256U * 1024U;
+constexpr size_t kMaxStateBlobHexBytes = 32U * 1024U;
 constexpr uint32_t kProcessTimeoutMs = 30U;
 constexpr uint32_t kRebuildCrossfadeSamples = 384U;
 constexpr UINT kMsgUiWake = WM_APP + 201U;
@@ -460,9 +462,10 @@ public:
         Shutdown();
     }
 
-    bool Load(const std::string& path, HostApplication* hostContext, std::string& error);
+    bool Load(const std::string& path, const std::string& stateBlob, HostApplication* hostContext, std::string& error);
     bool Process(float* mono, uint32_t frames);
     bool OpenEditor(const std::wstring& title, std::string& error);
+    bool SaveState(std::string& stateBlob, std::string& error);
     void CloseEditor();
     void Shutdown();
 
@@ -476,6 +479,7 @@ private:
     void OnEditorSize();
     void OnEditorDestroy();
     void TryLoadController();
+    bool ApplyStateBlob(const std::string& stateBlob, std::string& error);
 
     HMODULE module_ = nullptr;
     IPluginFactory* factory_ = nullptr;
@@ -574,7 +578,7 @@ private:
     bool resizeRecursionGuard_ = false;
 };
 
-bool LoadedVst::Load(const std::string& path, HostApplication* hostContext, std::string& error) {
+bool LoadedVst::Load(const std::string& path, const std::string& stateBlob, HostApplication* hostContext, std::string& error) {
     using InitDllProc = bool (*)();
     using ExitDllProc = bool (*)();
     using GetFactoryProc = IPluginFactory* (*)();
@@ -662,6 +666,10 @@ bool LoadedVst::Load(const std::string& path, HostApplication* hostContext, std:
         Shutdown();
         return false;
     }
+    if (!ApplyStateBlob(stateBlob, error)) {
+        Shutdown();
+        return false;
+    }
 
     TUID processorIid{};
     IAudioProcessor::iid.toTUID(processorIid);
@@ -740,6 +748,41 @@ bool LoadedVst::Load(const std::string& path, HostApplication* hostContext, std:
     return true;
 }
 
+bool LoadedVst::ApplyStateBlob(const std::string& stateBlob, std::string& error) {
+    if (stateBlob.empty()) {
+        return true;
+    }
+    if (!component_) {
+        error = "component_missing";
+        return false;
+    }
+    std::string bytes;
+    if (!HexDecode(stateBlob, bytes)) {
+        error = "state_blob_invalid";
+        return false;
+    }
+    Steinberg::ResizableMemoryIBStream stream(bytes.size());
+    Steinberg::int32 written = 0;
+    if (!bytes.empty() &&
+        stream.write(bytes.data(), static_cast<Steinberg::int32>(bytes.size()), &written) != kResultTrue) {
+        error = "state_stream_write_failed";
+        return false;
+    }
+    stream.rewind();
+    if (component_->setState(&stream) != kResultOk) {
+        error = "component_set_state_failed";
+        return false;
+    }
+
+    TryLoadController();
+    IEditController* editController = controller_ ? controller_ : componentController_;
+    if (editController) {
+        stream.rewind();
+        editController->setComponentState(&stream);
+    }
+    return true;
+}
+
 bool LoadedVst::Process(float* mono, uint32_t frames) {
     if (!processor_ || !mono || frames == 0 || frames > micmix::vstipc::kMaxFramesPerPacket) {
         return false;
@@ -811,6 +854,33 @@ bool LoadedVst::Process(float* mono, uint32_t frames) {
             }
             mono[i] = std::clamp(downmix, -8.0f, 8.0f);
         }
+    }
+    return true;
+}
+
+bool LoadedVst::SaveState(std::string& stateBlob, std::string& error) {
+    stateBlob.clear();
+    error.clear();
+    if (!component_) {
+        error = "component_missing";
+        return false;
+    }
+
+    Steinberg::ResizableMemoryIBStream stream(4096);
+    if (component_->getState(&stream) != kResultOk) {
+        error = "component_get_state_failed";
+        return false;
+    }
+    std::vector<Steinberg::uint8> bytes = stream.take();
+    if (bytes.empty()) {
+        return true;
+    }
+    const auto* begin = reinterpret_cast<const char*>(bytes.data());
+    stateBlob = HexEncode(std::string(begin, begin + bytes.size()));
+    if (stateBlob.size() > kMaxStateBlobHexBytes) {
+        error = "state_blob_too_large";
+        stateBlob.clear();
+        return false;
     }
     return true;
 }
@@ -1282,7 +1352,7 @@ void RebuildChains(HostState& state) {
         }
         auto plugin = std::make_unique<LoadedVst>();
         std::string error;
-        if (plugin->Load(slot.path, state.hostContext, error)) {
+        if (plugin->Load(slot.path, slot.stateBlob, state.hostContext, error)) {
             slotMap[slotIndex] = static_cast<int>(chain.size());
             chain.push_back(std::move(plugin));
             return;
@@ -1759,6 +1829,33 @@ std::string HandleEditorClose(const std::string& args, HostState& state) {
     return std::string("EDITOR_OK queued=1 chain=") + (isMusic ? "music" : "mic") + " index=" + std::to_string(index) + " closed=1";
 }
 
+std::string HandleStateGet(const std::string& args, HostState& state) {
+    bool isMusic = true;
+    size_t index = 0;
+    if (!ParseEditorArgs(args, isMusic, index)) {
+        return "STATE_ERR reason=invalid_args";
+    }
+
+    std::lock_guard<std::mutex> lock(state.chainMutex);
+    const auto& slots = isMusic ? state.musicSlots : state.micSlots;
+    const auto& slotMap = isMusic ? state.musicSlotToLoaded : state.micSlotToLoaded;
+    auto& chain = isMusic ? state.musicChain : state.micChain;
+    if (index >= slots.size() || index >= slotMap.size()) {
+        return "STATE_ERR reason=invalid_index";
+    }
+    const int loadedIndex = slotMap[index];
+    if (loadedIndex < 0 || static_cast<size_t>(loadedIndex) >= chain.size() || !chain[static_cast<size_t>(loadedIndex)]) {
+        return "STATE_ERR reason=slot_not_loaded";
+    }
+
+    std::string stateBlob;
+    std::string error;
+    if (!chain[static_cast<size_t>(loadedIndex)]->SaveState(stateBlob, error)) {
+        return "STATE_ERR reason=" + ToToken(error.empty() ? "save_failed" : error);
+    }
+    return "STATE_OK blob=" + stateBlob;
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -1894,6 +1991,10 @@ int wmain(int argc, wchar_t** argv) {
             }
             if (commandText.size() > 13U && _strnicmp(commandText.c_str(), "EDITOR_CLOSE ", 13) == 0) {
                 WriteResponse(pipe, HandleEditorClose(Trim(commandText.substr(13)), state));
+                continue;
+            }
+            if (commandText.size() > 10U && _strnicmp(commandText.c_str(), "STATE_GET ", 10) == 0) {
+                WriteResponse(pipe, HandleStateGet(Trim(commandText.substr(10)), state));
                 continue;
             }
             WriteResponse(pipe, "ERR unknown_command");

@@ -1781,8 +1781,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const int listTop = effectsTop + S(kEffectsListTopOffsetPx);
         const int buttonsTop = listTop + listH + S(kEffectsListButtonTopGapPx);
         const int buttonGap = S(kEffectsListButtonGapPx);
-        const int addBtnW = S(kEffectsListButtonAddWidthPx);
-        const int smallBtnW = S(kEffectsListButtonSmallWidthPx);
+        const int chainButtonW = std::max(S(64), (colW - (buttonGap * 3)) / 4);
+        const int addBtnW = chainButtonW;
+        const int smallBtnW = chainButtonW;
 
         CreateWindowW(L"STATIC", L"Audio Effects", WS_CHILD | WS_VISIBLE, leftColX, effectsLabelY, S(160), S(20), hwnd, nullptr, nullptr, nullptr);
         HWND musicList = CreateWindowW(
@@ -1798,8 +1799,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             nullptr,
             nullptr);
         CreateWindowW(L"BUTTON", L"Add", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, leftColX, buttonsTop, addBtnW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_ADD), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, leftColX + addBtnW + buttonGap, buttonsTop, smallBtnW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_UP), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Down", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, leftColX + addBtnW + buttonGap + smallBtnW + buttonGap, buttonsTop, smallBtnW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_DOWN), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Edit", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, leftColX + addBtnW + buttonGap, buttonsTop, smallBtnW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_EDITOR), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, leftColX + addBtnW + buttonGap + smallBtnW + buttonGap, buttonsTop, smallBtnW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_UP), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Down", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, leftColX + addBtnW + buttonGap + ((smallBtnW + buttonGap) * 2), buttonsTop, smallBtnW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MUSIC_DOWN), nullptr, nullptr);
         if (musicList) {
             SetWindowSubclass(musicList, EffectListSubclassProc, kMusicListSubclassId, static_cast<DWORD_PTR>(IDC_MUSIC_LIST));
         }
@@ -1818,8 +1820,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             nullptr,
             nullptr);
         CreateWindowW(L"BUTTON", L"Add", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, rightColX, buttonsTop, addBtnW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_ADD), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, rightColX + addBtnW + buttonGap, buttonsTop, smallBtnW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_UP), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Down", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, rightColX + addBtnW + buttonGap + smallBtnW + buttonGap, buttonsTop, smallBtnW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_DOWN), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Edit", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, rightColX + addBtnW + buttonGap, buttonsTop, smallBtnW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_EDITOR), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, rightColX + addBtnW + buttonGap + smallBtnW + buttonGap, buttonsTop, smallBtnW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_UP), nullptr, nullptr);
+        CreateWindowW(L"BUTTON", L"Down", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, rightColX + addBtnW + buttonGap + ((smallBtnW + buttonGap) * 2), buttonsTop, smallBtnW, S(28), hwnd, reinterpret_cast<HMENU>(IDC_MIC_DOWN), nullptr, nullptr);
         if (micList) {
             SetWindowSubclass(micList, EffectListSubclassProc, kMicListSubclassId, static_cast<DWORD_PTR>(IDC_MIC_LIST));
         }
@@ -1908,6 +1911,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_MUSIC_ADD:
             HandleAddEffect(hwnd, EffectChain::Music);
             return 0;
+        case IDC_MUSIC_EDITOR:
+            HandleOpenEditor(hwnd, EffectChain::Music, IDC_MUSIC_LIST);
+            return 0;
         case IDC_MUSIC_UP:
             HandleMoveEffect(hwnd, EffectChain::Music, IDC_MUSIC_LIST, -1);
             return 0;
@@ -1916,6 +1922,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         case IDC_MIC_ADD:
             HandleAddEffect(hwnd, EffectChain::Mic);
+            return 0;
+        case IDC_MIC_EDITOR:
+            HandleOpenEditor(hwnd, EffectChain::Mic, IDC_MIC_LIST);
             return 0;
         case IDC_MIC_UP:
             HandleMoveEffect(hwnd, EffectChain::Mic, IDC_MIC_LIST, -1);

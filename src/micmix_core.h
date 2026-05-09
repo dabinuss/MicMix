@@ -403,6 +403,7 @@ public:
     bool SetEffectBypass(EffectChain chain, size_t index, bool bypass, std::string& error);
     bool SetEffectEnabled(EffectChain chain, size_t index, bool enabled, std::string& error);
     bool OpenEffectEditor(EffectChain chain, size_t index, std::string& error);
+    bool SaveEffectState(EffectChain chain, size_t index, std::string& error);
     static void SanitizeEffectList(std::vector<VstEffectSlot>& list);
 
     void EditCapturedVoice(uint64 schid, short* samples, int sampleCount, int channels, int* edited);

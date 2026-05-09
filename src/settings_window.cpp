@@ -1960,15 +1960,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 1;
     case WM_CLOSE:
         EndHotkeyCapture(hwnd, false);
-        FlushDebouncedSettingsSave(hwnd);
-        if (MicMixApp::Instance().IsMonitorEnabled()) {
-            MicMixApp::Instance().SetMonitorEnabled(false);
+        if (!g_closing.load(std::memory_order_acquire)) {
+            FlushDebouncedSettingsSave(hwnd);
+            if (MicMixApp::Instance().IsMonitorEnabled()) {
+                MicMixApp::Instance().SetMonitorEnabled(false);
+            }
         }
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
         EndHotkeyCapture(hwnd, false);
-        if (MicMixApp::Instance().IsMonitorEnabled()) {
+        if (!g_closing.load(std::memory_order_acquire) && MicMixApp::Instance().IsMonitorEnabled()) {
             MicMixApp::Instance().SetMonitorEnabled(false);
         }
         g_closing.store(true, std::memory_order_release);
@@ -2108,9 +2110,6 @@ void SettingsWindowController::Open() {
 void SettingsWindowController::Close() {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_closing.store(true, std::memory_order_release);
-    if (MicMixApp::Instance().IsMonitorEnabled()) {
-        MicMixApp::Instance().SetMonitorEnabled(false);
-    }
     if (!g_running.load(std::memory_order_acquire)) {
         if (g_thread.joinable()) g_thread.join();
         JoinSourceRefreshThread();
